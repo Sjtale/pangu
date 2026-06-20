@@ -1,0 +1,20 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Ignore large datasets
+onedatasets/ERA5_test/data/
+onedatasets/ERA5_test/static/
+
+# Ignore model checkpoints
+pangu_weather/data/
+
+# Ignore inference outputs and records
+pangu_weather/result/output/
+pangu_weather/result/time_record.json
