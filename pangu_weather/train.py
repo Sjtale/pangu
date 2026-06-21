@@ -65,8 +65,9 @@ def main():
                   window_size=cfg.window_size,
                   ).to(local_rank)
     learning_rate = 5e-5 if train_pruned else 5e-4
+    training_epochs = cfg.pruned_max_epoch if train_pruned else cfg.max_epoch
     optimizer = optimizers.FusedAdam(model.parameters(), betas=(0.9, 0.999), lr=learning_rate, weight_decay=3e-6)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.max_epoch if train_pruned else 100)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=training_epochs if train_pruned else 100)
     
     ## Train process init
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
@@ -133,7 +134,7 @@ def main():
 
     world_rank == 0 and logger.info(f"start training ...")
 
-    for epoch in range(cfg.max_epoch):
+    for epoch in range(training_epochs):
         if dist.is_initialized():
             train_sampler.set_epoch(epoch)
             val_sampler.set_epoch(epoch)
@@ -217,7 +218,7 @@ def main():
         scheduler.step()
 
         if world_rank == 0:
-            logger.info(f"Epoch [{epoch}/{cfg.max_epoch}], "
+            logger.info(f"Epoch [{epoch}/{training_epochs}], "
                         f"Train Loss: {train_loss:.4f}, "
                         f"Valid Loss: {valid_loss:.4f}, "
                         f"Best loss at Epoch: {best_loss_epoch}"
