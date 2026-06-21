@@ -121,8 +121,9 @@ def _attention_heads(state, source_width, target_width, source_heads):
         if stage is None:
             continue
         width = source_width if stage == "shallow" else source_width * 2
+        pruned_width = target_width if stage == "shallow" else target_width * 2
         heads = source_heads[0] if stage == "shallow" else source_heads[1]
-        target_heads = target_width // (width // heads)
+        target_heads = pruned_width // (width // heads)
         head_dim = width // heads
         qkv = tensor.detach().float().reshape(3, heads, head_dim, width)
         scores = qkv.abs().sum((0, 2, 3)).cpu().double()
