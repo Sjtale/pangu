@@ -40,22 +40,6 @@ def _top_indices(scores, count):
     return selected.sort().values.cpu()
 
 
-def _parameter_count(state):
-    """Count unique parameter tensors while excluding registered buffers/aliases."""
-    seen = set()
-    total = 0
-    for key, tensor in state.items():
-        if key.endswith(("attn_mask", "earth_position_index")):
-            continue
-        storage = tensor.untyped_storage()
-        identity = (storage.data_ptr(), tensor.storage_offset(), tensor.numel())
-        if identity in seen:
-            continue
-        seen.add(identity)
-        total += tensor.numel()
-    return total
-
-
 def _residual_indices(state, source_width, target_width):
     """Rank globally shared residual channels by adjacent weight magnitude."""
     shallow = torch.zeros(source_width, dtype=torch.float64)
@@ -274,9 +258,20 @@ def prune_checkpoint(args):
         print(f"FP16 source not found; use official FP32 backup: {source_path}")
     checkpoint = torch.load(source_path, map_location="cpu", weights_only=False)
     source_state = checkpoint["model_state_dict"]
+    img_size = cfg.img_size if hasattr(cfg, "img_size") else (721, 1440)
+
+    source_model = Pangu(
+        img_size=img_size,
+        patch_size=cfg.patch_size,
+        embed_dim=source_width,
+        num_heads=source_heads,
+        window_size=cfg.window_size,
+    )
+    source_parameters = sum(parameter.numel() for parameter in source_model.parameters())
+    del source_model
 
     target_model = Pangu(
-        img_size=cfg.img_size if hasattr(cfg, "img_size") else (721, 1440),
+        img_size=img_size,
         patch_size=cfg.patch_size,
         embed_dim=args.target_embed_dim,
         num_heads=target_heads,
@@ -326,11 +321,15 @@ def prune_checkpoint(args):
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     torch.save({"model_state_dict": output_state, "pruning": metadata}, args.output)
 
-    source_parameters = _parameter_count(source_state)
     target_parameters = sum(parameter.numel() for parameter in target_model.parameters())
-    print(f"Source parameters (state estimate): {source_parameters:,}")
+    source_size = os.path.getsize(source_path)
+    target_size = os.path.getsize(args.output)
+    print(f"Source parameters: {source_parameters:,}")
     print(f"Pruned parameters: {target_parameters:,}")
     print(f"Parameter reduction: {(1 - target_parameters / source_parameters) * 100:.2f}%")
+    print(f"Source checkpoint size: {source_size / 1024**2:.1f} MiB")
+    print(f"Pruned checkpoint size: {target_size / 1024**2:.1f} MiB")
+    print(f"Checkpoint size reduction: {(1 - target_size / source_size) * 100:.2f}%")
     print(f"Saved pruned checkpoint: {args.output}")
     print(f"Target embed_dim: {args.target_embed_dim}, num_heads: {target_heads}")
 
