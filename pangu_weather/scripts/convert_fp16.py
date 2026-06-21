@@ -86,8 +86,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--backup_dir",
         type=str,
-        default="../pangu_backups",
-        help="官方 FP32 备份目录 (默认: ../pangu_backups)",
+        default="./pangu_backups",
+        help="官方 FP32 备份目录 (默认: ./pangu_backups)",
     )
     args = parser.parse_args()
     convert_to_fp16(args.checkpoint_dir, args.backup_dir)

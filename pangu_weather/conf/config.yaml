@@ -9,7 +9,7 @@ model:
     pruned_num_heads: [5, 10, 10, 5]
     pruned_checkpoint: "model_pruned_fp16.pth"
     pruned_train_checkpoint: "model_pruned_train.pth"
-    official_checkpoint_dir: "../pangu_backups"
+    official_checkpoint_dir: "./pangu_backups"
     patience: 50
     checkpoint_dir: "./data/checkpoints"         # AI4S，路径不可更改
 

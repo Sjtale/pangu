@@ -14,6 +14,7 @@ onedatasets/ERA5_test/static/
 
 # Ignore model checkpoints
 pangu_weather/data/
+pangu_weather/pangu_backups/
 
 # Ignore inference outputs and records
 pangu_weather/result/output/
