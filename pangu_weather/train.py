@@ -53,19 +53,26 @@ def main():
     surface_mask = surface_mask.unsqueeze(0).repeat(cfg_data.dataloader.batch_size, 1, 1, 1)
 
     ## Model init
+    train_pruned = os.environ.get("PANGU_TRAIN_PRUNED", "0").lower() in {
+        "1", "true", "yes"
+    }
+    model_embed_dim = cfg.pruned_embed_dim if train_pruned else cfg.embed_dim
+    model_num_heads = cfg.pruned_num_heads if train_pruned else cfg.num_heads
     model = Pangu(img_size=cfg_data.dataset.img_size,
                   patch_size=cfg.patch_size,
-                  embed_dim=cfg.embed_dim,
-                  num_heads=cfg.num_heads,
+                  embed_dim=model_embed_dim,
+                  num_heads=model_num_heads,
                   window_size=cfg.window_size,
                   ).to(local_rank)
-    optimizer = optimizers.FusedAdam(model.parameters(), betas=(0.9, 0.999), lr=5e-4, weight_decay=3e-6)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
+    learning_rate = 5e-5 if train_pruned else 5e-4
+    optimizer = optimizers.FusedAdam(model.parameters(), betas=(0.9, 0.999), lr=learning_rate, weight_decay=3e-6)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.max_epoch if train_pruned else 100)
     
     ## Train process init
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
-    train_loss_file = f"{cfg.checkpoint_dir}/trloss.npy"
-    valid_loss_file = f"{cfg.checkpoint_dir}/valoss.npy"
+    loss_prefix = "pruned_" if train_pruned else ""
+    train_loss_file = f"{cfg.checkpoint_dir}/{loss_prefix}trloss.npy"
+    valid_loss_file = f"{cfg.checkpoint_dir}/{loss_prefix}valoss.npy"
     best_valid_loss = 1.0e6
     best_loss_epoch = 0
     train_losses = np.empty((0,), dtype=np.float32)
@@ -79,22 +86,40 @@ def main():
         print(f"📂 now params is {total_params}, {total_params / 1e6:.2f}M, {total_params / 1e9:.2f}B")
         print("-" * 50, "\n")
 
-    ## Load model weight if there exist well-trained model 
-    if os.path.exists(f"{cfg.checkpoint_dir}/model_bak.pth"):
+    ## Load model weight if there exist well-trained model
+    full_checkpoint = f"{cfg.checkpoint_dir}/model_bak.pth"
+    pruned_checkpoint = f"{cfg.checkpoint_dir}/{cfg.pruned_checkpoint}"
+    pruned_train_checkpoint = f"{cfg.checkpoint_dir}/{cfg.pruned_train_checkpoint}"
+    load_path = (
+        pruned_train_checkpoint
+        if train_pruned and os.path.exists(pruned_train_checkpoint)
+        else pruned_checkpoint if train_pruned else full_checkpoint
+    )
+    if train_pruned and not os.path.exists(load_path):
+        raise FileNotFoundError(
+            f"Pruned checkpoint not found: {load_path}. Run scripts/prune_structured.py first."
+        )
+    if os.path.exists(load_path):
         if world_rank == 0:
             print("\n\n")
             print("-" * 50)
-            print(f"✅ There has a model weight, load and continue training...")
-            print(f'If you want to train a new model, ensure there is no *.pth file in {cfg.checkpoint_dir}')
+            print(f"✅ Load model weight from {load_path}")
+            if train_pruned and load_path == pruned_checkpoint:
+                print("Start pruned-model fine-tuning with a fresh optimizer.")
+            else:
+                print("Restore training state and continue training.")
             print("-" * 50, "\n")
-        ckpt = torch.load(f"{cfg.checkpoint_dir}/model_bak.pth", map_location=f'cuda:{local_rank}', weights_only=False)
+        ckpt = torch.load(load_path, map_location=f'cuda:{local_rank}', weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        best_valid_loss = ckpt["best_valid_loss"]
-        best_loss_epoch = ckpt["best_loss_epoch"]
-        train_losses = np.load(train_loss_file)
-        valid_losses = np.load(valid_loss_file)
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            best_valid_loss = ckpt["best_valid_loss"]
+            best_loss_epoch = ckpt["best_loss_epoch"]
+            if os.path.exists(train_loss_file):
+                train_losses = np.load(train_loss_file)
+            if os.path.exists(valid_loss_file):
+                valid_losses = np.load(valid_loss_file)
 
     ## Distributed model
     if cfg.world_size > 1:
@@ -177,7 +202,10 @@ def main():
         if valid_loss < best_valid_loss:
             best_valid_loss = valid_loss
             best_loss_epoch = epoch
-            world_rank == 0 and save_checkpoint(model, optimizer, scheduler, best_valid_loss, best_loss_epoch, cfg.checkpoint_dir)
+            world_rank == 0 and save_checkpoint(
+                model, optimizer, scheduler, best_valid_loss, best_loss_epoch,
+                cfg.checkpoint_dir, pruned=train_pruned, cfg=cfg,
+            )
             is_save_ckp = True
 
         scheduler.step()
@@ -200,7 +228,10 @@ def main():
             exit()
 
 
-def save_checkpoint(model, optimizer, scheduler, best_valid_loss, best_loss_epoch, model_path):
+def save_checkpoint(
+    model, optimizer, scheduler, best_valid_loss, best_loss_epoch, model_path,
+    pruned=False, cfg=None,
+):
     model_to_save = model.module if hasattr(model, "module") else model
     state = {"model_state_dict": model_to_save.state_dict(),
              "optimizer_state_dict": optimizer.state_dict(),
@@ -208,6 +239,35 @@ def save_checkpoint(model, optimizer, scheduler, best_valid_loss, best_loss_epoc
              "best_valid_loss": best_valid_loss,
              "best_loss_epoch": best_loss_epoch,
             }
+    if pruned:
+        train_path = f"{model_path}/{cfg.pruned_train_checkpoint}"
+        torch.save(state, train_path)
+        fp16_state = {}
+        converted_storages = {}
+        for key, value in model_to_save.state_dict().items():
+            identity = (
+                value.untyped_storage().data_ptr(),
+                value.storage_offset(),
+                value.numel(),
+            )
+            if identity not in converted_storages:
+                converted_storages[identity] = (
+                    value.detach().half().cpu()
+                    if torch.is_floating_point(value)
+                    else value.detach().cpu()
+                )
+            fp16_state[key] = converted_storages[identity]
+        inference_state = {
+            "model_state_dict": fp16_state,
+            "pruning": {
+                "method": "structured_head_width_pruning_finetuned",
+                "target_embed_dim": cfg.pruned_embed_dim,
+                "target_num_heads": tuple(cfg.pruned_num_heads),
+            },
+        }
+        torch.save(inference_state, f"{model_path}/{cfg.pruned_checkpoint}")
+        return
+
     torch.save(state, f"{model_path}/model.pth")
     ### the weight file saving may interrupted due to DCU queue limit, get a backup to ensure there at least has one model 
     os.system(f"mv {model_path}/model.pth {model_path}/model_bak.pth")

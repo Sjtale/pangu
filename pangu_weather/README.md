@@ -42,6 +42,32 @@ python inference.py
 python result.py
 ```
 
+## 结构化剪枝
+
+方向5使用显式的通道依赖迁移，将浅层宽度从 192 剪到 160、
+深层宽度从 384 剪到 320，同时剪除完整注意力头。生成剪枝权重：
+
+```bash
+python scripts/prune_structured.py
+```
+
+输出 `data/checkpoints/model_pruned_fp16.pth`。`inference.py` 检测到该文件后
+默认使用剪枝模型；可用以下命令强制回退到全量 FP16 模型：
+
+```bash
+PANGU_USE_PRUNED=0 python inference.py
+```
+
+首次剪枝后必须先运行推理和 `result.py` 记录未微调精度。如需恢复精度，
+使用独立的剪枝微调路径：
+
+```bash
+PANGU_TRAIN_PRUNED=1 python train.py
+```
+
+微调状态保存为 `model_pruned_train.pth`，最佳验证模型同步导出为
+`model_pruned_fp16.pth`，不会覆盖官方 `model_bak.pth`。
+
 ## 集群训练，提前查看slurm作业提交方式和相关指令
 ```bash
 mkdir -p logs

@@ -169,10 +169,16 @@ if __name__ == "__main__":
     onnx_sim_path = f"{cfg.checkpoint_dir}/model_fp16_sim.onnx"
     onnx_raw_path = f"{cfg.checkpoint_dir}/model_fp16.onnx"
     use_onnx = False
+    pruned_ckpt_path = f"{cfg.checkpoint_dir}/{cfg.pruned_checkpoint}"
+    enable_pruned = (
+        os.environ.get("PANGU_USE_PRUNED", "1").lower() not in {"0", "false", "no"}
+        and os.path.exists(pruned_ckpt_path)
+    )
     # DCU 实测 ONNX ROCm EP 比 PyTorch FP16 慢，因此默认使用 PyTorch。
-    enable_onnx = os.environ.get("PANGU_USE_ONNX", "0").lower() not in {
-        "0", "false", "no"
-    }
+    enable_onnx = (
+        os.environ.get("PANGU_USE_ONNX", "0").lower() not in {"0", "false", "no"}
+        and not enable_pruned
+    )
 
     for onnx_candidate in [onnx_sim_path, onnx_raw_path] if enable_onnx else []:
         if os.path.exists(onnx_candidate):
@@ -191,17 +197,26 @@ if __name__ == "__main__":
         # ---- PyTorch FP16 回退 ----
         fp16_ckpt_path = f"{cfg.checkpoint_dir}/model_fp16.pth"
         fp32_ckpt_path = f"{cfg.checkpoint_dir}/model_bak.pth"
-        if os.path.exists(fp16_ckpt_path):
+        if enable_pruned:
+            print(f"✂️  加载结构化剪枝权重: {pruned_ckpt_path}")
+            ckpt = torch.load(pruned_ckpt_path, map_location="cuda:0")
+            model_embed_dim = cfg.pruned_embed_dim
+            model_num_heads = cfg.pruned_num_heads
+        elif os.path.exists(fp16_ckpt_path):
             print(f"⚡ 加载 FP16 权重: {fp16_ckpt_path}")
             ckpt = torch.load(fp16_ckpt_path, map_location="cuda:0")
+            model_embed_dim = cfg.embed_dim
+            model_num_heads = cfg.num_heads
         else:
             print(f"ℹ️  未找到 FP16 权重，回退加载 FP32: {fp32_ckpt_path}")
             ckpt = torch.load(fp32_ckpt_path, map_location="cuda:0")
+            model_embed_dim = cfg.embed_dim
+            model_num_heads = cfg.num_heads
 
         model = Pangu(img_size=cfg_data.dataset.img_size,
                       patch_size=cfg.patch_size,
-                      embed_dim=cfg.embed_dim,
-                      num_heads=cfg.num_heads,
+                      embed_dim=model_embed_dim,
+                      num_heads=model_num_heads,
                       window_size=cfg.window_size,
                       ).to('cuda:0')
         model.load_state_dict(ckpt["model_state_dict"])
