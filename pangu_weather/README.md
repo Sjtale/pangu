@@ -44,6 +44,10 @@ python result.py
 
 ## 结构化剪枝
 
+服务器上官方 FP32 权重保存在 `../pangu_backups/model_bak.pth`，不放入
+`data/checkpoints/`。脚本优先使用 `data/checkpoints/model_fp16.pth`，仅在该文件
+不存在时回退到官方 FP32 备份。
+
 方向5使用显式的通道依赖迁移，将浅层宽度从 192 剪到 160、
 深层宽度从 384 剪到 320，同时剪除完整注意力头。生成剪枝权重：
 

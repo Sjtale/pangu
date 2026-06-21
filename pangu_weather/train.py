@@ -87,7 +87,13 @@ def main():
         print("-" * 50, "\n")
 
     ## Load model weight if there exist well-trained model
-    full_checkpoint = f"{cfg.checkpoint_dir}/model_bak.pth"
+    local_full_checkpoint = f"{cfg.checkpoint_dir}/model_bak.pth"
+    backup_full_checkpoint = f"{cfg.official_checkpoint_dir}/model_bak.pth"
+    full_checkpoint = (
+        local_full_checkpoint
+        if os.path.exists(local_full_checkpoint)
+        else backup_full_checkpoint
+    )
     pruned_checkpoint = f"{cfg.checkpoint_dir}/{cfg.pruned_checkpoint}"
     pruned_train_checkpoint = f"{cfg.checkpoint_dir}/{cfg.pruned_train_checkpoint}"
     load_path = (

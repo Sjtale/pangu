@@ -196,7 +196,11 @@ if __name__ == "__main__":
     if not use_onnx:
         # ---- PyTorch FP16 回退 ----
         fp16_ckpt_path = f"{cfg.checkpoint_dir}/model_fp16.pth"
-        fp32_ckpt_path = f"{cfg.checkpoint_dir}/model_bak.pth"
+        local_fp32_path = f"{cfg.checkpoint_dir}/model_bak.pth"
+        backup_fp32_path = f"{cfg.official_checkpoint_dir}/model_bak.pth"
+        fp32_ckpt_path = (
+            local_fp32_path if os.path.exists(local_fp32_path) else backup_fp32_path
+        )
         if enable_pruned:
             print(f"✂️  加载结构化剪枝权重: {pruned_ckpt_path}")
             ckpt = torch.load(pruned_ckpt_path, map_location="cuda:0")

@@ -36,7 +36,9 @@ def export_to_onnx(checkpoint_dir: str):
 
     # ---- 加载模型 ----
     fp16_path = os.path.join(checkpoint_dir, "model_fp16.pth")
-    fp32_path = os.path.join(checkpoint_dir, "model_bak.pth")
+    local_fp32_path = os.path.join(checkpoint_dir, "model_bak.pth")
+    backup_fp32_path = os.path.join(cfg.official_checkpoint_dir, "model_bak.pth")
+    fp32_path = local_fp32_path if os.path.exists(local_fp32_path) else backup_fp32_path
 
     if os.path.exists(fp16_path):
         print(f"⚡ 加载 FP16 权重: {fp16_path}")

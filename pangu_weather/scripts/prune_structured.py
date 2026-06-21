@@ -262,7 +262,16 @@ def prune_checkpoint(args):
         args.target_embed_dim * 2 // head_dim,
         args.target_embed_dim // head_dim,
     )
-    checkpoint = torch.load(args.source, map_location="cpu", weights_only=False)
+    source_path = args.source
+    if not os.path.exists(source_path):
+        backup_path = os.path.join(cfg.official_checkpoint_dir, "model_bak.pth")
+        if not os.path.exists(backup_path):
+            raise FileNotFoundError(
+                f"Neither pruning source {source_path} nor backup {backup_path} exists"
+            )
+        source_path = backup_path
+        print(f"FP16 source not found; use official FP32 backup: {source_path}")
+    checkpoint = torch.load(source_path, map_location="cpu", weights_only=False)
     source_state = checkpoint["model_state_dict"]
 
     target_model = Pangu(

@@ -16,8 +16,10 @@ import sys
 import argparse
 
 
-def convert_to_fp16(checkpoint_dir: str):
-    src_path = os.path.join(checkpoint_dir, "model_bak.pth")
+def convert_to_fp16(checkpoint_dir: str, backup_dir: str):
+    local_src_path = os.path.join(checkpoint_dir, "model_bak.pth")
+    backup_src_path = os.path.join(backup_dir, "model_bak.pth")
+    src_path = local_src_path if os.path.exists(local_src_path) else backup_src_path
     dst_path = os.path.join(checkpoint_dir, "model_fp16.pth")
 
     if not os.path.exists(src_path):
@@ -81,5 +83,11 @@ if __name__ == "__main__":
         default="./data/checkpoints",
         help="checkpoint 目录路径 (默认: ./data/checkpoints)",
     )
+    parser.add_argument(
+        "--backup_dir",
+        type=str,
+        default="../pangu_backups",
+        help="官方 FP32 备份目录 (默认: ../pangu_backups)",
+    )
     args = parser.parse_args()
-    convert_to_fp16(args.checkpoint_dir)
+    convert_to_fp16(args.checkpoint_dir, args.backup_dir)
