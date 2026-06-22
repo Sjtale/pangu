@@ -170,14 +170,22 @@ if __name__ == "__main__":
     onnx_raw_path = f"{cfg.checkpoint_dir}/model_fp16.onnx"
     use_onnx = False
     pruned_ckpt_path = f"{cfg.checkpoint_dir}/{cfg.pruned_checkpoint}"
+    distilled_ckpt_path = f"{cfg.checkpoint_dir}/{cfg.distilled_checkpoint}"
+    enable_distilled = (
+        os.environ.get("PANGU_USE_DISTILLED", "0").lower()
+        not in {"0", "false", "no"}
+        and os.path.exists(distilled_ckpt_path)
+    )
     enable_pruned = (
         os.environ.get("PANGU_USE_PRUNED", "0").lower() not in {"0", "false", "no"}
         and os.path.exists(pruned_ckpt_path)
+        and not enable_distilled
     )
     # DCU 实测 ONNX ROCm EP 比 PyTorch FP16 慢，因此默认使用 PyTorch。
     enable_onnx = (
         os.environ.get("PANGU_USE_ONNX", "0").lower() not in {"0", "false", "no"}
         and not enable_pruned
+        and not enable_distilled
     )
 
     for onnx_candidate in [onnx_sim_path, onnx_raw_path] if enable_onnx else []:
@@ -201,7 +209,12 @@ if __name__ == "__main__":
         fp32_ckpt_path = (
             local_fp32_path if os.path.exists(local_fp32_path) else backup_fp32_path
         )
-        if enable_pruned:
+        if enable_distilled:
+            print(f"加载知识蒸馏学生权重: {distilled_ckpt_path}")
+            ckpt = torch.load(distilled_ckpt_path, map_location="cuda:0")
+            model_embed_dim = cfg.pruned_embed_dim
+            model_num_heads = cfg.pruned_num_heads
+        elif enable_pruned:
             print(f"✂️  加载结构化剪枝权重: {pruned_ckpt_path}")
             ckpt = torch.load(pruned_ckpt_path, map_location="cuda:0")
             model_embed_dim = cfg.pruned_embed_dim

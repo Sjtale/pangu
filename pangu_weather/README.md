@@ -74,6 +74,29 @@ PANGU_TRAIN_PRUNED=1 python train.py
 微调状态保存为 `model_pruned_train.pth`，最佳验证模型同步导出为
 `model_pruned_fp16.pth`，不会覆盖官方 `model_bak.pth`。
 
+## 知识蒸馏
+
+当剪枝模型仅用真实标签微调仍无法恢复精度时，用官方全量模型作为
+冻结教师，对 `160/320` 宽度的剪枝学生做输出蒸馏：
+
+```bash
+python scripts/prune_structured.py
+python distill_train.py
+```
+
+最佳学生状态保存为 `model_distilled_train.pth`，提交用 FP16 权重保存为
+`model_distilled_fp16.pth`。训练时教师不更新梯度，验证集仍使用真实标签选择
+最佳 checkpoint。使用蒸馏学生推理：
+
+```bash
+PANGU_USE_DISTILLED=1 python inference.py
+```
+
+正式蒸馏默认使用官方外部 ERA5 的 `1980-1985` 年训练集和 `1986` 年
+验证集。由于每个训练样本都增加一次 Teacher 前向，每个 epoch 默认随机使用
+最多 2048 个样本，通过多轮 shuffle 覆盖六年数据。`ERA5_test` 配置仅保留在
+`conf/config.yaml` 注释中供本地烟雾测试，不用它评估蒸馏收益。
+
 ## 集群训练，提前查看slurm作业提交方式和相关指令
 ```bash
 mkdir -p logs

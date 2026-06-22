@@ -10,6 +10,12 @@ model:
     pruned_checkpoint: "model_pruned_fp16.pth"
     pruned_train_checkpoint: "model_pruned_train.pth"
     pruned_max_epoch: 10
+    distilled_checkpoint: "model_distilled_fp16.pth"
+    distilled_train_checkpoint: "model_distilled_train.pth"
+    distill_max_epoch: 20
+    distill_learning_rate: 5.0e-5
+    distill_ground_truth_weight: 0.3
+    distill_steps_per_epoch: 2048
     official_checkpoint_dir: "./pangu_backups"
     patience: 50
     checkpoint_dir: "./data/checkpoints"         # AI4S，路径不可更改
@@ -22,21 +28,22 @@ datapipe:
   dataset:
     type: "hdf5"
     
-    # stats_dir: "/work2/share/sugonhpcapp01/ERA5/old-data/stats"     # AI4S，拉取远程ERA5数据
-    # static_dir: "/work2/share/sugonhpcapp01/ERA5/old-data/static"   # AI4S，拉取远程ERA5数据
-    # data_dir: "/work2/share/sugonhpcapp01/ERA5/old-data"            # AI4S，拉取远程ERA5数据
+    # 官方外部 ERA5 用于正式训练；ERA5_test 只用于本地流程烟雾测试。
+    stats_dir: "/work2/share/sugonhpcapp01/ERA5/old-data/stats"
+    static_dir: "/work2/share/sugonhpcapp01/ERA5/old-data/static"
+    data_dir: "/work2/share/sugonhpcapp01/ERA5/old-data"
 
-    # train_ratio: [1980, 1981, 1982, 1983, 1984, 1985]
-    # val_ratio: [1986] 
-    # test_ratio: [2000]                                # AI4S，后台测试中，该年份只是标识，并非真实年份, 提交代码时需修改为[2050, 2052, 2054, 2056, 2058] ！！！！
+    train_ratio: [1980, 1981, 1982, 1983, 1984, 1985]
+    val_ratio: [1986]
+    test_ratio: [2000] # 提交前改为 [2050, 2052, 2054, 2056, 2058]
 
-    stats_dir: "../onedatasets/ERA5_test/stats/"     # AI4S，路径不可更改, 拉取本地ERA5数据
-    static_dir: "../onedatasets/ERA5_test/static/"   # AI4S，路径不可更改, 拉取本地本地ERA5数据
-    data_dir: "../onedatasets/ERA5_test/"            # AI4S，路径不可更改 , 拉取本地本地ERA5数据
-
-    train_ratio: [1977]
-    val_ratio: [2005]
-    test_ratio: [2012] # [2050, 2052, 2054, 2056, 2058]       # AI4S，后台测试中，该年份只是标识，并非真实年份, 提交代码时需修改为[2050, 2052, 2054, 2056, 2058] ！！！！
+    # 本地烟雾测试配置，不应用于正式微调/蒸馏：
+    # stats_dir: "../onedatasets/ERA5_test/stats/"
+    # static_dir: "../onedatasets/ERA5_test/static/"
+    # data_dir: "../onedatasets/ERA5_test/"
+    # train_ratio: [1977]
+    # val_ratio: [2005]
+    # test_ratio: [2012]
 
     img_size: [721, 1440]    # AI4S，测试集空间分辨率为该大小，更改报错
     verbose: true
