@@ -171,7 +171,7 @@ if __name__ == "__main__":
     use_onnx = False
     pruned_ckpt_path = f"{cfg.checkpoint_dir}/{cfg.pruned_checkpoint}"
     enable_pruned = (
-        os.environ.get("PANGU_USE_PRUNED", "1").lower() not in {"0", "false", "no"}
+        os.environ.get("PANGU_USE_PRUNED", "0").lower() not in {"0", "false", "no"}
         and os.path.exists(pruned_ckpt_path)
     )
     # DCU 实测 ONNX ROCm EP 比 PyTorch FP16 慢，因此默认使用 PyTorch。
