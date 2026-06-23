@@ -42,6 +42,36 @@ python inference.py
 python result.py
 ```
 
+## FP16 权重审计与重打包
+
+`scripts/convert_fp16.py` 会剥离优化器等非推理字段，并在转换 FP16 时保留
+state dict 的共享 storage 和 tensor view。默认从官方 FP32 权重生成
+`data/checkpoints/model_fp16.pth`：
+
+```bash
+python scripts/convert_fp16.py \
+  --report data/checkpoints/model_fp16_audit.json
+```
+
+审计服务器上已有的 FP16 权重而不改写文件：
+
+```bash
+python scripts/convert_fp16.py \
+  --source data/checkpoints/model_fp16.pth \
+  --audit-only
+```
+
+脚本使用临时文件写入，并在替换目标文件前验证所有键、dtype、形状、数值和
+storage 别名关系。首次在服务器运行时可通过 `--output` 生成候选文件，完成
+严格加载、推理和 `result.py` 对比后再替换默认权重。
+
+候选文件可直接用于 A/B 推理，无需覆盖当前权重：
+
+```bash
+PANGU_FP16_CHECKPOINT=model_fp16_compact.pth python inference.py
+python result.py
+```
+
 ## 结构化剪枝
 
 服务器上官方 FP32 权重保存在 `./pangu_backups/model_bak.pth`，不放入

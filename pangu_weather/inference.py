@@ -127,14 +127,13 @@ class ONNXModel:
         )
 
 
-def get_stats(data_dir, channels):
+def get_stats(data_dir, stats_dir, channels):
     """从 metadata.json 读取变量列表，提取归一化参数"""
     with open(os.path.join(data_dir, "metadata.json"), "r") as f:
         metadata = json.load(f)
     all_variables = metadata["variables"]
 
     channel_indices = [all_variables.index(v) for v in channels]
-    stats_dir = os.path.join(data_dir, "stats")
     mu = np.load(os.path.join(stats_dir, "global_means.npy"))   # [1, C, 1, 1]
     std = np.load(os.path.join(stats_dir, "global_stds.npy"))
     means = mu[:, channel_indices, :, :]
@@ -152,7 +151,7 @@ if __name__ == "__main__":
     ## DataLoader init
     cfg_data = YParams(config_file_path, "datapipe")
 
-    means, stds = get_stats(cfg_data.dataset.data_dir, cfg_data.dataset.channels)
+    means, stds = get_stats(cfg_data.dataset.data_dir, cfg_data.dataset.stats_dir, cfg_data.dataset.channels)
 
     datapipe = ERA5Datapipe(params=cfg_data, distributed=False)
     test_dataloader = datapipe.test_dataloader()
@@ -203,7 +202,12 @@ if __name__ == "__main__":
 
     if not use_onnx:
         # ---- PyTorch FP16 回退 ----
-        fp16_ckpt_path = f"{cfg.checkpoint_dir}/model_fp16.pth"
+        fp16_checkpoint = os.environ.get("PANGU_FP16_CHECKPOINT", "model_fp16.pth")
+        fp16_ckpt_path = (
+            fp16_checkpoint
+            if os.path.isabs(fp16_checkpoint)
+            else f"{cfg.checkpoint_dir}/{fp16_checkpoint}"
+        )
         local_fp32_path = f"{cfg.checkpoint_dir}/model_bak.pth"
         backup_fp32_path = f"{cfg.official_checkpoint_dir}/model_bak.pth"
         fp32_ckpt_path = (
@@ -237,7 +241,9 @@ if __name__ == "__main__":
                       window_size=cfg.window_size,
                       ).to('cuda:0')
         model.load_state_dict(ckpt["model_state_dict"])
-        model.half()   # FP16: 确保整个模型在半精度下运行
+        use_fp16 = os.environ.get("PANGU_USE_FP16", "1") == "1"
+        if use_fp16:
+            model.half()   # FP16: 确保整个模型在半精度下运行
         model.eval()
 
         # ---- 方向4.3: 释放 checkpoint 变量，清理显存碎片 ----
@@ -245,12 +251,13 @@ if __name__ == "__main__":
         gc.collect()
         torch.cuda.empty_cache()
 
+        target_dtype = torch.float16 if use_fp16 else torch.float32
         # ---- 方向4.5: CUDA Graph 捕获（可选，DCU 上可能不支持）----
         _example = None
         try:
             _example = torch.empty(1, 72, cfg_data.dataset.img_size[0],
                                    cfg_data.dataset.img_size[1],
-                                   dtype=torch.float16, device='cuda:0')
+                                   dtype=target_dtype, device='cuda:0')
             model = CUDAGraphWrapper(model, _example)
             del _example
             torch.cuda.empty_cache()
@@ -280,13 +287,14 @@ if __name__ == "__main__":
 
             # FP16: 输入数据直接转为半精度
             # 方向4.3: non_blocking 异步数据传输，重叠 CPU/GPU 工作
-            invar_surface = invar[:, :4, :, :].to("cuda:0", dtype=torch.float16, non_blocking=True)
-            invar_upper_air = invar[:, 4:, :, :].to("cuda:0", dtype=torch.float16, non_blocking=True)
+            invar_surface = invar[:, :4, :, :].to("cuda:0", dtype=target_dtype, non_blocking=True)
+            invar_upper_air = invar[:, 4:, :, :].to("cuda:0", dtype=target_dtype, non_blocking=True)
             invar = torch.concat([invar_surface, surface_mask, invar_upper_air], dim=1)
 
             #----------------------AI4S(时间度量不可更改)---------------------------
             start_time = time.perf_counter()      # AI4S(时间度量，位置不可更改)
             out_surface, out_upper_air = model(invar)
+            torch.cuda.synchronize()              # AI4S(时间度量，位置不可更改，新增)
             end_time = time.perf_counter()        # AI4S(时间度量，位置不可更改)
             time_list.append(end_time-start_time) # AI4S(时间度量，位置不可更改)
             #---------------------------------------------------------------------

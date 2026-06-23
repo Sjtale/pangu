@@ -1,93 +1,252 @@
+"""Audit and create a minimal FP16 inference checkpoint.
+
+The OneScience Pangu state dict contains aliases. Converting every key with an
+independent ``tensor.half()`` call expands shared storages and can make the FP16
+file much larger than necessary. This tool converts each unique floating-point
+storage once, reconstructs all tensor views, and verifies the saved checkpoint.
+
+Examples:
+    python scripts/convert_fp16.py
+    python scripts/convert_fp16.py --source data/checkpoints/model_fp16.pth --audit-only
+    python scripts/convert_fp16.py --output data/checkpoints/model_fp16_compact.pth
 """
-FP16 权重转换脚本
-将 FP32 的 model_bak.pth 转换为 FP16 权重，同时清除优化器/调度器状态，
-只保留推理所需的最小 state_dict。
 
-用法:
-    python scripts/convert_fp16.py [--checkpoint_dir ./data/checkpoints]
-
-输出:
-    {checkpoint_dir}/model_fp16.pth  — FP16 权重文件（仅含 model_state_dict）
-"""
-
-import torch
+import argparse
+import json
 import os
 import sys
-import argparse
+from collections import Counter, OrderedDict
+from collections.abc import Mapping
+
+import torch
 
 
-def convert_to_fp16(checkpoint_dir: str, backup_dir: str):
-    local_src_path = os.path.join(checkpoint_dir, "model_bak.pth")
-    backup_src_path = os.path.join(backup_dir, "model_bak.pth")
-    src_path = local_src_path if os.path.exists(local_src_path) else backup_src_path
-    dst_path = os.path.join(checkpoint_dir, "model_fp16.pth")
+def _storage_key(tensor):
+    storage = tensor.untyped_storage()
+    return (storage._cdata, str(tensor.device), str(tensor.dtype))
 
-    if not os.path.exists(src_path):
-        print(f"❌ 源文件不存在: {src_path}")
-        sys.exit(1)
 
-    # 统计原文件大小
-    src_size_mb = os.path.getsize(src_path) / (1024 * 1024)
-    print(f"📂 源文件: {src_path} ({src_size_mb:.1f} MB)")
+def _storage_groups(state_dict):
+    groups = OrderedDict()
+    for name, tensor in state_dict.items():
+        if not isinstance(tensor, torch.Tensor) or tensor.layout != torch.strided:
+            continue
+        groups.setdefault(_storage_key(tensor), []).append((name, tensor))
+    return groups
 
-    # 加载 checkpoint
-    print("⏳ 加载 checkpoint ...")
-    ckpt = torch.load(src_path, map_location="cpu")
 
-    # 提取 model_state_dict（丢弃 optimizer、scheduler 等）
-    if "model_state_dict" in ckpt:
-        state_dict = ckpt["model_state_dict"]
-        extra_keys = [k for k in ckpt.keys() if k != "model_state_dict"]
-        if extra_keys:
-            print(f"🗑️  丢弃非推理字段: {extra_keys}")
-    else:
-        # 可能直接是 state_dict
-        state_dict = ckpt
-        print("ℹ️  checkpoint 中未找到 'model_state_dict' 键，假定整体为 state_dict")
+def extract_state_dict(checkpoint):
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError("Checkpoint must be a mapping")
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
+    if not isinstance(state_dict, Mapping):
+        raise TypeError("model_state_dict must be a mapping")
+    non_tensors = [name for name, value in state_dict.items()
+                   if not isinstance(value, torch.Tensor)]
+    if non_tensors:
+        preview = ", ".join(non_tensors[:5])
+        raise TypeError(f"model_state_dict contains non-tensors: {preview}")
+    return state_dict
 
-    # 统计参数
-    total_params = sum(v.numel() for v in state_dict.values())
-    fp32_count = sum(1 for v in state_dict.values() if v.dtype == torch.float32)
-    print(f"📊 总参数量: {total_params:,}")
-    print(f"📊 FP32 张量数: {fp32_count} / {len(state_dict)}")
 
-    # 转换为 FP16
-    print("⚡ 转换为 FP16 ...")
-    fp16_state_dict = {}
-    for k, v in state_dict.items():
-        if v.is_floating_point():
-            fp16_state_dict[k] = v.half()
-        else:
-            # 保持整数类型不变（如有）
-            fp16_state_dict[k] = v
+def audit_checkpoint(path, checkpoint=None):
+    if checkpoint is None:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    state_dict = extract_state_dict(checkpoint)
+    groups = _storage_groups(state_dict)
 
-    # 只保存 model_state_dict，不包装额外字段
-    torch.save({"model_state_dict": fp16_state_dict}, dst_path)
+    tensor_dtypes = Counter()
+    element_dtypes = Counter()
+    logical_bytes = 0
+    ungrouped_bytes = 0
+    for tensor in state_dict.values():
+        tensor_dtypes[str(tensor.dtype)] += 1
+        element_dtypes[str(tensor.dtype)] += tensor.numel()
+        logical_bytes += tensor.numel() * tensor.element_size()
+        if tensor.layout != torch.strided:
+            ungrouped_bytes += tensor.numel() * tensor.element_size()
 
-    dst_size_mb = os.path.getsize(dst_path) / (1024 * 1024)
-    reduction = (1 - dst_size_mb / src_size_mb) * 100
+    unique_storage_bytes = ungrouped_bytes + sum(
+        tensors[0][1].untyped_storage().nbytes() for tensors in groups.values()
+    )
+    alias_groups = [
+        [name for name, _ in tensors]
+        for tensors in groups.values()
+        if len(tensors) > 1
+    ]
+    top_level_keys = list(checkpoint) if checkpoint is not state_dict else []
+    extra_fields = [key for key in top_level_keys if key != "model_state_dict"]
 
-    print(f"✅ FP16 权重已保存: {dst_path}")
-    print(f"📦 原文件大小:  {src_size_mb:.1f} MB")
-    print(f"📦 新文件大小:  {dst_size_mb:.1f} MB")
-    print(f"📉 体积缩减:    {reduction:.1f}%")
-    print()
-    print("接下来在 inference.py 中使用 model_fp16.pth 加载模型即可。")
+    report = {
+        "path": os.path.abspath(path),
+        "file_bytes": os.path.getsize(path),
+        "top_level_keys": top_level_keys,
+        "extra_fields": extra_fields,
+        "tensor_count": len(state_dict),
+        "tensor_dtypes": dict(sorted(tensor_dtypes.items())),
+        "elements_by_dtype": dict(sorted(element_dtypes.items())),
+        "logical_tensor_bytes": logical_bytes,
+        "unique_storage_count": len(groups),
+        "unique_storage_bytes": unique_storage_bytes,
+        "alias_group_count": len(alias_groups),
+        "aliased_tensor_count": sum(len(names) for names in alias_groups),
+        "largest_alias_groups": sorted(alias_groups, key=len, reverse=True)[:10],
+    }
+    return report
+
+
+def print_report(report, title):
+    mib = 1024 ** 2
+    print(f"\n{title}: {report['path']}")
+    print(f"  file size:            {report['file_bytes'] / mib:.1f} MiB")
+    print(f"  tensors:              {report['tensor_count']}")
+    print(f"  tensor dtypes:        {report['tensor_dtypes']}")
+    print(f"  logical tensor bytes: {report['logical_tensor_bytes'] / mib:.1f} MiB")
+    print(f"  unique storage bytes: {report['unique_storage_bytes'] / mib:.1f} MiB")
+    print(f"  unique storages:      {report['unique_storage_count']}")
+    print(f"  alias groups:         {report['alias_group_count']}")
+    print(f"  extra fields:         {report['extra_fields']}")
+    for names in report["largest_alias_groups"][:5]:
+        preview = ", ".join(names[:4])
+        suffix = " ..." if len(names) > 4 else ""
+        print(f"    alias x{len(names)}: {preview}{suffix}")
+
+
+def convert_state_dict_to_fp16(state_dict):
+    """Convert each dense floating storage once and preserve all tensor views."""
+    converted = OrderedDict()
+    groups = _storage_groups(state_dict)
+
+    for tensors in groups.values():
+        representative = tensors[0][1]
+        if not representative.is_floating_point():
+            for name, tensor in tensors:
+                converted[name] = tensor
+            continue
+
+        storage = representative.untyped_storage()
+        storage_elements = storage.nbytes() // representative.element_size()
+        base = torch.empty(0, dtype=representative.dtype, device="cpu")
+        base = base.set_(storage, 0, (storage_elements,), (1,))
+        fp16_storage = base.half()
+        for name, tensor in tensors:
+            converted[name] = fp16_storage.as_strided(
+                tuple(tensor.size()), tuple(tensor.stride()), tensor.storage_offset()
+            )
+
+    for name, tensor in state_dict.items():
+        if name in converted:
+            continue
+        converted[name] = tensor.half() if tensor.is_floating_point() else tensor
+
+    converted = state_dict.__class__((name, converted[name]) for name in state_dict)
+    if hasattr(state_dict, "_metadata"):
+        converted._metadata = state_dict._metadata
+    return converted
+
+
+def _alias_partitions(state_dict):
+    return sorted(
+        sorted(name for name, _ in tensors)
+        for tensors in _storage_groups(state_dict).values()
+        if len(tensors) > 1
+    )
+
+
+def verify_checkpoint(source_state, candidate_path):
+    candidate = torch.load(candidate_path, map_location="cpu", weights_only=False)
+    candidate_state = extract_state_dict(candidate)
+    if list(candidate_state) != list(source_state):
+        raise ValueError("Candidate state_dict keys or ordering differ from source")
+
+    for name, source in source_state.items():
+        actual = candidate_state[name]
+        expected = source.half() if source.is_floating_point() else source
+        if actual.shape != expected.shape or actual.dtype != expected.dtype:
+            raise ValueError(f"Tensor metadata mismatch: {name}")
+        if not torch.equal(actual, expected):
+            raise ValueError(f"Tensor value mismatch: {name}")
+
+    if _alias_partitions(candidate_state) != _alias_partitions(source_state):
+        raise ValueError("Candidate tensor storage aliases differ from source")
+
+
+def convert_to_fp16(source_path, destination_path, report_path=None):
+    checkpoint = torch.load(source_path, map_location="cpu", weights_only=False)
+    source_state = extract_state_dict(checkpoint)
+    source_report = audit_checkpoint(source_path, checkpoint)
+    print_report(source_report, "Source checkpoint")
+    del checkpoint
+
+    fp16_state = convert_state_dict_to_fp16(source_state)
+    destination_path = os.path.abspath(destination_path)
+    os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+    temporary_path = destination_path + ".tmp"
+    try:
+        torch.save({"model_state_dict": fp16_state}, temporary_path)
+        verify_checkpoint(source_state, temporary_path)
+        os.replace(temporary_path, destination_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
+    output_report = audit_checkpoint(destination_path)
+    print_report(output_report, "Verified FP16 checkpoint")
+    reduction = 100 * (1 - output_report["file_bytes"] / source_report["file_bytes"])
+    print(f"  file reduction:       {reduction:.1f}%")
+
+    if report_path:
+        payload = {"source": source_report, "output": output_report}
+        with open(report_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    return output_report
+
+
+def resolve_source(checkpoint_dir, backup_dir, explicit_source):
+    if explicit_source:
+        return explicit_source
+    local_source = os.path.join(checkpoint_dir, "model_bak.pth")
+    backup_source = os.path.join(backup_dir, "model_bak.pth")
+    return local_source if os.path.exists(local_source) else backup_source
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Audit or create a storage-preserving FP16 Pangu checkpoint"
+    )
+    parser.add_argument("--checkpoint_dir", default="./data/checkpoints")
+    parser.add_argument("--backup_dir", default="./pangu_backups")
+    parser.add_argument("--source", help="Explicit checkpoint to read")
+    parser.add_argument("--output", help="Output path (default: model_fp16.pth)")
+    parser.add_argument("--report", help="Optional JSON audit report path")
+    parser.add_argument("--audit-only", action="store_true")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    source_path = resolve_source(args.checkpoint_dir, args.backup_dir, args.source)
+    if not os.path.exists(source_path):
+        print(f"Source checkpoint does not exist: {source_path}", file=sys.stderr)
+        return 1
+
+    if args.audit_only:
+        report = audit_checkpoint(source_path)
+        print_report(report, "Checkpoint audit")
+        if args.report:
+            with open(args.report, "w", encoding="utf-8") as handle:
+                json.dump(report, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+        return 0
+
+    output_path = args.output or os.path.join(args.checkpoint_dir, "model_fp16.pth")
+    if os.path.abspath(source_path) == os.path.abspath(output_path):
+        print("Source and output paths must differ", file=sys.stderr)
+        return 1
+    convert_to_fp16(source_path, output_path, args.report)
+    return 0
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="将 Pangu-Weather 权重从 FP32 转换为 FP16")
-    parser.add_argument(
-        "--checkpoint_dir",
-        type=str,
-        default="./data/checkpoints",
-        help="checkpoint 目录路径 (默认: ./data/checkpoints)",
-    )
-    parser.add_argument(
-        "--backup_dir",
-        type=str,
-        default="./pangu_backups",
-        help="官方 FP32 备份目录 (默认: ./pangu_backups)",
-    )
-    args = parser.parse_args()
-    convert_to_fp16(args.checkpoint_dir, args.backup_dir)
+    raise SystemExit(main())

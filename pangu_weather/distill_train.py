@@ -110,7 +110,7 @@ def make_model(cfg, cfg_data, student):
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     logger = logging.getLogger(__name__)
     current_path = os.getcwd()
     config_path = os.path.join(current_path, "conf/config.yaml")
