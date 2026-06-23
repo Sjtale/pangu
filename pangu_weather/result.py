@@ -25,7 +25,14 @@ def get_metadata(data_dir, test_years, channels):
 
     if not h5_files:
         raise FileNotFoundError(f"No HDF5 files found in {data_dir}/data/{{year}}/")
-    channel_indices = list(range(len(channels)))
+    import json
+    meta_path = os.path.join(data_dir, "metadata.json")
+    if not os.path.exists(meta_path):
+        meta_path = "/public/home/xdzs2026_c271/xiandao2026-AI4S/onedatasets/ERA5_test/metadata.json"
+    with open(meta_path, "r") as f:
+        meta = json.load(f)
+    variables = meta["variables"]
+    channel_indices = [variables.index(v) for v in channels]
 
     total_files = [f for f in os.listdir('./result/output/') if f.endswith('.npy')]
     total_files.sort()
@@ -179,7 +186,7 @@ if __name__ == "__main__":
     total_files, channel_indices, h5_map = get_metadata(data_dir, test_years, cfg_data.dataset.channels)
 
     # Load data & Compute RMSE/ACC per channel
-    stats_dir = os.path.join(data_dir, "stats")
+    stats_dir = cfg_data.dataset.stats_dir
     mu = np.load(os.path.join(stats_dir, "global_means.npy"))
 
     clim_mean = mu[:, channel_indices, :, :]
