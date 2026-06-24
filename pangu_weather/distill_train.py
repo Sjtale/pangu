@@ -273,8 +273,13 @@ def main():
 
         student.eval()
         valid_loss = 0.0
+        val_stride = int(getattr(cfg, "val_stride", 10))
+        val_count = 0
         with torch.no_grad():
-            for data in valid_loader:
+            for j, data in enumerate(valid_loader):
+                if j % val_stride != 0:
+                    continue
+                val_count += 1
                 model_input, target_surface, target_upper_air = prepare_batch(
                     data, surface_mask, device
                 )
@@ -291,7 +296,7 @@ def main():
                     dist.all_reduce(loss)
                     loss /= world_size
                 valid_loss += loss.item()
-        valid_loss /= len(valid_loader)
+        valid_loss /= max(val_count, 1)
 
         scheduler.step()
         is_best = valid_loss < best_valid_loss

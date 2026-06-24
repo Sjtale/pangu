@@ -173,9 +173,14 @@ def main():
 
         model.eval()
         valid_loss = 0
+        val_stride = int(getattr(cfg, "val_stride", 10))
+        val_count = 0
         with torch.no_grad():
             start_time = time.time()
             for j, data in enumerate(val_dataloader):
+                if j % val_stride != 0:
+                    continue
+                val_count += 1
                 invar = data[0]
                 outvar = data[1]
                 invar_surface = invar[:, :4, :, :].to(local_rank, dtype=torch.float32)
@@ -199,12 +204,12 @@ def main():
                     loss = loss_tensor.item() / cfg.world_size
                 valid_loss += loss
                 if world_rank == 0:
-                    logger.info(f'Valid: Epoch {epoch}-{j+1}/{len(val_dataloader)} '
+                    logger.info(f'Valid: Epoch {epoch}-{val_count}/{max(1, len(val_dataloader)//val_stride)} '
                             f'[cost {int((time.time()-start_time) // 60):02}:{int((time.time()-start_time) % 60):02}] '
                             f'[{(time.time()-start_time)/(j+1): .02f}s/{cfg_data.dataloader.batch_size}batch] '
-                            f'loss:{valid_loss / (j+1): .04f}')
+                            f'loss:{valid_loss / val_count: .04f}')
                 
-        valid_loss /= len(val_dataloader)
+        valid_loss /= max(val_count, 1)
         is_save_ckp = False
         if valid_loss < best_valid_loss:
             best_valid_loss = valid_loss

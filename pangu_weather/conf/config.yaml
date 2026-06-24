@@ -19,6 +19,7 @@ model:
     official_checkpoint_dir: "./pangu_backups"
     patience: 50
     checkpoint_dir: "./data/checkpoints"         # AI4S，路径不可更改
+    val_stride: 10
 
 datapipe:
   name: "ERA5"
