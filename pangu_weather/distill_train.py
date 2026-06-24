@@ -60,7 +60,15 @@ def load_state(model, path):
 
 
 def save_student(
-    model, optimizer, scheduler, epoch, best_valid_loss, best_loss_epoch, cfg
+    model,
+    optimizer,
+    scheduler,
+    epoch,
+    best_valid_loss,
+    best_loss_epoch,
+    cfg,
+    train_checkpoint_name,
+    inference_checkpoint_name=None,
 ):
     model_to_save = model.module if hasattr(model, "module") else model
     train_state = {
@@ -71,7 +79,10 @@ def save_student(
         "best_valid_loss": best_valid_loss,
         "best_loss_epoch": best_loss_epoch,
     }
-    torch.save(train_state, checkpoint_path(cfg, cfg.distilled_train_checkpoint))
+    torch.save(train_state, checkpoint_path(cfg, train_checkpoint_name))
+
+    if inference_checkpoint_name is None:
+        return
 
     inference_state = {
         "model_state_dict": {
@@ -86,7 +97,7 @@ def save_student(
             "ground_truth_weight": float(cfg.distill_ground_truth_weight),
         },
     }
-    torch.save(inference_state, checkpoint_path(cfg, cfg.distilled_checkpoint))
+    torch.save(inference_state, checkpoint_path(cfg, inference_checkpoint_name))
 
 
 def prepare_batch(data, surface_mask, device):
@@ -156,15 +167,20 @@ def main():
     teacher.requires_grad_(False)
 
     student = make_model(cfg, cfg_data, student=True)
+    latest_train_checkpoint = "model_distilled_latest.pth"
+    latest_train_path = checkpoint_path(cfg, latest_train_checkpoint)
     distilled_train_path = checkpoint_path(cfg, cfg.distilled_train_checkpoint)
     pruned_train_path = checkpoint_path(cfg, cfg.pruned_train_checkpoint)
     pruned_path = checkpoint_path(cfg, cfg.pruned_checkpoint)
-    resume = os.path.exists(distilled_train_path)
-    initial_student_path = (
-        distilled_train_path
-        if resume
-        else pruned_train_path if os.path.exists(pruned_train_path) else pruned_path
-    )
+    resume = os.path.exists(latest_train_path) or os.path.exists(distilled_train_path)
+    if os.path.exists(latest_train_path):
+        initial_student_path = latest_train_path
+    elif os.path.exists(distilled_train_path):
+        initial_student_path = distilled_train_path
+    elif os.path.exists(pruned_train_path):
+        initial_student_path = pruned_train_path
+    else:
+        initial_student_path = pruned_path
     student_checkpoint = load_state(student, initial_student_path)
     student.to(device)
 
@@ -278,9 +294,22 @@ def main():
         valid_loss /= len(valid_loader)
 
         scheduler.step()
-        if valid_loss < best_valid_loss:
+        is_best = valid_loss < best_valid_loss
+        if is_best:
             best_valid_loss = valid_loss
             best_loss_epoch = epoch
+        if world_rank == 0:
+            save_student(
+                student,
+                optimizer,
+                scheduler,
+                epoch,
+                best_valid_loss,
+                best_loss_epoch,
+                cfg,
+                latest_train_checkpoint,
+            )
+        if is_best:
             if world_rank == 0:
                 save_student(
                     student,
@@ -290,6 +319,8 @@ def main():
                     best_valid_loss,
                     best_loss_epoch,
                     cfg,
+                    cfg.distilled_train_checkpoint,
+                    cfg.distilled_checkpoint,
                 )
         if world_rank == 0:
             logger.info(
