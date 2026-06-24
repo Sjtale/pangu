@@ -197,19 +197,19 @@ def main():
                 loss2 = loss_func(out_upper_air, tar_upper_air, pressure_weights, level_weight=1.0).item()
                 # 总 loss
                 loss = loss1 + loss2
-
-                if cfg.world_size > 1:
-                    loss_tensor = torch.tensor(loss, device=local_rank)
-                    dist.all_reduce(loss_tensor)
-                    loss = loss_tensor.item() / cfg.world_size
                 valid_loss += loss
-                if world_rank == 0:
-                    logger.info(f'Valid: Epoch {epoch}-{val_count}/{max(1, len(val_dataloader)//val_stride)} '
+                if world_rank == 0 and val_count % 10 == 0:
+                    logger.info(f'Valid Step: {val_count} '
                             f'[cost {int((time.time()-start_time) // 60):02}:{int((time.time()-start_time) % 60):02}] '
-                            f'[{(time.time()-start_time)/(j+1): .02f}s/{cfg_data.dataloader.batch_size}batch] '
+                            f'[{(time.time()-start_time)/val_count: .02f}s/step] '
                             f'loss:{valid_loss / val_count: .04f}')
                 
-        valid_loss /= max(val_count, 1)
+        if cfg.world_size > 1:
+            loss_tensor = torch.tensor([valid_loss, float(val_count)], device=local_rank)
+            dist.all_reduce(loss_tensor)
+            valid_loss = loss_tensor[0].item() / max(loss_tensor[1].item(), 1.0)
+        else:
+            valid_loss /= max(val_count, 1)
         is_save_ckp = False
         if valid_loss < best_valid_loss:
             best_valid_loss = valid_loss

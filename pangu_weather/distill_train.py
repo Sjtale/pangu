@@ -275,6 +275,7 @@ def main():
         valid_loss = 0.0
         val_stride = int(getattr(cfg, "val_stride", 10))
         val_count = 0
+        start_val_time = time.time()
         with torch.no_grad():
             for j, data in enumerate(valid_loader):
                 if j % val_stride != 0:
@@ -292,11 +293,22 @@ def main():
                     target_upper_air,
                     weights,
                 )
-                if dist.is_initialized():
-                    dist.all_reduce(loss)
-                    loss /= world_size
                 valid_loss += loss.item()
-        valid_loss /= max(val_count, 1)
+                if world_rank == 0 and val_count % 10 == 0:
+                    logger.info(
+                        "Valid step %d (raw step %d) loss=%.4f [%.2fs/step]",
+                        val_count,
+                        j,
+                        valid_loss / val_count,
+                        (time.time() - start_val_time) / val_count,
+                    )
+
+        if dist.is_initialized():
+            loss_tensor = torch.tensor([valid_loss, float(val_count)], device=device)
+            dist.all_reduce(loss_tensor)
+            valid_loss = loss_tensor[0].item() / max(loss_tensor[1].item(), 1.0)
+        else:
+            valid_loss /= max(val_count, 1)
 
         scheduler.step()
         is_best = valid_loss < best_valid_loss
