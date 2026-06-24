@@ -41,9 +41,9 @@ echo "🔧 正在注入官方评测专用的配置参数..."
 CONFIG_FILE="$PANGU_DIR/conf/config.yaml"
 
 # 强制将数据集路径改为本地 ERA5_test 相对路径
-sed -i.bak -E 's|stats_dir:.*$|stats_dir: "../onedatasets/ERA5_test/stats/"|g' $CONFIG_FILE
-sed -i.bak -E 's|static_dir:.*$|static_dir: "../onedatasets/ERA5_test/static/"|g' $CONFIG_FILE
-sed -i.bak -E 's|data_dir:.*$|data_dir: "../onedatasets/ERA5_test/"|g' $CONFIG_FILE
+sed -i.bak -E 's|stats_dir:.*$|stats_dir: "../onedatasets/ERA5_test/stats/"     # AI4S，路径不可更改, 拉取本地ERA5数据|g' $CONFIG_FILE
+sed -i.bak -E 's|static_dir:.*$|static_dir: "../onedatasets/ERA5_test/static/"   # AI4S，路径不可更改, 拉取本地本地ERA5数据|g' $CONFIG_FILE
+sed -i.bak -E 's|data_dir:.*$|data_dir: "../onedatasets/ERA5_test/"            # AI4S，路径不可更改 , 拉取本地本地ERA5数据|g' $CONFIG_FILE
 
 # 强制修改年份配置为官方指定的值
 sed -i.bak -E 's/train_ratio:.*$/train_ratio: [1977]/g' $CONFIG_FILE
