@@ -226,8 +226,10 @@ if __name__ == "__main__":
         elif os.path.exists(fp16_ckpt_path):
             print(f"⚡ 加载 FP16 权重: {fp16_ckpt_path}")
             ckpt = torch.load(fp16_ckpt_path, map_location="cuda:0")
-            if "distillation" in ckpt or "pruning" in ckpt:
-                print("ℹ️ 检测到蒸馏/剪枝权重，自动启用剪枝架构")
+            state_dict = ckpt.get("model_state_dict", ckpt)
+            proj_weight = state_dict.get("patchembed2d.proj.weight")
+            if proj_weight is not None and proj_weight.shape[0] == cfg.pruned_embed_dim:
+                print("ℹ️ 检测到权重维度匹配剪枝架构，自动启用剪枝架构")
                 model_embed_dim = cfg.pruned_embed_dim
                 model_num_heads = cfg.pruned_num_heads
             else:
@@ -236,8 +238,10 @@ if __name__ == "__main__":
         else:
             print(f"ℹ️  未找到 FP16 权重，回退加载 FP32: {fp32_ckpt_path}")
             ckpt = torch.load(fp32_ckpt_path, map_location="cuda:0")
-            if "distillation" in ckpt or "pruning" in ckpt:
-                print("ℹ️ 检测到蒸馏/剪枝权重，自动启用剪枝架构")
+            state_dict = ckpt.get("model_state_dict", ckpt)
+            proj_weight = state_dict.get("patchembed2d.proj.weight")
+            if proj_weight is not None and proj_weight.shape[0] == cfg.pruned_embed_dim:
+                print("ℹ️ 检测到权重维度匹配剪枝架构，自动启用剪枝架构")
                 model_embed_dim = cfg.pruned_embed_dim
                 model_num_heads = cfg.pruned_num_heads
             else:
