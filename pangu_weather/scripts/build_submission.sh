@@ -13,7 +13,7 @@ set -e
 echo "🚀 开始构建比赛提交包..."
 
 SUBMIT_DIR="submit_package"
-PANGU_DIR="$SUBMIT_DIR/pangu_weather"
+PANGU_DIR="$SUBMIT_DIR/pangu-weather"
 
 # 1. 清理并创建干净的目录结构
 rm -rf $SUBMIT_DIR
@@ -60,7 +60,7 @@ rm -f $CONFIG_FILE.bak
 # 5. 打包为最终的 ZIP 文件
 echo "📦 正在压缩最终提交包..."
 cd $SUBMIT_DIR
-zip -r pangu_weather.zip pangu_weather/ > /dev/null
+zip -r pangu_weather.zip pangu-weather/ > /dev/null
 cd ..
 
 # 6. 验证包内容
