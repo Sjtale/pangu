@@ -18,7 +18,7 @@ PANGU_DIR="$SUBMIT_DIR/pangu-weather"
 # 1. 清理并创建干净的目录结构
 rm -rf $SUBMIT_DIR
 mkdir -p $PANGU_DIR/conf
-mkdir -p $PANGU_DIR/data/checkpoints
+mkdir -p $PANGU_DIR/data
 mkdir -p $PANGU_DIR/result/output
 
 # 2. 复制官方要求的必需文件
