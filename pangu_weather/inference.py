@@ -226,13 +226,23 @@ if __name__ == "__main__":
         elif os.path.exists(fp16_ckpt_path):
             print(f"⚡ 加载 FP16 权重: {fp16_ckpt_path}")
             ckpt = torch.load(fp16_ckpt_path, map_location="cuda:0")
-            model_embed_dim = cfg.embed_dim
-            model_num_heads = cfg.num_heads
+            if "distillation" in ckpt or "pruning" in ckpt:
+                print("ℹ️ 检测到蒸馏/剪枝权重，自动启用剪枝架构")
+                model_embed_dim = cfg.pruned_embed_dim
+                model_num_heads = cfg.pruned_num_heads
+            else:
+                model_embed_dim = cfg.embed_dim
+                model_num_heads = cfg.num_heads
         else:
             print(f"ℹ️  未找到 FP16 权重，回退加载 FP32: {fp32_ckpt_path}")
             ckpt = torch.load(fp32_ckpt_path, map_location="cuda:0")
-            model_embed_dim = cfg.embed_dim
-            model_num_heads = cfg.num_heads
+            if "distillation" in ckpt or "pruning" in ckpt:
+                print("ℹ️ 检测到蒸馏/剪枝权重，自动启用剪枝架构")
+                model_embed_dim = cfg.pruned_embed_dim
+                model_num_heads = cfg.pruned_num_heads
+            else:
+                model_embed_dim = cfg.embed_dim
+                model_num_heads = cfg.num_heads
 
         model = Pangu(img_size=cfg_data.dataset.img_size,
                       patch_size=cfg.patch_size,
