@@ -13,7 +13,7 @@ set -e
 echo "🚀 开始构建比赛提交包..."
 
 SUBMIT_DIR="submit_package"
-PANGU_DIR="$SUBMIT_DIR/pangu-weather"
+PANGU_DIR="$SUBMIT_DIR/pangu_weather"
 
 # 1. 清理并创建干净的目录结构
 rm -rf $SUBMIT_DIR
@@ -60,16 +60,16 @@ rm -f $CONFIG_FILE.bak
 # 5. 打包为最终的 ZIP 文件
 echo "📦 正在压缩最终提交包..."
 cd $SUBMIT_DIR
-zip -r pangu-weather.zip pangu-weather/ > /dev/null
+zip -r pangu_weather.zip pangu_weather/ > /dev/null
 cd ..
 
 # 6. 验证包内容
-echo "✅ 打包完成！提交包路径：$SUBMIT_DIR/pangu-weather.zip"
+echo "✅ 打包完成！提交包路径：$SUBMIT_DIR/pangu_weather.zip"
 echo "🔍 提交包内部结构预览："
-unzip -l $SUBMIT_DIR/pangu-weather.zip | grep -v "/$"
+unzip -l $SUBMIT_DIR/pangu_weather.zip | grep -v "/$"
 
 echo ""
 echo "🎉 [最终检查清单]"
 echo "1. 确保 download_model_url.txt 里的链接没有多余的空格。"
 echo "2. 确保 SCNet 上的模型压缩包是 .zip 格式，且解压后不要带一层冗余文件夹。"
-echo "3. 提交 pangu-weather.zip 给官方平台，外加一份你的优化文档 PDF！"
+echo "3. 提交 pangu_weather.zip 给官方平台，外加一份你的优化文档 PDF！"
