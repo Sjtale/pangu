@@ -138,6 +138,26 @@ def main():
     datapipe = ERA5Datapipe(params=cfg_data, distributed=dist.is_initialized())
     train_loader, train_sampler = datapipe.train_dataloader()
     valid_loader, valid_sampler = datapipe.val_dataloader()
+    val_stride = int(getattr(cfg, "val_stride", 10))
+    if val_stride > 1:
+        from torch.utils.data import Subset
+        valid_indices = list(range(0, len(valid_loader.dataset), val_stride))
+        valid_subset = Subset(valid_loader.dataset, valid_indices)
+        if dist.is_initialized():
+            from torch.utils.data.distributed import DistributedSampler
+            valid_sampler = DistributedSampler(valid_subset, shuffle=False)
+        else:
+            valid_sampler = None
+        valid_loader = torch.utils.data.DataLoader(
+            valid_subset,
+            batch_size=valid_loader.batch_size,
+            shuffle=False,
+            num_workers=valid_loader.num_workers,
+            pin_memory=valid_loader.pin_memory,
+            sampler=valid_sampler,
+            drop_last=valid_loader.drop_last,
+        )
+
     surface_weights = torch.as_tensor(
         cfg_data.dataset.weights[:4], device=device, dtype=torch.float32
     ).view(1, -1, 1, 1)
@@ -273,13 +293,10 @@ def main():
 
         student.eval()
         valid_loss = 0.0
-        val_stride = int(getattr(cfg, "val_stride", 10))
         val_count = 0
         start_val_time = time.time()
         with torch.no_grad():
             for j, data in enumerate(valid_loader):
-                if j % val_stride != 0:
-                    continue
                 val_count += 1
                 model_input, target_surface, target_upper_air = prepare_batch(
                     data, surface_mask, device
@@ -296,9 +313,9 @@ def main():
                 valid_loss += loss.item()
                 if world_rank == 0 and val_count % 10 == 0:
                     logger.info(
-                        "Valid step %d (raw step %d) loss=%.4f [%.2fs/step]",
+                        "Valid step %d/%d loss=%.4f [%.2fs/step]",
                         val_count,
-                        j,
+                        len(valid_loader),
                         valid_loss / val_count,
                         (time.time() - start_val_time) / val_count,
                     )

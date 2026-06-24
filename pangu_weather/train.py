@@ -41,6 +41,25 @@ def main():
     datapipe = ERA5Datapipe(params=cfg_data, distributed=dist.is_initialized())
     train_dataloader, train_sampler = datapipe.train_dataloader()
     val_dataloader, val_sampler = datapipe.val_dataloader()
+    val_stride = int(getattr(cfg, "val_stride", 10))
+    if val_stride > 1:
+        from torch.utils.data import Subset
+        val_indices = list(range(0, len(val_dataloader.dataset), val_stride))
+        val_subset = Subset(val_dataloader.dataset, val_indices)
+        if dist.is_initialized():
+            from torch.utils.data.distributed import DistributedSampler
+            val_sampler = DistributedSampler(val_subset, shuffle=False)
+        else:
+            val_sampler = None
+        val_dataloader = torch.utils.data.DataLoader(
+            val_subset,
+            batch_size=val_dataloader.batch_size,
+            shuffle=False,
+            num_workers=val_dataloader.num_workers,
+            pin_memory=val_dataloader.pin_memory,
+            sampler=val_sampler,
+            drop_last=val_dataloader.drop_last,
+        )
 
     surface_weights = torch.as_tensor(cfg_data.dataset.weights[:4], device=local_rank, dtype=torch.float32).view(1, -1, 1, 1)
     pressure_weights = torch.as_tensor(cfg_data.dataset.weights[4:], device=local_rank, dtype=torch.float32).view(1, -1, 1, 1)
