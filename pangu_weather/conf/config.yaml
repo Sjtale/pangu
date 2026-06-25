@@ -5,13 +5,33 @@ model:
     embed_dim: 192
     num_heads: [6, 12, 12, 6]
     window_size: [2, 6, 12]
+    student_profiles:
+      full_192:
+        patch_size: [2, 4, 4]
+        embed_dim: 192
+        num_heads: [6, 12, 12, 6]
+      student_160:
+        patch_size: [2, 4, 4]
+        embed_dim: 160
+        num_heads: [5, 10, 10, 5]
+      pgw_lite_patch8:
+        patch_size: [2, 8, 8]
+        embed_dim: 192
+        num_heads: [6, 12, 12, 6]
     pruned_embed_dim: 160
     pruned_num_heads: [5, 10, 10, 5]
     pruned_checkpoint: "model_pruned_fp16.pth"
     pruned_train_checkpoint: "model_pruned_train.pth"
     pruned_max_epoch: 10
+    default_student_profile: "student_160"
     distilled_checkpoint: "model_distilled_fp16.pth"
     distilled_train_checkpoint: "model_distilled_train.pth"
+    pgw_lite_profile: "pgw_lite_patch8"
+    pgw_lite_distilled_checkpoint: "model_pgw_lite_fp16.pth"
+    pgw_lite_distilled_train_checkpoint: "model_pgw_lite_train.pth"
+    pgw_lite_distilled_latest_checkpoint: "model_pgw_lite_latest.pth"
+    pgw_lite_quantized_checkpoint: "model_pgw_lite_quantized.pth"
+    quantized_checkpoint: "model_distilled_quantized.pth"
     distill_max_epoch: 20
     distill_learning_rate: 5.0e-5
     distill_ground_truth_weight: 0.3
@@ -34,7 +54,7 @@ datapipe:
     static_dir: "/public/SothisAI/sharingCenter/xiaodao2026/ERA5/old-data/static"
     data_dir: "/public/SothisAI/sharingCenter/xiaodao2026/ERA5/old-data"
 
-    train_ratio: [1980, 1981, 1982, 1983, 1984, 1985, 1986, 1987, 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999]
+    train_ratio: [1980, 1981, 1982, 1983, 1984, 1985, 1986, 1987, 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998]
     val_ratio: [2000]
     test_ratio: [2000]
 
@@ -131,8 +151,8 @@ datapipe:
   dataloader:
     mask_dtype: "float32"
     batch_size: 1                     # AI4S，批处理大小推理阶段不可更改
-    num_workers: 0 
-    pin_memory: false 
+    num_workers: 4 
+    pin_memory: true 
     drop_last: true
     shuffle: false  # 使用sampler时设为false
     persistent_workers: false
