@@ -117,11 +117,11 @@ def load_compatible_state(model, path, logger):
     compatible = {}
     warm_started_count = 0
     interpolated_count = 0
-    
+
     for key, target_val in target_state.items():
         if key not in source_state:
             continue
-        
+
         source_val = source_state[key]
         if tuple(source_val.shape) == tuple(target_val.shape):
             compatible[key] = source_val
@@ -134,10 +134,17 @@ def load_compatible_state(model, path, logger):
             interpolated = F.interpolate(
                 reshaped,
                 size=(t_shape[-2], t_shape[-1]),
-                mode='bilinear',
+                mode='bicubic',
                 align_corners=False
             ).view(t_shape)
-            compatible[key] = interpolated
+
+            # Apply scale factor if it is standard convolution (patchembed) to preserve activation scale
+            if "patchembed" in key:
+                scale = (s_shape[-2] * s_shape[-1]) / (t_shape[-2] * t_shape[-1])
+                compatible[key] = interpolated * scale
+            else:
+                compatible[key] = interpolated
+
             interpolated_count += 1
         elif "earth_position_bias_table" in key:
             # Earth-Specific Position Bias table interpolation
@@ -167,7 +174,7 @@ def load_compatible_state(model, path, logger):
                 interpolated = interpolated.view(n_tokens, num_heads, tgt_wins).permute(0, 2, 1)
             compatible[key] = interpolated
             interpolated_count += 1
-            
+
     model.load_state_dict(compatible, strict=False)
     logger.info(
         "Warm-started %d/%d tensors (including %d interpolated) from %s",
@@ -177,6 +184,7 @@ def load_compatible_state(model, path, logger):
         path,
     )
     return checkpoint
+
 
 
 def save_student(
@@ -242,6 +250,91 @@ def make_model(cfg_data, profile):
         num_heads=profile["num_heads"],
         window_size=profile["window_size"],
     )
+
+
+class WarmupCosineSchedule:
+    def __init__(self, optimizer, warmup_steps, total_steps, min_lr_ratio=0.01):
+        self.optimizer = optimizer
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.min_lr_ratio = min_lr_ratio
+
+        # Store the initial learning rate for each parameter group
+        self.base_lrs = [group['lr'] for group in optimizer.param_groups]
+        self.current_step = 0
+
+    def step(self):
+        self.current_step += 1
+        self._update_lr()
+
+    def _update_lr(self):
+        if self.current_step < self.warmup_steps:
+            # Linear warmup
+            factor = float(self.current_step) / float(max(1, self.warmup_steps))
+        else:
+            # Cosine decay
+            progress = float(self.current_step - self.warmup_steps) / float(max(1, self.total_steps - self.warmup_steps))
+            progress = min(1.0, max(0.0, progress))
+            cosine_decay = 0.5 * (1.0 + np.cos(np.pi * progress))
+            factor = self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cosine_decay
+
+        for i, group in enumerate(self.optimizer.param_groups):
+            group['lr'] = self.base_lrs[i] * factor
+
+    def state_dict(self):
+        return {
+            'current_step': self.current_step,
+            'warmup_steps': self.warmup_steps,
+            'total_steps': self.total_steps,
+            'min_lr_ratio': self.min_lr_ratio,
+            'base_lrs': self.base_lrs
+        }
+
+    def load_state_dict(self, state_dict):
+        self.current_step = state_dict.get('current_step', self.current_step)
+        self.warmup_steps = state_dict.get('warmup_steps', self.warmup_steps)
+        self.total_steps = state_dict.get('total_steps', self.total_steps)
+        self.min_lr_ratio = state_dict.get('min_lr_ratio', self.min_lr_ratio)
+        self.base_lrs = state_dict.get('base_lrs', self.base_lrs)
+        self._update_lr()
+
+
+def get_llrd_param_groups(model, base_lr, decay=0.95):
+    head_params = []
+    layer4_params = []
+    layer3_params = []
+    layer2_params = []
+    layer1_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        # Determine parameter group based on layer depth
+        if "patchembed" in name or "patchrecovery" in name or "earth_position_bias_table" in name:
+            head_params.append(param)
+        elif "layer4" in name or "upsample" in name:
+            layer4_params.append(param)
+        elif "layer3" in name:
+            layer3_params.append(param)
+        elif "layer2" in name or "downsample" in name:
+            layer2_params.append(param)
+        elif "layer1" in name:
+            layer1_params.append(param)
+        else:
+            layer1_params.append(param)
+
+    param_groups = [
+        {"params": head_params, "lr": base_lr * 10.0},
+        {"params": layer4_params, "lr": base_lr},
+        {"params": layer3_params, "lr": base_lr * decay},
+        {"params": layer2_params, "lr": base_lr * (decay ** 2)},
+        {"params": layer1_params, "lr": base_lr * (decay ** 3)},
+    ]
+
+    # Remove empty groups to avoid optimizer warnings
+    param_groups = [pg for pg in param_groups if len(pg["params"]) > 0]
+    return param_groups
 
 
 def main():
@@ -339,25 +432,24 @@ def main():
         student_checkpoint = load_compatible_state(student, teacher_path, logger)
     student.to(device)
 
-    # Group parameters: 10x learning rate for heads and bias tables
-    head_params = []
-    backbone_params = []
-    for name, param in student.named_parameters():
-        if not param.requires_grad:
-            continue
-        if "patchembed" in name or "patchrecovery" in name or "earth_position_bias_table" in name:
-            head_params.append(param)
-        else:
-            backbone_params.append(param)
+    # Group parameters with Layer-wise Learning Rate Decay (LLRD)
+    base_lr = float(cfg.distill_learning_rate)
+    param_groups = get_llrd_param_groups(student, base_lr, decay=0.95)
+    optimizer = optimizers.FusedAdam(param_groups, betas=(0.9, 0.999), weight_decay=3e-6)
 
-    optimizer = optimizers.FusedAdam([
-        {"params": backbone_params, "lr": float(cfg.distill_learning_rate)},
-        {"params": head_params, "lr": float(cfg.distill_learning_rate) * 10}
-    ], betas=(0.9, 0.999), weight_decay=3e-6)
+    # Initialize WarmupCosineSchedule scheduler
+    steps_per_epoch = min(int(cfg.distill_steps_per_epoch), len(train_loader))
+    total_epochs = int(cfg.distill_max_epoch)
+    total_steps = total_epochs * steps_per_epoch
+    warmup_steps = steps_per_epoch  # 1 epoch of warmup
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=int(cfg.distill_max_epoch)
+    scheduler = WarmupCosineSchedule(
+        optimizer=optimizer,
+        warmup_steps=warmup_steps,
+        total_steps=total_steps,
+        min_lr_ratio=0.01
     )
+
     best_valid_loss = float("inf")
     best_loss_epoch = 0
     start_epoch = 0
@@ -370,13 +462,26 @@ def main():
                 "Continuing with newly initialized optimizer states.",
                 str(e)
             )
-        try:
-            scheduler.load_state_dict(student_checkpoint["scheduler_state_dict"])
-        except Exception as e:
-            logger.warning("Could not load scheduler state dict: %s", str(e))
         best_valid_loss = student_checkpoint["best_valid_loss"]
         best_loss_epoch = student_checkpoint["best_loss_epoch"]
         start_epoch = student_checkpoint.get("epoch", -1) + 1
+
+        try:
+            scheduler_state = student_checkpoint["scheduler_state_dict"]
+            scheduler.load_state_dict(scheduler_state)
+            if "current_step" not in scheduler_state:
+                scheduler.current_step = start_epoch * steps_per_epoch
+                scheduler._update_lr()
+                logger.info(
+                    "Old scheduler state dict format detected. Resetting current_step = %d based on start_epoch = %d",
+                    scheduler.current_step,
+                    start_epoch
+                )
+        except Exception as e:
+            logger.warning("Could not load scheduler state dict: %s. Defaulting to calculated current_step.", str(e))
+            scheduler.current_step = start_epoch * steps_per_epoch
+            scheduler._update_lr()
+
     del student_checkpoint
 
     if dist.is_initialized():
@@ -433,12 +538,15 @@ def main():
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            scheduler.step()
             train_total += loss.item()
             train_hard += hard_loss.item()
             train_teacher += teacher_loss.item()
             if world_rank == 0:
+                lrs = [group["lr"] for group in optimizer.param_groups]
+                lr_str = ", ".join([f"{lr:.2e}" for lr in lrs[:3]])
                 logger.info(
-                    "Train %d-%d/%d [%.1fs/step] total=%.4f hard=%.4f teacher=%.4f",
+                    "Train %d-%d/%d [%.1fs/step] total=%.4f hard=%.4f teacher=%.4f | lrs: %s",
                     epoch,
                     step,
                     steps_per_epoch,
@@ -446,6 +554,7 @@ def main():
                     train_total / step,
                     train_hard / step,
                     train_teacher / step,
+                    lr_str,
                 )
 
         student.eval()
@@ -484,7 +593,6 @@ def main():
         else:
             valid_loss /= max(val_count, 1)
 
-        scheduler.step()
         is_best = valid_loss < best_valid_loss
         if is_best:
             best_valid_loss = valid_loss
