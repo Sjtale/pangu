@@ -1,6 +1,8 @@
-"""Distill the official Pangu model into the width-pruned student.
+"""Distill the official Pangu model into a lightweight student profile.
 
-Run from ``pangu_weather`` after generating the structured-pruning checkpoint:
+Run from ``pangu_weather`` after generating the structured-pruning checkpoint,
+or set ``PANGU_STUDENT_PROFILE=pgw_lite_patch8`` to train the PGW-Lite
+patch-size student:
 
     python scripts/prune_structured.py
     python distill_train.py
@@ -23,8 +25,8 @@ from torch.nn.parallel import DistributedDataParallel
 
 from onescience.datapipes.climate import ERA5Datapipe
 from onescience.memory.checkpoint import replace_function
-from onescience.models.pangu import Pangu
 from onescience.utils.YParams import YParams
+from pangu_profile_model import build_pangu_model
 
 
 def weighted_l1(prediction, target, weights, level_weight=1.0):
@@ -51,11 +53,129 @@ def checkpoint_path(cfg, name):
     return os.path.join(cfg.checkpoint_dir, name)
 
 
-def load_state(model, path):
+def cfg_list(value):
+    return [int(v) for v in value]
+
+
+def get_model_profile(cfg, profile_name):
+    profiles = getattr(cfg, "student_profiles", {})
+    if profile_name not in profiles:
+        raise ValueError(f"Unknown student profile: {profile_name}")
+    profile = profiles[profile_name]
+    return {
+        "name": profile_name,
+        "patch_size": cfg_list(profile.patch_size),
+        "embed_dim": int(profile.embed_dim),
+        "num_heads": cfg_list(profile.num_heads),
+    }
+
+
+def get_default_profile(cfg):
+    return {
+        "name": "full_192",
+        "patch_size": cfg_list(cfg.patch_size),
+        "embed_dim": int(cfg.embed_dim),
+        "num_heads": cfg_list(cfg.num_heads),
+    }
+
+
+def get_student_profile(cfg):
+    profile_name = os.environ.get(
+        "PANGU_STUDENT_PROFILE", getattr(cfg, "default_student_profile", "student_160")
+    )
+    return get_model_profile(cfg, profile_name)
+
+
+def get_profile_checkpoint_names(cfg, profile):
+    if profile["name"] == getattr(cfg, "pgw_lite_profile", "pgw_lite_patch8"):
+        return {
+            "latest": cfg.pgw_lite_distilled_latest_checkpoint,
+            "train": cfg.pgw_lite_distilled_train_checkpoint,
+            "inference": cfg.pgw_lite_distilled_checkpoint,
+        }
+    return {
+        "latest": "model_distilled_latest.pth",
+        "train": cfg.distilled_train_checkpoint,
+        "inference": cfg.distilled_checkpoint,
+    }
+
+
+def load_state(model, path, strict=True):
     if not os.path.exists(path):
         raise FileNotFoundError(path)
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    model.load_state_dict(checkpoint.pop("model_state_dict"), strict=True)
+    model.load_state_dict(checkpoint.pop("model_state_dict"), strict=strict)
+    return checkpoint
+
+
+def load_compatible_state(model, path, logger):
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    source_state = checkpoint.get("model_state_dict", checkpoint)
+    target_state = model.state_dict()
+    compatible = {}
+    warm_started_count = 0
+    interpolated_count = 0
+    
+    for key, target_val in target_state.items():
+        if key not in source_state:
+            continue
+        
+        source_val = source_state[key]
+        if tuple(source_val.shape) == tuple(target_val.shape):
+            compatible[key] = source_val
+            warm_started_count += 1
+        elif ("patchembed" in key or "patchrecovery" in key) and key.endswith(".proj.weight"):
+            # Conv3d / ConvTranspose3d weight interpolation
+            s_shape = source_val.shape
+            t_shape = target_val.shape
+            reshaped = source_val.view(-1, 1, s_shape[-2], s_shape[-1])
+            interpolated = F.interpolate(
+                reshaped,
+                size=(t_shape[-2], t_shape[-1]),
+                mode='bilinear',
+                align_corners=False
+            ).view(t_shape)
+            compatible[key] = interpolated
+            interpolated_count += 1
+        elif "earth_position_bias_table" in key:
+            # Earth-Specific Position Bias table interpolation
+            n_tokens, src_wins, num_heads = source_val.shape
+            tgt_wins = target_val.shape[1]
+            if src_wins % 4 == 0 and tgt_wins % 4 == 0:
+                src_lat_wins = src_wins // 4
+                tgt_lat_wins = tgt_wins // 4
+                reshaped = source_val.view(n_tokens, 4, src_lat_wins, num_heads)
+                reshaped = reshaped.permute(0, 3, 1, 2).reshape(-1, 1, src_lat_wins)
+                interpolated = F.interpolate(
+                    reshaped,
+                    size=tgt_lat_wins,
+                    mode='linear',
+                    align_corners=False
+                )
+                interpolated = interpolated.view(n_tokens, num_heads, 4, tgt_lat_wins)
+                interpolated = interpolated.permute(0, 2, 3, 1).reshape(n_tokens, -1, num_heads)
+            else:
+                reshaped = source_val.permute(0, 2, 1).reshape(-1, 1, src_wins)
+                interpolated = F.interpolate(
+                    reshaped,
+                    size=tgt_wins,
+                    mode='linear',
+                    align_corners=False
+                )
+                interpolated = interpolated.view(n_tokens, num_heads, tgt_wins).permute(0, 2, 1)
+            compatible[key] = interpolated
+            interpolated_count += 1
+            
+    model.load_state_dict(compatible, strict=False)
+    logger.info(
+        "Warm-started %d/%d tensors (including %d interpolated) from %s",
+        warm_started_count + interpolated_count,
+        len(target_state),
+        interpolated_count,
+        path,
+    )
     return checkpoint
 
 
@@ -67,6 +187,7 @@ def save_student(
     best_valid_loss,
     best_loss_epoch,
     cfg,
+    student_profile,
     train_checkpoint_name,
     inference_checkpoint_name=None,
 ):
@@ -78,6 +199,7 @@ def save_student(
         "epoch": epoch,
         "best_valid_loss": best_valid_loss,
         "best_loss_epoch": best_loss_epoch,
+        "model_profile": student_profile,
     }
     torch.save(train_state, checkpoint_path(cfg, train_checkpoint_name))
 
@@ -93,9 +215,11 @@ def save_student(
         },
         "distillation": {
             "teacher_embed_dim": int(cfg.embed_dim),
-            "student_embed_dim": int(cfg.pruned_embed_dim),
+            "student_profile": student_profile["name"],
+            "student_embed_dim": int(student_profile["embed_dim"]),
             "ground_truth_weight": float(cfg.distill_ground_truth_weight),
         },
+        "model_profile": student_profile,
     }
     torch.save(inference_state, checkpoint_path(cfg, inference_checkpoint_name))
 
@@ -110,13 +234,13 @@ def prepare_batch(data, surface_mask, device):
     return model_input, target_surface, target_upper_air
 
 
-def make_model(cfg, cfg_data, student):
-    return Pangu(
+def make_model(cfg_data, profile):
+    return build_pangu_model(
         img_size=cfg_data.dataset.img_size,
-        patch_size=cfg.patch_size,
-        embed_dim=cfg.pruned_embed_dim if student else cfg.embed_dim,
-        num_heads=cfg.pruned_num_heads if student else cfg.num_heads,
-        window_size=cfg.window_size,
+        patch_size=profile["patch_size"],
+        embed_dim=profile["embed_dim"],
+        num_heads=profile["num_heads"],
+        window_size=profile["window_size"],
     )
 
 
@@ -127,6 +251,11 @@ def main():
     config_path = os.path.join(current_path, "conf/config.yaml")
     cfg = YParams(config_path, "model")
     cfg_data = YParams(config_path, "datapipe")
+    teacher_profile = get_default_profile(cfg)
+    teacher_profile["window_size"] = cfg_list(cfg.window_size)
+    student_profile = get_student_profile(cfg)
+    student_profile["window_size"] = cfg_list(cfg.window_size)
+    checkpoint_names = get_profile_checkpoint_names(cfg, student_profile)
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -178,7 +307,7 @@ def main():
         cfg_data.dataloader.batch_size, 1, 1, 1
     )
 
-    teacher = make_model(cfg, cfg_data, student=False).half()
+    teacher = make_model(cfg_data, teacher_profile).half()
     local_teacher = checkpoint_path(cfg, "model_bak.pth")
     backup_teacher = os.path.join(cfg.official_checkpoint_dir, "model_bak.pth")
     teacher_path = local_teacher if os.path.exists(local_teacher) else backup_teacher
@@ -186,10 +315,10 @@ def main():
     teacher.to(device).eval()
     teacher.requires_grad_(False)
 
-    student = make_model(cfg, cfg_data, student=True)
-    latest_train_checkpoint = "model_distilled_latest.pth"
+    student = make_model(cfg_data, student_profile)
+    latest_train_checkpoint = checkpoint_names["latest"]
     latest_train_path = checkpoint_path(cfg, latest_train_checkpoint)
-    distilled_train_path = checkpoint_path(cfg, cfg.distilled_train_checkpoint)
+    distilled_train_path = checkpoint_path(cfg, checkpoint_names["train"])
     pruned_train_path = checkpoint_path(cfg, cfg.pruned_train_checkpoint)
     pruned_path = checkpoint_path(cfg, cfg.pruned_checkpoint)
     resume = os.path.exists(latest_train_path) or os.path.exists(distilled_train_path)
@@ -197,19 +326,35 @@ def main():
         initial_student_path = latest_train_path
     elif os.path.exists(distilled_train_path):
         initial_student_path = distilled_train_path
-    elif os.path.exists(pruned_train_path):
+    elif student_profile["name"] == "student_160" and os.path.exists(pruned_train_path):
         initial_student_path = pruned_train_path
     else:
-        initial_student_path = pruned_path
-    student_checkpoint = load_state(student, initial_student_path)
+        initial_student_path = pruned_path if student_profile["name"] == "student_160" else teacher_path
+    if os.path.exists(initial_student_path) and (
+        initial_student_path != teacher_path or student_profile["name"] == "full_192"
+    ):
+        student_checkpoint = load_state(student, initial_student_path)
+    else:
+        initial_student_path = teacher_path
+        student_checkpoint = load_compatible_state(student, teacher_path, logger)
     student.to(device)
 
-    optimizer = optimizers.FusedAdam(
-        student.parameters(),
-        betas=(0.9, 0.999),
-        lr=float(cfg.distill_learning_rate),
-        weight_decay=3e-6,
-    )
+    # Group parameters: 10x learning rate for heads and bias tables
+    head_params = []
+    backbone_params = []
+    for name, param in student.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "patchembed" in name or "patchrecovery" in name or "earth_position_bias_table" in name:
+            head_params.append(param)
+        else:
+            backbone_params.append(param)
+
+    optimizer = optimizers.FusedAdam([
+        {"params": backbone_params, "lr": float(cfg.distill_learning_rate)},
+        {"params": head_params, "lr": float(cfg.distill_learning_rate) * 10}
+    ], betas=(0.9, 0.999), weight_decay=3e-6)
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=int(cfg.distill_max_epoch)
     )
@@ -217,8 +362,18 @@ def main():
     best_loss_epoch = 0
     start_epoch = 0
     if resume:
-        optimizer.load_state_dict(student_checkpoint["optimizer_state_dict"])
-        scheduler.load_state_dict(student_checkpoint["scheduler_state_dict"])
+        try:
+            optimizer.load_state_dict(student_checkpoint["optimizer_state_dict"])
+        except Exception as e:
+            logger.warning(
+                "Could not load optimizer state dict due to param_groups mismatch: %s. "
+                "Continuing with newly initialized optimizer states.",
+                str(e)
+            )
+        try:
+            scheduler.load_state_dict(student_checkpoint["scheduler_state_dict"])
+        except Exception as e:
+            logger.warning("Could not load scheduler state dict: %s", str(e))
         best_valid_loss = student_checkpoint["best_valid_loss"]
         best_loss_epoch = student_checkpoint["best_loss_epoch"]
         start_epoch = student_checkpoint.get("epoch", -1) + 1
@@ -234,9 +389,11 @@ def main():
     if not 0.0 <= ground_truth_weight <= 1.0:
         raise ValueError("distill_ground_truth_weight must be in [0, 1]")
     logger.info(
-        "Distillation starts: teacher=%s, student=%s, data=%s, years=%s, "
+        "Distillation starts: teacher=%s, student_profile=%s, init=%s, "
+        "data=%s, years=%s, "
         "ground_truth_weight=%.2f",
         teacher_path,
+        student_profile["name"],
         initial_student_path,
         cfg_data.dataset.data_dir,
         cfg_data.dataset.train_ratio,
@@ -341,6 +498,7 @@ def main():
                 best_valid_loss,
                 best_loss_epoch,
                 cfg,
+                student_profile,
                 latest_train_checkpoint,
             )
         if is_best:
@@ -353,8 +511,9 @@ def main():
                     best_valid_loss,
                     best_loss_epoch,
                     cfg,
-                    cfg.distilled_train_checkpoint,
-                    cfg.distilled_checkpoint,
+                    student_profile,
+                    checkpoint_names["train"],
+                    checkpoint_names["inference"],
                 )
         if world_rank == 0:
             logger.info(
