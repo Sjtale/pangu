@@ -227,8 +227,11 @@ if __name__ == "__main__":
             print(f"⚡ 加载 FP16 权重: {fp16_ckpt_path}")
             ckpt = torch.load(fp16_ckpt_path, map_location="cuda:0")
             state_dict = ckpt.get("model_state_dict", ckpt)
-            proj_weight = state_dict.get("patchembed2d.proj.weight")
-            if proj_weight is not None and proj_weight.shape[0] == cfg.pruned_embed_dim:
+            is_pruned = any(
+                isinstance(tensor, torch.Tensor) and tensor.ndim > 0 and tensor.shape[0] == cfg.pruned_embed_dim
+                for tensor in state_dict.values()
+            )
+            if is_pruned:
                 print("ℹ️ 检测到权重维度匹配剪枝架构，自动启用剪枝架构")
                 model_embed_dim = cfg.pruned_embed_dim
                 model_num_heads = cfg.pruned_num_heads
@@ -239,14 +242,39 @@ if __name__ == "__main__":
             print(f"ℹ️  未找到 FP16 权重，回退加载 FP32: {fp32_ckpt_path}")
             ckpt = torch.load(fp32_ckpt_path, map_location="cuda:0")
             state_dict = ckpt.get("model_state_dict", ckpt)
-            proj_weight = state_dict.get("patchembed2d.proj.weight")
-            if proj_weight is not None and proj_weight.shape[0] == cfg.pruned_embed_dim:
+            is_pruned = any(
+                isinstance(tensor, torch.Tensor) and tensor.ndim > 0 and tensor.shape[0] == cfg.pruned_embed_dim
+                for tensor in state_dict.values()
+            )
+            if is_pruned:
                 print("ℹ️ 检测到权重维度匹配剪枝架构，自动启用剪枝架构")
                 model_embed_dim = cfg.pruned_embed_dim
                 model_num_heads = cfg.pruned_num_heads
             else:
                 model_embed_dim = cfg.embed_dim
                 model_num_heads = cfg.num_heads
+
+        use_fp16 = os.environ.get("PANGU_USE_FP16", "1") == "1"
+        target_dtype = torch.float16 if use_fp16 else torch.float32
+
+        # ---- 反量化重建逻辑（仅在模型加载时运行，不影响单样本推理计时）----
+        state_dict = ckpt.get("model_state_dict", ckpt)
+        dequantized_state_dict = {}
+        for key, value in state_dict.items():
+            if key.endswith(".weight") and value.dtype == torch.int8:
+                scale_key = key + "_scale"
+                if scale_key in state_dict:
+                    scale = state_dict[scale_key]
+                    dequantized_state_dict[key] = (
+                        value.to(device='cuda:0', dtype=torch.float32) * scale.to(device='cuda:0')
+                    ).to(target_dtype)
+                else:
+                    dequantized_state_dict[key] = value.to(device='cuda:0', dtype=target_dtype if torch.is_floating_point(value) else value.dtype)
+            elif key.endswith("_scale"):
+                continue
+            else:
+                dequantized_state_dict[key] = value.to(device='cuda:0', dtype=target_dtype if torch.is_floating_point(value) else value.dtype)
+        ckpt["model_state_dict"] = dequantized_state_dict
 
         model = Pangu(img_size=cfg_data.dataset.img_size,
                       patch_size=cfg.patch_size,
@@ -255,7 +283,6 @@ if __name__ == "__main__":
                       window_size=cfg.window_size,
                       ).to('cuda:0')
         model.load_state_dict(ckpt["model_state_dict"])
-        use_fp16 = os.environ.get("PANGU_USE_FP16", "1") == "1"
         if use_fp16:
             model.half()   # FP16: 确保整个模型在半精度下运行
         model.eval()
