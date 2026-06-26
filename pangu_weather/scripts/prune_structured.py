@@ -15,7 +15,9 @@ from collections import OrderedDict
 
 import torch
 
-from onescience.models.pangu import Pangu
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from pangu_profile_model import build_pangu_model
 from onescience.utils.YParams import YParams
 
 
@@ -271,7 +273,7 @@ def prune_checkpoint(args):
     )
     img_size = cfg.img_size if hasattr(cfg, "img_size") else (721, 1440)
 
-    source_model = Pangu(
+    source_model = build_pangu_model(
         img_size=img_size,
         patch_size=patch_size,
         embed_dim=source_width,
@@ -281,7 +283,7 @@ def prune_checkpoint(args):
     source_parameters = sum(parameter.numel() for parameter in source_model.parameters())
     del source_model
 
-    target_model = Pangu(
+    target_model = build_pangu_model(
         img_size=img_size,
         patch_size=patch_size,
         embed_dim=args.target_embed_dim,

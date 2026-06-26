@@ -26,6 +26,7 @@ echo "📋 正在复制必要文件..."
 cp conf/config.yaml $PANGU_DIR/conf/
 cp train.py $PANGU_DIR/
 cp inference.py $PANGU_DIR/
+cp pangu_profile_model.py $PANGU_DIR/
 cp README.md $PANGU_DIR/
 
 # 3. 检查 download_model_url.txt
