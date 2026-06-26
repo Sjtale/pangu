@@ -18,6 +18,10 @@ model:
         patch_size: [2, 8, 8]
         embed_dim: 192
         num_heads: [6, 12, 12, 6]
+      pgw_lite_pruned_128:
+        patch_size: [2, 8, 8]
+        embed_dim: 128
+        num_heads: [4, 8, 8, 4]
     pruned_embed_dim: 160
     pruned_num_heads: [5, 10, 10, 5]
     pruned_checkpoint: "model_pruned_fp16.pth"

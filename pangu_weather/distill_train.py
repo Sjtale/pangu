@@ -87,16 +87,23 @@ def get_student_profile(cfg):
 
 
 def get_profile_checkpoint_names(cfg, profile):
-    if profile["name"] == getattr(cfg, "pgw_lite_profile", "pgw_lite_patch8"):
+    name = profile["name"]
+    if name == "student_160":
+        return {
+            "latest": "model_distilled_latest.pth",
+            "train": cfg.distilled_train_checkpoint,
+            "inference": cfg.distilled_checkpoint,
+        }
+    if name == "pgw_lite_patch8":
         return {
             "latest": cfg.pgw_lite_distilled_latest_checkpoint,
             "train": cfg.pgw_lite_distilled_train_checkpoint,
             "inference": cfg.pgw_lite_distilled_checkpoint,
         }
     return {
-        "latest": "model_distilled_latest.pth",
-        "train": cfg.distilled_train_checkpoint,
-        "inference": cfg.distilled_checkpoint,
+        "latest": f"model_{name}_latest.pth",
+        "train": f"model_{name}_train.pth",
+        "inference": f"model_{name}_fp16.pth",
     }
 
 
@@ -338,7 +345,20 @@ def get_llrd_param_groups(model, base_lr, decay=0.95):
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    handlers = [logging.StreamHandler(sys.stdout)]
+    if local_rank == 0:
+        log_dir = "logs"
+        os.makedirs(log_dir, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        log_file = os.path.join(log_dir, f"distill_train_{timestamp}.log")
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=handlers
+    )
     logger = logging.getLogger(__name__)
     current_path = os.getcwd()
     config_path = os.path.join(current_path, "conf/config.yaml")
@@ -412,17 +432,24 @@ def main():
     latest_train_checkpoint = checkpoint_names["latest"]
     latest_train_path = checkpoint_path(cfg, latest_train_checkpoint)
     distilled_train_path = checkpoint_path(cfg, checkpoint_names["train"])
-    pruned_train_path = checkpoint_path(cfg, cfg.pruned_train_checkpoint)
-    pruned_path = checkpoint_path(cfg, cfg.pruned_checkpoint)
     resume = os.path.exists(latest_train_path) or os.path.exists(distilled_train_path)
+
+    name = student_profile["name"]
+    pruned_start_path = checkpoint_path(cfg, f"model_{name}.pth")
+
     if os.path.exists(latest_train_path):
         initial_student_path = latest_train_path
     elif os.path.exists(distilled_train_path):
         initial_student_path = distilled_train_path
-    elif student_profile["name"] == "student_160" and os.path.exists(pruned_train_path):
-        initial_student_path = pruned_train_path
+    elif os.path.exists(pruned_start_path):
+        initial_student_path = pruned_start_path
+        logger.info("Warm-starting training from pruned checkpoint: %s", pruned_start_path)
+    elif name == "student_160" and os.path.exists(checkpoint_path(cfg, cfg.pruned_train_checkpoint)):
+        initial_student_path = checkpoint_path(cfg, cfg.pruned_train_checkpoint)
     else:
-        initial_student_path = pruned_path if student_profile["name"] == "student_160" else teacher_path
+        legacy_pruned = checkpoint_path(cfg, cfg.pruned_checkpoint)
+        initial_student_path = legacy_pruned if name == "student_160" else teacher_path
+
     if os.path.exists(initial_student_path) and (
         initial_student_path != teacher_path or student_profile["name"] == "full_192"
     ):
@@ -441,7 +468,7 @@ def main():
     steps_per_epoch = min(int(cfg.distill_steps_per_epoch), len(train_loader))
     total_epochs = int(cfg.distill_max_epoch)
     total_steps = total_epochs * steps_per_epoch
-    warmup_steps = steps_per_epoch  # 1 epoch of warmup
+    warmup_steps = int(getattr(cfg, "distill_warmup_steps", 256))
 
     scheduler = WarmupCosineSchedule(
         optimizer=optimizer,

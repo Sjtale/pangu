@@ -231,8 +231,30 @@ def _migrate_tensor(
 
 def prune_checkpoint(args):
     cfg = YParams(args.config, "model")
-    source_width = int(cfg.embed_dim)
-    source_heads = tuple(int(value) for value in cfg.num_heads)
+    source_path = args.source
+    if not os.path.exists(source_path):
+        backup_path = os.path.join(cfg.official_checkpoint_dir, "model_bak.pth")
+        if not os.path.exists(backup_path):
+            raise FileNotFoundError(
+                f"Neither pruning source {source_path} nor backup {backup_path} exists"
+            )
+        source_path = backup_path
+        print(f"FP16 source not found; use official FP32 backup: {source_path}")
+    checkpoint = torch.load(source_path, map_location="cpu", weights_only=False)
+    source_state = checkpoint["model_state_dict"]
+
+    # Inferred source parameters from model_profile metadata if available
+    profile = checkpoint.get("model_profile", None)
+    if profile is not None:
+        source_width = int(profile.get("embed_dim", cfg.embed_dim))
+        source_heads = tuple(int(value) for value in profile.get("num_heads", cfg.num_heads))
+        patch_size = list(profile.get("patch_size", cfg.patch_size))
+        print(f"Inferred source profile from checkpoint: patch_size={patch_size}, embed_dim={source_width}, num_heads={source_heads}")
+    else:
+        source_width = int(cfg.embed_dim)
+        source_heads = tuple(int(value) for value in cfg.num_heads)
+        patch_size = cfg.patch_size
+
     head_dim = source_width // source_heads[0]
     if source_width % source_heads[0] or source_width * 2 % source_heads[1]:
         raise ValueError("Source embed dimensions must be divisible by attention heads")
@@ -247,22 +269,11 @@ def prune_checkpoint(args):
         args.target_embed_dim * 2 // head_dim,
         args.target_embed_dim // head_dim,
     )
-    source_path = args.source
-    if not os.path.exists(source_path):
-        backup_path = os.path.join(cfg.official_checkpoint_dir, "model_bak.pth")
-        if not os.path.exists(backup_path):
-            raise FileNotFoundError(
-                f"Neither pruning source {source_path} nor backup {backup_path} exists"
-            )
-        source_path = backup_path
-        print(f"FP16 source not found; use official FP32 backup: {source_path}")
-    checkpoint = torch.load(source_path, map_location="cpu", weights_only=False)
-    source_state = checkpoint["model_state_dict"]
     img_size = cfg.img_size if hasattr(cfg, "img_size") else (721, 1440)
 
     source_model = Pangu(
         img_size=img_size,
-        patch_size=cfg.patch_size,
+        patch_size=patch_size,
         embed_dim=source_width,
         num_heads=source_heads,
         window_size=cfg.window_size,
@@ -272,7 +283,7 @@ def prune_checkpoint(args):
 
     target_model = Pangu(
         img_size=img_size,
-        patch_size=cfg.patch_size,
+        patch_size=patch_size,
         embed_dim=args.target_embed_dim,
         num_heads=target_heads,
         window_size=cfg.window_size,
@@ -318,8 +329,21 @@ def prune_checkpoint(args):
         "shallow_channels": residual["shallow"].tolist(),
         "deep_channels": residual["deep"].tolist(),
     }
+    model_profile = {
+        "name": f"pgw_lite_pruned_{args.target_embed_dim}" if patch_size == [2, 8, 8] else f"student_{args.target_embed_dim}",
+        "patch_size": patch_size,
+        "embed_dim": args.target_embed_dim,
+        "num_heads": list(target_heads),
+    }
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    torch.save({"model_state_dict": output_state, "pruning": metadata}, args.output)
+    torch.save(
+        {
+            "model_state_dict": output_state,
+            "pruning": metadata,
+            "model_profile": model_profile,
+        },
+        args.output,
+    )
 
     target_parameters = sum(parameter.numel() for parameter in target_model.parameters())
     source_size = os.path.getsize(source_path)

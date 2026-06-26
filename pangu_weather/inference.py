@@ -8,9 +8,9 @@ from tqdm import tqdm
 import time
 import json
 import gc
-from onescience.models.pangu import Pangu
 from onescience.utils.YParams import YParams
 from onescience.datapipes.climate import ERA5Datapipe
+from pangu_profile_model import build_pangu_model
 
 # ---- 方向4.2: cuDNN 自动调优（固定输入尺寸 721×1440, batch=1）----
 torch.backends.cudnn.benchmark = True
@@ -141,6 +141,128 @@ def get_stats(data_dir, stats_dir, channels):
     return means, stds
 
 
+def _cfg_list(value):
+    return [int(v) for v in value]
+
+
+def _is_enabled(name):
+    return os.environ.get(name, "0").lower() not in {"0", "false", "no"}
+
+
+def _profile_from_config(cfg, profile_name):
+    profiles = getattr(cfg, "student_profiles", {})
+    if profile_name not in profiles:
+        raise ValueError(f"Unknown model profile: {profile_name}")
+    profile = profiles[profile_name]
+    return {
+        "name": profile_name,
+        "patch_size": _cfg_list(profile.patch_size),
+        "embed_dim": int(profile.embed_dim),
+        "num_heads": _cfg_list(profile.num_heads),
+        "window_size": _cfg_list(cfg.window_size),
+    }
+
+
+def _default_profile(cfg):
+    return {
+        "name": "full_192",
+        "patch_size": _cfg_list(cfg.patch_size),
+        "embed_dim": int(cfg.embed_dim),
+        "num_heads": _cfg_list(cfg.num_heads),
+        "window_size": _cfg_list(cfg.window_size),
+    }
+
+
+def _profile_from_metadata(cfg, metadata):
+    if not isinstance(metadata, dict):
+        return None
+    profile_name = metadata.get("name")
+    if profile_name and profile_name in getattr(cfg, "student_profiles", {}):
+        profile = _profile_from_config(cfg, profile_name)
+    else:
+        profile = _default_profile(cfg)
+        if profile_name:
+            profile["name"] = profile_name
+    if "patch_size" in metadata:
+        profile["patch_size"] = _cfg_list(metadata["patch_size"])
+    if "embed_dim" in metadata:
+        profile["embed_dim"] = int(metadata["embed_dim"])
+    if "num_heads" in metadata:
+        profile["num_heads"] = _cfg_list(metadata["num_heads"])
+    if "window_size" in metadata:
+        profile["window_size"] = _cfg_list(metadata["window_size"])
+    return profile
+
+
+def _infer_profile_from_state(cfg, ckpt, state_dict):
+    profile = _profile_from_metadata(cfg, ckpt.get("model_profile"))
+    if profile is not None:
+        return profile
+
+    quant_meta = ckpt.get("quantization", {})
+    quant_profile = quant_meta.get("target_profile") if isinstance(quant_meta, dict) else None
+    if quant_profile in getattr(cfg, "student_profiles", {}):
+        return _profile_from_config(cfg, quant_profile)
+
+    distill_meta = ckpt.get("distillation", {})
+    distill_profile = distill_meta.get("student_profile") if isinstance(distill_meta, dict) else None
+    if distill_profile in getattr(cfg, "student_profiles", {}):
+        return _profile_from_config(cfg, distill_profile)
+
+    profile = _default_profile(cfg)
+    embed_weight = next(
+        (
+            tensor
+            for key, tensor in state_dict.items()
+            if key.endswith("patchembed2d.embedder.proj.weight")
+            or key.endswith("patchembed2d.proj.weight")
+        ),
+        None,
+    )
+    if isinstance(embed_weight, torch.Tensor):
+        profile["embed_dim"] = int(embed_weight.shape[0])
+        profile["patch_size"] = [int(v) for v in embed_weight.shape[-3:]]
+    if profile["embed_dim"] == int(cfg.pruned_embed_dim):
+        profile["name"] = "student_160"
+        profile["num_heads"] = _cfg_list(cfg.pruned_num_heads)
+    elif profile["patch_size"][-2:] == [8, 8]:
+        profile["name"] = getattr(cfg, "pgw_lite_profile", "pgw_lite_patch8")
+    return profile
+
+
+def _load_checkpoint(path):
+    ckpt = torch.load(path, map_location="cuda:0")
+    state_dict = ckpt.get("model_state_dict", ckpt)
+    return ckpt, state_dict
+
+
+def _dequantize_state_dict(state_dict, target_dtype):
+    dequantized_state_dict = {}
+    for key, value in state_dict.items():
+        if key.endswith(".weight") and value.dtype == torch.int8:
+            scale_key = key + "_scale"
+            if scale_key in state_dict:
+                scale = state_dict[scale_key].to(device="cuda:0", dtype=torch.float32)
+                if scale.ndim == 1 and value.ndim == 2:
+                    scale = scale.view(-1, 1)
+                dequantized_state_dict[key] = (
+                    value.to(device="cuda:0", dtype=torch.float32) * scale
+                ).to(target_dtype)
+            else:
+                dequantized_state_dict[key] = value.to(
+                    device="cuda:0",
+                    dtype=target_dtype if torch.is_floating_point(value) else value.dtype,
+                )
+        elif key.endswith("_scale"):
+            continue
+        else:
+            dequantized_state_dict[key] = value.to(
+                device="cuda:0",
+                dtype=target_dtype if torch.is_floating_point(value) else value.dtype,
+            )
+    return dequantized_state_dict
+
+
 if __name__ == "__main__":
     current_path = os.getcwd()
     sys.path.append(current_path)
@@ -170,21 +292,46 @@ if __name__ == "__main__":
     use_onnx = False
     pruned_ckpt_path = f"{cfg.checkpoint_dir}/{cfg.pruned_checkpoint}"
     distilled_ckpt_path = f"{cfg.checkpoint_dir}/{cfg.distilled_checkpoint}"
+    
+    # Resolve profile-specific pgw_lite filenames dynamically
+    profile_name = os.environ.get("PANGU_STUDENT_PROFILE", getattr(cfg, "default_student_profile", "student_160"))
+    if "pgw_lite" in profile_name:
+        pgw_lite_quantized_path = f"{cfg.checkpoint_dir}/model_{profile_name}_quantized.pth"
+        pgw_lite_ckpt_path = f"{cfg.checkpoint_dir}/model_{profile_name}_fp16.pth"
+        # Backward compatibility fallback for pgw_lite_patch8 configured names
+        if profile_name == "pgw_lite_patch8":
+            legacy_quant = f"{cfg.checkpoint_dir}/{cfg.pgw_lite_quantized_checkpoint}"
+            legacy_fp16 = f"{cfg.checkpoint_dir}/{cfg.pgw_lite_distilled_checkpoint}"
+            if not os.path.exists(pgw_lite_quantized_path) and os.path.exists(legacy_quant):
+                pgw_lite_quantized_path = legacy_quant
+            if not os.path.exists(pgw_lite_ckpt_path) and os.path.exists(legacy_fp16):
+                pgw_lite_ckpt_path = legacy_fp16
+    else:
+        pgw_lite_quantized_path = f"{cfg.checkpoint_dir}/{cfg.pgw_lite_quantized_checkpoint}"
+        pgw_lite_ckpt_path = f"{cfg.checkpoint_dir}/{cfg.pgw_lite_distilled_checkpoint}"
+
+    distilled_quantized_path = f"{cfg.checkpoint_dir}/{getattr(cfg, 'quantized_checkpoint', 'model_distilled_quantized.pth')}"
+    enable_pgw_lite = (
+        _is_enabled("PANGU_USE_PGW_LITE")
+        and (os.path.exists(pgw_lite_quantized_path) or os.path.exists(pgw_lite_ckpt_path))
+    )
     enable_distilled = (
-        os.environ.get("PANGU_USE_DISTILLED", "0").lower()
-        not in {"0", "false", "no"}
+        _is_enabled("PANGU_USE_DISTILLED")
         and os.path.exists(distilled_ckpt_path)
+        and not enable_pgw_lite
     )
     enable_pruned = (
-        os.environ.get("PANGU_USE_PRUNED", "0").lower() not in {"0", "false", "no"}
+        _is_enabled("PANGU_USE_PRUNED")
         and os.path.exists(pruned_ckpt_path)
         and not enable_distilled
+        and not enable_pgw_lite
     )
     # DCU 实测 ONNX ROCm EP 比 PyTorch FP16 慢，因此默认使用 PyTorch。
     enable_onnx = (
-        os.environ.get("PANGU_USE_ONNX", "0").lower() not in {"0", "false", "no"}
+        _is_enabled("PANGU_USE_ONNX")
         and not enable_pruned
         and not enable_distilled
+        and not enable_pgw_lite
     )
 
     for onnx_candidate in [onnx_sim_path, onnx_raw_path] if enable_onnx else []:
@@ -213,76 +360,50 @@ if __name__ == "__main__":
         fp32_ckpt_path = (
             local_fp32_path if os.path.exists(local_fp32_path) else backup_fp32_path
         )
-        if enable_distilled:
+        if enable_pgw_lite:
+            selected_path = pgw_lite_quantized_path if os.path.exists(pgw_lite_quantized_path) else pgw_lite_ckpt_path
+            print(f"加载 PGW-Lite 学生权重: {selected_path}")
+            ckpt, state_dict = _load_checkpoint(selected_path)
+            model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
+        elif enable_distilled:
             print(f"加载知识蒸馏学生权重: {distilled_ckpt_path}")
-            ckpt = torch.load(distilled_ckpt_path, map_location="cuda:0")
-            model_embed_dim = cfg.pruned_embed_dim
-            model_num_heads = cfg.pruned_num_heads
+            ckpt, state_dict = _load_checkpoint(distilled_ckpt_path)
+            model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
         elif enable_pruned:
             print(f"✂️  加载结构化剪枝权重: {pruned_ckpt_path}")
-            ckpt = torch.load(pruned_ckpt_path, map_location="cuda:0")
-            model_embed_dim = cfg.pruned_embed_dim
-            model_num_heads = cfg.pruned_num_heads
+            ckpt, state_dict = _load_checkpoint(pruned_ckpt_path)
+            model_profile = _profile_from_config(cfg, "student_160")
         elif os.path.exists(fp16_ckpt_path):
             print(f"⚡ 加载 FP16 权重: {fp16_ckpt_path}")
-            ckpt = torch.load(fp16_ckpt_path, map_location="cuda:0")
-            state_dict = ckpt.get("model_state_dict", ckpt)
-            is_pruned = any(
-                isinstance(tensor, torch.Tensor) and tensor.ndim > 0 and tensor.shape[0] == cfg.pruned_embed_dim
-                for tensor in state_dict.values()
-            )
-            if is_pruned:
-                print("ℹ️ 检测到权重维度匹配剪枝架构，自动启用剪枝架构")
-                model_embed_dim = cfg.pruned_embed_dim
-                model_num_heads = cfg.pruned_num_heads
-            else:
-                model_embed_dim = cfg.embed_dim
-                model_num_heads = cfg.num_heads
+            ckpt, state_dict = _load_checkpoint(fp16_ckpt_path)
+            model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
+        elif os.path.exists(distilled_quantized_path):
+            print(f"⚡ 加载量化学生权重: {distilled_quantized_path}")
+            ckpt, state_dict = _load_checkpoint(distilled_quantized_path)
+            model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
         else:
             print(f"ℹ️  未找到 FP16 权重，回退加载 FP32: {fp32_ckpt_path}")
-            ckpt = torch.load(fp32_ckpt_path, map_location="cuda:0")
-            state_dict = ckpt.get("model_state_dict", ckpt)
-            is_pruned = any(
-                isinstance(tensor, torch.Tensor) and tensor.ndim > 0 and tensor.shape[0] == cfg.pruned_embed_dim
-                for tensor in state_dict.values()
-            )
-            if is_pruned:
-                print("ℹ️ 检测到权重维度匹配剪枝架构，自动启用剪枝架构")
-                model_embed_dim = cfg.pruned_embed_dim
-                model_num_heads = cfg.pruned_num_heads
-            else:
-                model_embed_dim = cfg.embed_dim
-                model_num_heads = cfg.num_heads
+            ckpt, state_dict = _load_checkpoint(fp32_ckpt_path)
+            model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
+        print(
+            f"ℹ️  模型结构 profile={model_profile['name']} "
+            f"patch={model_profile['patch_size']} embed={model_profile['embed_dim']}"
+        )
 
         use_fp16 = os.environ.get("PANGU_USE_FP16", "1") == "1"
         target_dtype = torch.float16 if use_fp16 else torch.float32
 
         # ---- 反量化重建逻辑（仅在模型加载时运行，不影响单样本推理计时）----
-        state_dict = ckpt.get("model_state_dict", ckpt)
-        dequantized_state_dict = {}
-        for key, value in state_dict.items():
-            if key.endswith(".weight") and value.dtype == torch.int8:
-                scale_key = key + "_scale"
-                if scale_key in state_dict:
-                    scale = state_dict[scale_key]
-                    dequantized_state_dict[key] = (
-                        value.to(device='cuda:0', dtype=torch.float32) * scale.to(device='cuda:0')
-                    ).to(target_dtype)
-                else:
-                    dequantized_state_dict[key] = value.to(device='cuda:0', dtype=target_dtype if torch.is_floating_point(value) else value.dtype)
-            elif key.endswith("_scale"):
-                continue
-            else:
-                dequantized_state_dict[key] = value.to(device='cuda:0', dtype=target_dtype if torch.is_floating_point(value) else value.dtype)
-        ckpt["model_state_dict"] = dequantized_state_dict
+        ckpt["model_state_dict"] = _dequantize_state_dict(state_dict, target_dtype)
 
-        model = Pangu(img_size=cfg_data.dataset.img_size,
-                      patch_size=cfg.patch_size,
-                      embed_dim=model_embed_dim,
-                      num_heads=model_num_heads,
-                      window_size=cfg.window_size,
-                      ).to('cuda:0')
-        model.load_state_dict(ckpt["model_state_dict"])
+        model = build_pangu_model(
+            img_size=cfg_data.dataset.img_size,
+            patch_size=model_profile["patch_size"],
+            embed_dim=model_profile["embed_dim"],
+            num_heads=model_profile["num_heads"],
+            window_size=model_profile["window_size"],
+        ).to('cuda:0')
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
         if use_fp16:
             model.half()   # FP16: 确保整个模型在半精度下运行
         model.eval()
