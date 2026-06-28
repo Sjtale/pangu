@@ -62,12 +62,15 @@ def get_model_profile(cfg, profile_name):
     if profile_name not in profiles:
         raise ValueError(f"Unknown student profile: {profile_name}")
     profile = profiles[profile_name]
-    return {
+    res = {
         "name": profile_name,
         "patch_size": cfg_list(profile.patch_size),
         "embed_dim": int(profile.embed_dim),
         "num_heads": cfg_list(profile.num_heads),
     }
+    if hasattr(profile, "depth_blocks"):
+        res["depth_blocks"] = cfg_list(profile.depth_blocks)
+    return res
 
 
 def get_default_profile(cfg):
@@ -256,6 +259,7 @@ def make_model(cfg_data, profile):
         embed_dim=profile["embed_dim"],
         num_heads=profile["num_heads"],
         window_size=profile["window_size"],
+        depth_blocks=profile.get("depth_blocks", None),
     )
 
 
@@ -453,7 +457,7 @@ def main():
     if os.path.exists(initial_student_path) and (
         initial_student_path != teacher_path or student_profile["name"] == "full_192"
     ):
-        student_checkpoint = load_state(student, initial_student_path)
+        student_checkpoint = load_compatible_state(student, initial_student_path, logger)
     else:
         initial_student_path = teacher_path
         student_checkpoint = load_compatible_state(student, teacher_path, logger)

@@ -231,6 +231,46 @@ def _migrate_tensor(
     )
 
 
+def get_source_key_for_target(key, source_depths, target_depths):
+    if ".blocks." not in key:
+        return key
+    parts = key.split(".")
+    try:
+        blocks_idx = parts.index("blocks")
+    except ValueError:
+        return key
+        
+    t = int(parts[blocks_idx + 1])
+    
+    # Look back to find the layer stage name (e.g. layer1, layer2, etc.)
+    layer_name = None
+    for idx in range(blocks_idx - 1, -1, -1):
+        token = parts[idx]
+        if token.startswith("layer") and token[-1].isdigit():
+            layer_name = token
+            break
+            
+    if layer_name is None:
+        raise ValueError(f"Could not parse layer stage name from key: {key}")
+    
+    # layer name to index: "layer1" -> 0, "layer2" -> 1, etc.
+    layer_idx = int(layer_name[-1]) - 1
+    s_depth = source_depths[layer_idx]
+    t_depth = target_depths[layer_idx]
+    
+    # Map t to s
+    if t_depth == s_depth:
+        s = t
+    elif t_depth == 1:
+        s = s_depth // 2
+    else:
+        step = (s_depth - 1) / (t_depth - 1)
+        s = round(t * step)
+        
+    parts[blocks_idx + 1] = str(s)
+    return ".".join(parts)
+
+
 def prune_checkpoint(args):
     cfg = YParams(args.config, "model")
     source_path = args.source
@@ -260,17 +300,35 @@ def prune_checkpoint(args):
     head_dim = source_width // source_heads[0]
     if source_width % source_heads[0] or source_width * 2 % source_heads[1]:
         raise ValueError("Source embed dimensions must be divisible by attention heads")
-    if args.target_embed_dim >= source_width or args.target_embed_dim % head_dim:
+
+    source_depths = [2, 6, 6, 2]
+    if args.target_profile:
+        profiles = getattr(cfg, "student_profiles", {})
+        if args.target_profile not in profiles:
+            raise ValueError(f"Unknown target profile: {args.target_profile}")
+        target_profile_cfg = profiles[args.target_profile]
+        target_width = int(target_profile_cfg.embed_dim)
+        target_heads = tuple(int(h) for h in target_profile_cfg.num_heads)
+        target_depth_blocks = getattr(target_profile_cfg, "depth_blocks", None)
+    else:
+        target_width = args.target_embed_dim
+        target_heads = (
+            target_width // head_dim,
+            target_width * 2 // head_dim,
+            target_width * 2 // head_dim,
+            target_width // head_dim,
+        )
+        target_depth_blocks = None
+
+    if target_depth_blocks is not None:
+        target_depth_blocks = [int(v) for v in target_depth_blocks]
+    target_depths = target_depth_blocks if target_depth_blocks is not None else source_depths
+
+    if target_width > source_width or target_width % head_dim:
         raise ValueError(
-            f"target embed dim must be smaller than {source_width} and divisible by {head_dim}"
+            f"target embed dim must be smaller than or equal to {source_width} and divisible by {head_dim}"
         )
 
-    target_heads = (
-        args.target_embed_dim // head_dim,
-        args.target_embed_dim * 2 // head_dim,
-        args.target_embed_dim * 2 // head_dim,
-        args.target_embed_dim // head_dim,
-    )
     img_size = cfg.img_size if hasattr(cfg, "img_size") else (721, 1440)
 
     source_model = build_pangu_model(
@@ -286,24 +344,26 @@ def prune_checkpoint(args):
     target_model = build_pangu_model(
         img_size=img_size,
         patch_size=patch_size,
-        embed_dim=args.target_embed_dim,
+        embed_dim=target_width,
         num_heads=target_heads,
         window_size=cfg.window_size,
+        depth_blocks=target_depth_blocks,
     )
     target_state = target_model.state_dict()
-    residual = _residual_indices(source_state, source_width, args.target_embed_dim)
+    residual = _residual_indices(source_state, source_width, target_width)
     attention_heads = _attention_heads(
-        source_state, source_width, args.target_embed_dim, source_heads
+        source_state, source_width, target_width, source_heads
     )
-    mlp_hidden = _mlp_indices(source_state, source_width, args.target_embed_dim)
+    mlp_hidden = _mlp_indices(source_state, source_width, target_width)
 
     migrated = OrderedDict()
     for key, target_tensor in target_state.items():
-        if key not in source_state:
-            raise KeyError(f"Source checkpoint is missing {key}")
+        source_key = get_source_key_for_target(key, source_depths, target_depths)
+        if source_key not in source_state:
+            raise KeyError(f"Source checkpoint is missing {source_key} for target {key}")
         tensor = _migrate_tensor(
-            key,
-            source_state[key],
+            source_key,
+            source_state[source_key],
             target_tensor,
             residual,
             attention_heads,
@@ -325,18 +385,24 @@ def prune_checkpoint(args):
     metadata = {
         "method": "structured_head_width_pruning",
         "source_embed_dim": source_width,
-        "target_embed_dim": args.target_embed_dim,
+        "target_embed_dim": target_width,
         "source_num_heads": source_heads,
         "target_num_heads": target_heads,
         "shallow_channels": residual["shallow"].tolist(),
         "deep_channels": residual["deep"].tolist(),
     }
+    if target_depth_blocks is not None:
+        metadata["target_depth_blocks"] = target_depth_blocks
+        
     model_profile = {
-        "name": f"pgw_lite_pruned_{args.target_embed_dim}" if patch_size == [2, 8, 8] else f"student_{args.target_embed_dim}",
+        "name": args.target_profile if args.target_profile else (f"pgw_lite_pruned_{target_width}" if patch_size == [2, 8, 8] else f"student_{target_width}"),
         "patch_size": patch_size,
-        "embed_dim": args.target_embed_dim,
+        "embed_dim": target_width,
         "num_heads": list(target_heads),
     }
+    if target_depth_blocks is not None:
+        model_profile["depth_blocks"] = target_depth_blocks
+
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     torch.save(
         {
@@ -357,7 +423,9 @@ def prune_checkpoint(args):
     print(f"Pruned checkpoint size: {target_size / 1024**2:.1f} MiB")
     print(f"Checkpoint size reduction: {(1 - target_size / source_size) * 100:.2f}%")
     print(f"Saved pruned checkpoint: {args.output}")
-    print(f"Target embed_dim: {args.target_embed_dim}, num_heads: {target_heads}")
+    print(f"Target embed_dim: {target_width}, num_heads: {target_heads}")
+    if target_depth_blocks is not None:
+        print(f"Target depth blocks: {target_depth_blocks}")
 
 
 def parse_args():
@@ -366,6 +434,7 @@ def parse_args():
     parser.add_argument("--source", default="data/checkpoints/model_fp16.pth")
     parser.add_argument("--output", default="data/checkpoints/model_pruned_fp16.pth")
     parser.add_argument("--target-embed-dim", type=int, default=160)
+    parser.add_argument("--target-profile", default=None)
     parser.add_argument("--dtype", choices=("fp16", "fp32"), default="fp16")
     return parser.parse_args()
 

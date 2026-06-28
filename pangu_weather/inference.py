@@ -154,13 +154,16 @@ def _profile_from_config(cfg, profile_name):
     if profile_name not in profiles:
         raise ValueError(f"Unknown model profile: {profile_name}")
     profile = profiles[profile_name]
-    return {
+    res = {
         "name": profile_name,
         "patch_size": _cfg_list(profile.patch_size),
         "embed_dim": int(profile.embed_dim),
         "num_heads": _cfg_list(profile.num_heads),
         "window_size": _cfg_list(cfg.window_size),
     }
+    if hasattr(profile, "depth_blocks"):
+        res["depth_blocks"] = _cfg_list(profile.depth_blocks)
+    return res
 
 
 def _default_profile(cfg):
@@ -191,6 +194,8 @@ def _profile_from_metadata(cfg, metadata):
         profile["num_heads"] = _cfg_list(metadata["num_heads"])
     if "window_size" in metadata:
         profile["window_size"] = _cfg_list(metadata["window_size"])
+    if "depth_blocks" in metadata:
+        profile["depth_blocks"] = _cfg_list(metadata["depth_blocks"])
     return profile
 
 
@@ -402,6 +407,7 @@ if __name__ == "__main__":
             embed_dim=model_profile["embed_dim"],
             num_heads=model_profile["num_heads"],
             window_size=model_profile["window_size"],
+            depth_blocks=model_profile.get("depth_blocks", None),
         ).to('cuda:0')
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
         if use_fp16:

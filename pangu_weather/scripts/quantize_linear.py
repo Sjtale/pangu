@@ -26,13 +26,16 @@ def get_model_profile(cfg, profile_name):
     if profile_name not in profiles:
         raise ValueError(f"Unknown model profile: {profile_name}")
     profile = profiles[profile_name]
-    return {
+    res = {
         "name": profile_name,
         "patch_size": cfg_list(profile.patch_size),
         "embed_dim": int(profile.embed_dim),
         "num_heads": cfg_list(profile.num_heads),
         "window_size": cfg_list(cfg.window_size),
     }
+    if hasattr(profile, "depth_blocks"):
+        res["depth_blocks"] = cfg_list(profile.depth_blocks)
+    return res
 
 
 def get_quantization_profile(cfg):
@@ -91,6 +94,7 @@ def main():
         embed_dim=profile["embed_dim"],
         num_heads=profile["num_heads"],
         window_size=profile["window_size"],
+        depth_blocks=profile.get("depth_blocks", None),
     )
 
     # Record all weight keys belonging to Linear layers
