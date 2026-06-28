@@ -354,70 +354,81 @@ if __name__ == "__main__":
 
     if not use_onnx:
         # ---- PyTorch FP16 回退 ----
-        fp16_checkpoint = os.environ.get("PANGU_FP16_CHECKPOINT", "model_fp16.pth")
-        fp16_ckpt_path = (
-            fp16_checkpoint
-            if os.path.isabs(fp16_checkpoint)
-            else f"{cfg.checkpoint_dir}/{fp16_checkpoint}"
-        )
-        local_fp32_path = f"{cfg.checkpoint_dir}/model_bak.pth"
-        backup_fp32_path = f"{cfg.official_checkpoint_dir}/model_bak.pth"
-        fp32_ckpt_path = (
-            local_fp32_path if os.path.exists(local_fp32_path) else backup_fp32_path
-        )
-        if enable_pgw_lite:
-            selected_path = pgw_lite_quantized_path if os.path.exists(pgw_lite_quantized_path) else pgw_lite_ckpt_path
-            print(f"加载 PGW-Lite 学生权重: {selected_path}")
-            ckpt, state_dict = _load_checkpoint(selected_path)
-            model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
-        elif enable_distilled:
-            print(f"加载知识蒸馏学生权重: {distilled_ckpt_path}")
-            ckpt, state_dict = _load_checkpoint(distilled_ckpt_path)
-            model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
-        elif enable_pruned:
-            print(f"✂️  加载结构化剪枝权重: {pruned_ckpt_path}")
-            ckpt, state_dict = _load_checkpoint(pruned_ckpt_path)
-            model_profile = _profile_from_config(cfg, "student_160")
-        elif os.path.exists(fp16_ckpt_path):
-            print(f"⚡ 加载 FP16 权重: {fp16_ckpt_path}")
-            ckpt, state_dict = _load_checkpoint(fp16_ckpt_path)
-            model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
-        elif os.path.exists(distilled_quantized_path):
-            print(f"⚡ 加载量化学生权重: {distilled_quantized_path}")
-            ckpt, state_dict = _load_checkpoint(distilled_quantized_path)
-            model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
-        else:
-            print(f"ℹ️  未找到 FP16 权重，回退加载 FP32: {fp32_ckpt_path}")
-            ckpt, state_dict = _load_checkpoint(fp32_ckpt_path)
-            model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
-        print(
-            f"ℹ️  模型结构 profile={model_profile['name']} "
-            f"patch={model_profile['patch_size']} embed={model_profile['embed_dim']}"
-        )
+        try:
+            fp16_checkpoint = os.environ.get("PANGU_FP16_CHECKPOINT", "model_fp16.pth")
+            fp16_ckpt_path = (
+                fp16_checkpoint
+                if os.path.isabs(fp16_checkpoint)
+                else f"{cfg.checkpoint_dir}/{fp16_checkpoint}"
+            )
+            local_fp32_path = f"{cfg.checkpoint_dir}/model_bak.pth"
+            backup_fp32_path = f"{cfg.official_checkpoint_dir}/model_bak.pth"
+            fp32_ckpt_path = (
+                local_fp32_path if os.path.exists(local_fp32_path) else backup_fp32_path
+            )
+            if enable_pgw_lite:
+                selected_path = pgw_lite_quantized_path if os.path.exists(pgw_lite_quantized_path) else pgw_lite_ckpt_path
+                print(f"加载 PGW-Lite 学生权重: {selected_path}")
+                ckpt, state_dict = _load_checkpoint(selected_path)
+                model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
+            elif enable_distilled:
+                print(f"加载知识蒸馏学生权重: {distilled_ckpt_path}")
+                ckpt, state_dict = _load_checkpoint(distilled_ckpt_path)
+                model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
+            elif enable_pruned:
+                print(f"✂️  加载结构化剪枝权重: {pruned_ckpt_path}")
+                ckpt, state_dict = _load_checkpoint(pruned_ckpt_path)
+                model_profile = _profile_from_config(cfg, "student_160")
+            elif os.path.exists(fp16_ckpt_path):
+                print(f"⚡ 加载 FP16 权重: {fp16_ckpt_path}")
+                ckpt, state_dict = _load_checkpoint(fp16_ckpt_path)
+                model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
+            elif os.path.exists(distilled_quantized_path):
+                print(f"⚡ 加载量化学生权重: {distilled_quantized_path}")
+                ckpt, state_dict = _load_checkpoint(distilled_quantized_path)
+                model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
+            else:
+                print(f"ℹ️  未找到 FP16 权重，回退加载 FP32: {fp32_ckpt_path}")
+                ckpt, state_dict = _load_checkpoint(fp32_ckpt_path)
+                model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
+            print(
+                f"ℹ️  模型结构 profile={model_profile['name']} "
+                f"patch={model_profile['patch_size']} embed={model_profile['embed_dim']}"
+            )
 
-        use_fp16 = os.environ.get("PANGU_USE_FP16", "1") == "1"
-        target_dtype = torch.float16 if use_fp16 else torch.float32
+            use_fp16 = os.environ.get("PANGU_USE_FP16", "1") == "1"
+            target_dtype = torch.float16 if use_fp16 else torch.float32
 
-        # ---- 反量化重建逻辑（仅在模型加载时运行，不影响单样本推理计时）----
-        ckpt["model_state_dict"] = _dequantize_state_dict(state_dict, target_dtype)
+            # ---- 反量化重建逻辑（仅在模型加载时运行，不影响单样本推理计时）----
+            ckpt["model_state_dict"] = _dequantize_state_dict(state_dict, target_dtype)
 
-        model = build_pangu_model(
-            img_size=cfg_data.dataset.img_size,
-            patch_size=model_profile["patch_size"],
-            embed_dim=model_profile["embed_dim"],
-            num_heads=model_profile["num_heads"],
-            window_size=model_profile["window_size"],
-            depth_blocks=model_profile.get("depth_blocks", None),
-        ).to('cuda:0')
-        model.load_state_dict(ckpt["model_state_dict"], strict=False)
-        if use_fp16:
-            model.half()   # FP16: 确保整个模型在半精度下运行
-        model.eval()
+            model = build_pangu_model(
+                img_size=cfg_data.dataset.img_size,
+                patch_size=model_profile["patch_size"],
+                embed_dim=model_profile["embed_dim"],
+                num_heads=model_profile["num_heads"],
+                window_size=model_profile["window_size"],
+                depth_blocks=model_profile.get("depth_blocks", None),
+            ).to('cuda:0')
+            model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            if use_fp16:
+                model.half()   # FP16: 确保整个模型在半精度下运行
+            model.eval()
 
-        # ---- 方向4.3: 释放 checkpoint 变量，清理显存碎片 ----
-        del ckpt
-        gc.collect()
-        torch.cuda.empty_cache()
+            # ---- 方向4.3: 释放 checkpoint 变量，清理显存碎片 ----
+            del ckpt
+            gc.collect()
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"❌ 加载模型或权重出错: {e}")
+            import traceback
+            traceback.print_exc()
+            if os.path.exists("data"):
+                print("data/ 目录内容:", os.listdir("data"))
+                if os.path.exists("data/checkpoints"):
+                    print("data/checkpoints/ 目录内容:", os.listdir("data/checkpoints"))
+            print("当前执行根目录内容:", os.listdir("."))
+            raise e
 
         target_dtype = torch.float16 if use_fp16 else torch.float32
         # ---- 方向4.5: CUDA Graph 捕获（可选，DCU 上可能不支持）----
