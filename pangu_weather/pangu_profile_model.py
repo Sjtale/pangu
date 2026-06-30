@@ -5,15 +5,72 @@ the platform-provided dependency. Keep architecture adaptations that are needed
 by profile checkpoints here instead of relying on local OneScience edits.
 """
 
+import types
+
 from onescience.models.pangu import Pangu
 from onescience.modules import OneRecovery, OneFuser
+import torch
 
 
 def _as_int_list(value):
     return [int(v) for v in value]
 
 
-def build_pangu_model(img_size, patch_size, embed_dim, num_heads, window_size, depth_blocks=None):
+def _embed_sequence(model, x):
+    SurfaceInput = x[:, :7, :, :]
+    UpperAirInput = x[:, 7:, :, :].reshape(x.shape[0], 5, 13, x.shape[2], x.shape[3])
+
+    SurfaceFeatures = model.patchembed2d(SurfaceInput)
+    UpperAirFeatures = model.patchembed3d(UpperAirInput)
+    CombinedFeatures = torch.concat(
+        [SurfaceFeatures.unsqueeze(2), UpperAirFeatures], dim=2
+    )
+    Batch, Channels, PressureLevels, Height, Width = CombinedFeatures.shape
+    sequence = CombinedFeatures.reshape(Batch, Channels, -1).transpose(1, 2)
+    return sequence, Batch, PressureLevels, Height, Width
+
+
+def _forward_recompute_skip(self, x):
+    sequence, Batch, PressureLevels, Height, Width = _embed_sequence(self, x)
+
+    sequence = self.layer1(sequence)
+    sequence = self.downsample(sequence)
+    sequence = self.layer2(sequence)
+    sequence = self.layer3(sequence)
+    sequence = self.upsample(sequence)
+    sequence = self.layer4(sequence)
+
+    skip_sequence, _, _, _, _ = _embed_sequence(self, x)
+    skip_sequence = self.layer1(skip_sequence)
+
+    OutputFeatures = torch.concat([sequence, skip_sequence], dim=-1)
+    OutputFeatures = OutputFeatures.transpose(1, 2).reshape(
+        Batch, -1, PressureLevels, Height, Width
+    )
+    output_surface = OutputFeatures[:, :, 0, :, :]
+    output_upper_air = OutputFeatures[:, :, 1:, :, :]
+
+    output_surface = self.patchrecovery2d(output_surface)
+    output_upper_air = self.patchrecovery3d(output_upper_air)
+    return output_surface, output_upper_air
+
+
+def enable_skip_recompute(model):
+    """Trade extra layer1 compute for a shorter-lived skip activation."""
+
+    model.forward = types.MethodType(_forward_recompute_skip, model)
+    return model
+
+
+def build_pangu_model(
+    img_size,
+    patch_size,
+    embed_dim,
+    num_heads,
+    window_size,
+    depth_blocks=None,
+    recompute_skip=False,
+):
     """Create a Pangu model and patch submission-local profile differences.
 
     The upstream OneScience Pangu implementation hardcodes patch recovery for
@@ -124,5 +181,8 @@ def build_pangu_model(img_size, patch_size, embed_dim, num_heads, window_size, d
             in_chans=embed_dim * 2,
             out_chans=5,
         )
+
+    if recompute_skip:
+        enable_skip_recompute(model)
 
     return model

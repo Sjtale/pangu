@@ -54,6 +54,18 @@ class PGWLiteStaticTests(unittest.TestCase):
         self.assertIn("scale.view(-1, 1)", source)
         self.assertIn("build_pangu_model", source)
         self.assertIn("model_profile['patch_size']", source)
+        self.assertIn("PANGU_RECOMPUTE_SKIP", source)
+        self.assertIn("recompute_skip=", source)
+
+    def test_profile_model_can_enable_skip_recompute_forward(self):
+        source = PROFILE_MODEL.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        self.assertIsNotNone(tree)
+        self.assertIn("def _forward_recompute_skip", source)
+        self.assertIn("def enable_skip_recompute", source)
+        self.assertIn("model.forward = types.MethodType", source)
+        self.assertIn("recompute_skip=False", source)
+        self.assertIn("skip_sequence = self.layer1(skip_sequence)", source)
 
     def test_quantizer_outputs_per_channel_versioned_metadata(self):
         source = QUANTIZE.read_text(encoding="utf-8")

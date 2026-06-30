@@ -409,7 +409,10 @@ if __name__ == "__main__":
                 num_heads=model_profile["num_heads"],
                 window_size=model_profile["window_size"],
                 depth_blocks=model_profile.get("depth_blocks", None),
+                recompute_skip=_is_enabled("PANGU_RECOMPUTE_SKIP"),
             ).to('cuda:0')
+            if _is_enabled("PANGU_RECOMPUTE_SKIP"):
+                print("♻️  PANGU_RECOMPUTE_SKIP=1，推理时重算 skip activation")
             model.load_state_dict(ckpt["model_state_dict"], strict=False)
             if use_fp16:
                 model.half()   # FP16: 确保整个模型在半精度下运行
