@@ -57,6 +57,19 @@ class DistillTrainStaticTests(unittest.TestCase):
         self.assertIn("cfg.distilled_train_checkpoint", source)
         self.assertIn("cfg.distilled_checkpoint", source)
 
+    def test_hint_loss_feature_capture_is_wired(self):
+        source = SCRIPT_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        self.assertIsNotNone(tree)
+        self.assertIn("class FeatureCapture", source)
+        self.assertIn("register_forward_hook", source)
+        self.assertIn("feature_hint_loss", source)
+        self.assertIn("tokens_to_feature_grid", source)
+        self.assertIn("F.adaptive_avg_pool3d", source)
+        self.assertIn("distill_hint_layers", source)
+        self.assertIn("distill_hint_weight", source)
+        self.assertIn("teacher_weight=teacher_weight", source)
+
 
 if __name__ == "__main__":
     unittest.main()

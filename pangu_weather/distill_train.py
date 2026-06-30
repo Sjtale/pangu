@@ -42,10 +42,23 @@ def forecast_loss(surface, upper_air, target_surface, target_upper_air, weights)
     ) + weighted_l1(upper_air, target_upper_air, pressure_weights)
 
 
-def distillation_loss(student, target, teacher, weights, ground_truth_weight):
+def distillation_loss(
+    student,
+    target,
+    teacher,
+    weights,
+    ground_truth_weight,
+    teacher_weight=None,
+    hint_loss=None,
+    hint_weight=0.0,
+):
     hard_loss = forecast_loss(*student, *target, weights)
     teacher_loss = forecast_loss(*student, *teacher, weights)
-    total = ground_truth_weight * hard_loss + (1.0 - ground_truth_weight) * teacher_loss
+    if teacher_weight is None:
+        teacher_weight = 1.0 - ground_truth_weight
+    total = ground_truth_weight * hard_loss + teacher_weight * teacher_loss
+    if hint_loss is not None and hint_weight > 0.0:
+        total = total + hint_weight * hint_loss
     return total, hard_loss, teacher_loss
 
 
@@ -55,6 +68,27 @@ def checkpoint_path(cfg, name):
 
 def cfg_list(value):
     return [int(v) for v in value]
+
+
+def cfg_str_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return [str(item) for item in value]
+
+
+def cfg_float(cfg, name, default):
+    env_name = f"PANGU_{name.upper()}"
+    if env_name in os.environ:
+        return float(os.environ[env_name])
+    return float(getattr(cfg, name, default))
+
+
+def cfg_hint_layers(cfg):
+    if "PANGU_DISTILL_HINT_LAYERS" in os.environ:
+        return cfg_str_list(os.environ["PANGU_DISTILL_HINT_LAYERS"])
+    return cfg_str_list(getattr(cfg, "distill_hint_layers", []))
 
 
 def get_model_profile(cfg, profile_name):
@@ -236,6 +270,11 @@ def save_student(
             "student_profile": student_profile["name"],
             "student_embed_dim": int(student_profile["embed_dim"]),
             "ground_truth_weight": float(cfg.distill_ground_truth_weight),
+            "teacher_weight": cfg_float(
+                cfg, "distill_teacher_weight", 1.0 - float(cfg.distill_ground_truth_weight)
+            ),
+            "hint_weight": cfg_float(cfg, "distill_hint_weight", 0.0),
+            "hint_layers": cfg_hint_layers(cfg),
         },
         "model_profile": student_profile,
     }
@@ -250,6 +289,107 @@ def prepare_batch(data, surface_mask, device):
     target_surface = outvar[:, :4].to(device, dtype=torch.float32)
     target_upper_air = outvar[:, 4:].to(device, dtype=torch.float32)
     return model_input, target_surface, target_upper_air
+
+
+def ceil_div(a, b):
+    return (int(a) + int(b) - 1) // int(b)
+
+
+def feature_grids_for_profile(img_size, patch_size):
+    pressure = 1 + ceil_div(13, patch_size[0])
+    layer1 = (
+        pressure,
+        ceil_div(img_size[0], patch_size[1]),
+        ceil_div(img_size[1], patch_size[2]),
+    )
+    layer2 = (pressure, ceil_div(layer1[1], 2), ceil_div(layer1[2], 2))
+    return {"layer1": layer1, "layer2": layer2}
+
+
+class FeatureCapture:
+    def __init__(self, model, layers):
+        self.features = {}
+        self.handles = []
+        model = model.module if hasattr(model, "module") else model
+        for layer in layers:
+            module = getattr(model, layer)
+            self.handles.append(module.register_forward_hook(self._make_hook(layer)))
+
+    def _make_hook(self, name):
+        def hook(_module, _inputs, output):
+            self.features[name] = output
+        return hook
+
+    def clear(self):
+        self.features.clear()
+
+    def close(self):
+        for handle in self.handles:
+            handle.remove()
+        self.handles = []
+
+
+def tokens_to_feature_grid(tokens, grid):
+    if tokens.dim() != 3:
+        raise ValueError(f"Expected token tensor [B, N, C], got {tuple(tokens.shape)}")
+    batch, tokens_count, channels = tokens.shape
+    expected = int(grid[0]) * int(grid[1]) * int(grid[2])
+    if tokens_count != expected:
+        raise ValueError(
+            f"Feature token count mismatch: got {tokens_count}, expected {expected} for grid {grid}"
+        )
+    return tokens.transpose(1, 2).reshape(batch, channels, *grid)
+
+
+def resize_channels(feature, target_channels):
+    if feature.shape[1] == target_channels:
+        return feature
+    batch, channels, pressure, height, width = feature.shape
+    channel_series = (
+        feature.permute(0, 2, 3, 4, 1)
+        .reshape(-1, 1, channels)
+        .float()
+    )
+    resized = F.interpolate(
+        channel_series,
+        size=int(target_channels),
+        mode="linear",
+        align_corners=False,
+    )
+    return resized.reshape(batch, pressure, height, width, target_channels).permute(
+        0, 4, 1, 2, 3
+    )
+
+
+def normalize_hint_feature(feature):
+    dims = tuple(range(2, feature.dim()))
+    mean = feature.mean(dim=dims, keepdim=True)
+    std = feature.std(dim=dims, keepdim=True, unbiased=False)
+    return (feature - mean) / (std + 1e-4)
+
+
+def feature_hint_loss(student_features, teacher_features, student_grids, teacher_grids, layers):
+    losses = []
+    for layer in layers:
+        if layer not in student_features or layer not in teacher_features:
+            raise RuntimeError(f"Missing captured feature for hint layer: {layer}")
+        student_grid = tokens_to_feature_grid(
+            student_features[layer].float(), student_grids[layer]
+        )
+        teacher_grid = tokens_to_feature_grid(
+            teacher_features[layer].float(), teacher_grids[layer]
+        )
+        teacher_grid = F.adaptive_avg_pool3d(teacher_grid, student_grid.shape[2:])
+        teacher_grid = resize_channels(teacher_grid, student_grid.shape[1])
+        losses.append(
+            F.l1_loss(
+                normalize_hint_feature(student_grid),
+                normalize_hint_feature(teacher_grid.detach()),
+            )
+        )
+    if not losses:
+        raise RuntimeError("Hint loss is enabled but no hint layers were configured")
+    return torch.stack(losses).mean()
 
 
 def make_model(cfg_data, profile):
@@ -521,19 +661,49 @@ def main():
         )
 
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
-    ground_truth_weight = float(cfg.distill_ground_truth_weight)
-    if not 0.0 <= ground_truth_weight <= 1.0:
-        raise ValueError("distill_ground_truth_weight must be in [0, 1]")
+    ground_truth_weight = cfg_float(cfg, "distill_ground_truth_weight", 0.3)
+    teacher_weight = cfg_float(cfg, "distill_teacher_weight", 1.0 - ground_truth_weight)
+    hint_weight = cfg_float(cfg, "distill_hint_weight", 0.0)
+    hint_layers = cfg_hint_layers(cfg)
+    for weight_name, value in [
+        ("distill_ground_truth_weight", ground_truth_weight),
+        ("distill_teacher_weight", teacher_weight),
+        ("distill_hint_weight", hint_weight),
+    ]:
+        if value < 0.0:
+            raise ValueError(f"{weight_name} must be non-negative")
+    if hint_weight > 0.0 and not hint_layers:
+        raise ValueError("distill_hint_weight > 0 requires distill_hint_layers")
+
+    teacher_capture = student_capture = None
+    teacher_grids = student_grids = None
+    if hint_weight > 0.0:
+        valid_hint_layers = {"layer1", "layer2"}
+        unknown_layers = sorted(set(hint_layers) - valid_hint_layers)
+        if unknown_layers:
+            raise ValueError(f"Unsupported distill_hint_layers: {unknown_layers}")
+        teacher_capture = FeatureCapture(teacher, hint_layers)
+        student_capture = FeatureCapture(student, hint_layers)
+        teacher_grids = feature_grids_for_profile(
+            cfg_data.dataset.img_size, teacher_profile["patch_size"]
+        )
+        student_grids = feature_grids_for_profile(
+            cfg_data.dataset.img_size, student_profile["patch_size"]
+        )
+
     logger.info(
         "Distillation starts: teacher=%s, student_profile=%s, init=%s, "
         "data=%s, years=%s, "
-        "ground_truth_weight=%.2f",
+        "loss_weights=(hard=%.2f, teacher=%.2f, hint=%.2f), hint_layers=%s",
         teacher_path,
         student_profile["name"],
         initial_student_path,
         cfg_data.dataset.data_dir,
         cfg_data.dataset.train_ratio,
         ground_truth_weight,
+        teacher_weight,
+        hint_weight,
+        hint_layers,
     )
 
     steps_per_epoch = min(int(cfg.distill_steps_per_epoch), len(train_loader))
@@ -543,7 +713,7 @@ def main():
             valid_sampler.set_epoch(epoch)
 
         student.train()
-        train_total = train_hard = train_teacher = 0.0
+        train_total = train_hard = train_teacher = train_hint = 0.0
         start_time = time.time()
         for step, data in enumerate(train_loader, start=1):
             if step > steps_per_epoch:
@@ -551,6 +721,9 @@ def main():
             model_input, target_surface, target_upper_air = prepare_batch(
                 data, surface_mask, device
             )
+            if teacher_capture is not None:
+                teacher_capture.clear()
+                student_capture.clear()
             with torch.no_grad():
                 teacher_surface, teacher_upper_air = teacher(model_input.half())
                 teacher_surface = teacher_surface.float()
@@ -559,12 +732,24 @@ def main():
             with replace_function(student, ["layer2", "layer3"], dist.is_initialized()):
                 student_surface, student_upper_air = student(model_input)
             student_upper_air = student_upper_air.reshape(target_upper_air.shape)
+            hint_loss = None
+            if hint_weight > 0.0:
+                hint_loss = feature_hint_loss(
+                    student_capture.features,
+                    teacher_capture.features,
+                    student_grids,
+                    teacher_grids,
+                    hint_layers,
+                )
             loss, hard_loss, teacher_loss = distillation_loss(
                 (student_surface, student_upper_air),
                 (target_surface, target_upper_air),
                 (teacher_surface, teacher_upper_air),
                 weights,
                 ground_truth_weight,
+                teacher_weight=teacher_weight,
+                hint_loss=hint_loss,
+                hint_weight=hint_weight,
             )
             optimizer.zero_grad()
             loss.backward()
@@ -573,11 +758,13 @@ def main():
             train_total += loss.item()
             train_hard += hard_loss.item()
             train_teacher += teacher_loss.item()
+            if hint_loss is not None:
+                train_hint += hint_loss.item()
             if world_rank == 0:
                 lrs = [group["lr"] for group in optimizer.param_groups]
                 lr_str = ", ".join([f"{lr:.2e}" for lr in lrs[:3]])
                 logger.info(
-                    "Train %d-%d/%d [%.1fs/step] total=%.4f hard=%.4f teacher=%.4f | lrs: %s",
+                    "Train %d-%d/%d [%.1fs/step] total=%.4f hard=%.4f teacher=%.4f hint=%.4f | lrs: %s",
                     epoch,
                     step,
                     steps_per_epoch,
@@ -585,6 +772,7 @@ def main():
                     train_total / step,
                     train_hard / step,
                     train_teacher / step,
+                    train_hint / step,
                     lr_str,
                 )
 
@@ -664,6 +852,10 @@ def main():
             )
         if epoch - best_loss_epoch > cfg.patience:
             break
+
+    if teacher_capture is not None:
+        teacher_capture.close()
+        student_capture.close()
 
 
 if __name__ == "__main__":

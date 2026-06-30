@@ -28,6 +28,9 @@ class PGWLiteStaticTests(unittest.TestCase):
         self.assertIn("patch_size: [2, 8, 8]", config)
         self.assertIn('pgw_lite_distilled_checkpoint: "model_pgw_lite_fp16.pth"', config)
         self.assertIn('pgw_lite_quantized_checkpoint: "model_pgw_lite_quantized.pth"', config)
+        self.assertIn("distill_teacher_weight: 0.5", config)
+        self.assertIn("distill_hint_weight: 0.2", config)
+        self.assertIn('distill_hint_layers: ["layer1", "layer2"]', config)
 
     def test_submission_helper_patches_pgw_lite_recovery(self):
         source = PROFILE_MODEL.read_text(encoding="utf-8")
