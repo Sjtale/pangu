@@ -80,6 +80,14 @@ class DistillTrainStaticTests(unittest.TestCase):
         self.assertIn("Extending distillation", source)
         self.assertIn("No epochs to run", source)
 
+    def test_resume_can_start_from_best_checkpoint(self):
+        source = SCRIPT_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        self.assertIsNotNone(tree)
+        self.assertIn("PANGU_DISTILL_RESUME_FROM", source)
+        self.assertIn("Resuming from best training checkpoint", source)
+        self.assertIn("PANGU_DISTILL_RESUME_FROM=best requested", source)
+
 
 if __name__ == "__main__":
     unittest.main()

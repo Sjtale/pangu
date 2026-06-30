@@ -588,7 +588,18 @@ def main():
     name = student_profile["name"]
     pruned_start_path = checkpoint_path(cfg, f"model_{name}.pth")
 
-    if os.path.exists(latest_train_path):
+    resume_from = os.environ.get("PANGU_DISTILL_RESUME_FROM", "latest").strip().lower()
+    if resume_from not in {"latest", "best"}:
+        raise ValueError("PANGU_DISTILL_RESUME_FROM must be 'latest' or 'best'")
+
+    if resume_from == "best" and os.path.exists(distilled_train_path):
+        initial_student_path = distilled_train_path
+        logger.info("Resuming from best training checkpoint: %s", distilled_train_path)
+    elif resume_from == "best":
+        raise FileNotFoundError(
+            f"PANGU_DISTILL_RESUME_FROM=best requested, but {distilled_train_path} does not exist"
+        )
+    elif os.path.exists(latest_train_path):
         initial_student_path = latest_train_path
     elif os.path.exists(distilled_train_path):
         initial_student_path = distilled_train_path
