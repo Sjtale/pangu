@@ -70,6 +70,16 @@ class DistillTrainStaticTests(unittest.TestCase):
         self.assertIn("distill_hint_weight", source)
         self.assertIn("teacher_weight=teacher_weight", source)
 
+    def test_resume_can_extend_completed_training(self):
+        source = SCRIPT_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        self.assertIsNotNone(tree)
+        self.assertIn("def cfg_int", source)
+        self.assertIn("distill_extra_epochs", source)
+        self.assertIn("PANGU_DISTILL_EXTRA_EPOCHS", source)
+        self.assertIn("Extending distillation", source)
+        self.assertIn("No epochs to run", source)
+
 
 if __name__ == "__main__":
     unittest.main()

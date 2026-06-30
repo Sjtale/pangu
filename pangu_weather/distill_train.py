@@ -85,6 +85,13 @@ def cfg_float(cfg, name, default):
     return float(getattr(cfg, name, default))
 
 
+def cfg_int(cfg, name, default):
+    env_name = f"PANGU_{name.upper()}"
+    if env_name in os.environ:
+        return int(os.environ[env_name])
+    return int(getattr(cfg, name, default))
+
+
 def cfg_hint_layers(cfg):
     if "PANGU_DISTILL_HINT_LAYERS" in os.environ:
         return cfg_str_list(os.environ["PANGU_DISTILL_HINT_LAYERS"])
@@ -609,10 +616,10 @@ def main():
     optimizer = optimizers.FusedAdam(param_groups, betas=(0.9, 0.999), weight_decay=3e-6)
 
     # Initialize WarmupCosineSchedule scheduler
-    steps_per_epoch = min(int(cfg.distill_steps_per_epoch), len(train_loader))
-    total_epochs = int(cfg.distill_max_epoch)
+    steps_per_epoch = min(cfg_int(cfg, "distill_steps_per_epoch", len(train_loader)), len(train_loader))
+    total_epochs = cfg_int(cfg, "distill_max_epoch", 20)
     total_steps = total_epochs * steps_per_epoch
-    warmup_steps = int(getattr(cfg, "distill_warmup_steps", 256))
+    warmup_steps = cfg_int(cfg, "distill_warmup_steps", 256)
 
     scheduler = WarmupCosineSchedule(
         optimizer=optimizer,
@@ -651,6 +658,20 @@ def main():
         except Exception as e:
             logger.warning("Could not load scheduler state dict: %s. Defaulting to calculated current_step.", str(e))
             scheduler.current_step = start_epoch * steps_per_epoch
+            scheduler._update_lr()
+
+    extra_epochs = cfg_int(cfg, "distill_extra_epochs", 0)
+    if extra_epochs > 0:
+        requested_total_epochs = start_epoch + extra_epochs
+        if requested_total_epochs > total_epochs:
+            logger.info(
+                "Extending distillation from max_epoch=%d to %d via distill_extra_epochs=%d",
+                total_epochs,
+                requested_total_epochs,
+                extra_epochs,
+            )
+            total_epochs = requested_total_epochs
+            scheduler.total_steps = total_epochs * steps_per_epoch
             scheduler._update_lr()
 
     del student_checkpoint
@@ -706,8 +727,21 @@ def main():
         hint_layers,
     )
 
-    steps_per_epoch = min(int(cfg.distill_steps_per_epoch), len(train_loader))
-    for epoch in range(start_epoch, int(cfg.distill_max_epoch)):
+    logger.info(
+        "Epoch schedule: start_epoch=%d, total_epochs=%d, steps_per_epoch=%d",
+        start_epoch,
+        total_epochs,
+        steps_per_epoch,
+    )
+    if start_epoch >= total_epochs:
+        logger.warning(
+            "No epochs to run because start_epoch=%d >= total_epochs=%d. "
+            "Set PANGU_DISTILL_EXTRA_EPOCHS or PANGU_DISTILL_MAX_EPOCH to continue.",
+            start_epoch,
+            total_epochs,
+        )
+
+    for epoch in range(start_epoch, total_epochs):
         if dist.is_initialized():
             train_sampler.set_epoch(epoch)
             valid_sampler.set_epoch(epoch)
