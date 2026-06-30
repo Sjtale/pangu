@@ -92,6 +92,14 @@ def cfg_int(cfg, name, default):
     return int(getattr(cfg, name, default))
 
 
+def resolve_checkpoint_arg(cfg, value):
+    if not value:
+        return value
+    if os.path.isabs(value):
+        return value
+    return checkpoint_path(cfg, value)
+
+
 def cfg_hint_layers(cfg):
     if "PANGU_DISTILL_HINT_LAYERS" in os.environ:
         return cfg_str_list(os.environ["PANGU_DISTILL_HINT_LAYERS"])
@@ -592,6 +600,10 @@ def main():
     if resume_from not in {"latest", "best"}:
         raise ValueError("PANGU_DISTILL_RESUME_FROM must be 'latest' or 'best'")
 
+    init_override = resolve_checkpoint_arg(cfg, os.environ.get("PANGU_DISTILL_INIT_CHECKPOINT", ""))
+    if init_override and not os.path.exists(init_override):
+        raise FileNotFoundError(f"PANGU_DISTILL_INIT_CHECKPOINT not found: {init_override}")
+
     if resume_from == "best" and os.path.exists(distilled_train_path):
         initial_student_path = distilled_train_path
         logger.info("Resuming from best training checkpoint: %s", distilled_train_path)
@@ -603,6 +615,9 @@ def main():
         initial_student_path = latest_train_path
     elif os.path.exists(distilled_train_path):
         initial_student_path = distilled_train_path
+    elif init_override:
+        initial_student_path = init_override
+        logger.info("Warm-starting training from override checkpoint: %s", init_override)
     elif os.path.exists(pruned_start_path):
         initial_student_path = pruned_start_path
         logger.info("Warm-starting training from pruned checkpoint: %s", pruned_start_path)

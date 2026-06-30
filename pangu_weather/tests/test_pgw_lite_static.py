@@ -26,6 +26,8 @@ class PGWLiteStaticTests(unittest.TestCase):
         self.assertIn("student_160:", config)
         self.assertIn("pgw_lite_patch8:", config)
         self.assertIn("patch_size: [2, 8, 8]", config)
+        self.assertIn("pgw_lite_pruned_96_patch16_full:", config)
+        self.assertIn("patch_size: [2, 16, 16]", config)
         self.assertIn('pgw_lite_distilled_checkpoint: "model_pgw_lite_fp16.pth"', config)
         self.assertIn('pgw_lite_quantized_checkpoint: "model_pgw_lite_quantized.pth"', config)
         self.assertIn("distill_teacher_weight: 0.5", config)
@@ -87,6 +89,8 @@ class PGWLiteStaticTests(unittest.TestCase):
         self.assertIn("pgw_lite_distilled_checkpoint", source)
         self.assertIn("load_compatible_state", source)
         self.assertIn('"model_profile": student_profile', source)
+        self.assertIn("PANGU_DISTILL_INIT_CHECKPOINT", source)
+        self.assertIn("resolve_checkpoint_arg", source)
 
 
 if __name__ == "__main__":

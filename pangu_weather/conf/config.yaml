@@ -31,6 +31,10 @@ model:
         embed_dim: 96
         num_heads: [3, 6, 6, 3]
         depth_blocks: [1, 2, 2, 1]
+      pgw_lite_pruned_96_patch16_full:
+        patch_size: [2, 16, 16]
+        embed_dim: 96
+        num_heads: [3, 6, 6, 3]
       pgw_lite_pruned_64:
         patch_size: [2, 8, 8]
         embed_dim: 64
