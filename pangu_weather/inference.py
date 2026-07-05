@@ -16,6 +16,11 @@ from pangu_profile_model import build_pangu_model
 # pass environment variables. Keep these overrideable for server A/B tests.
 os.environ.setdefault("PANGU_AUTO_SCAN_CHECKPOINT", "0")
 os.environ.setdefault("PANGU_DISABLE_CUDA_GRAPH", "1")
+os.environ.setdefault("PANGU_LAYERWISE_INFERENCE", "1")
+os.environ.setdefault("PANGU_RECOMPUTE_SKIP", "1")
+os.environ.setdefault("PANGU_DIRECT_RECOVERY", "1")
+os.environ.setdefault("PANGU_DIRECT_RECOVERY_WIDTH_CHUNK", "16")
+
 
 # ---- 方向4.2: cuDNN 自动调优（固定输入尺寸 721×1440, batch=1）----
 torch.backends.cudnn.benchmark = True
@@ -886,6 +891,16 @@ if __name__ == "__main__":
                     print("🧹  PANGU_LAYERWISE_EMPTY_CACHE=1，逐层推理时清理 CUDA cache")
             if recompute_skip:
                 print("♻️  PANGU_RECOMPUTE_SKIP=1，推理时重算 skip activation")
+            if _is_enabled("PANGU_CHUNKED_RECOVERY"):
+                print(
+                    "🧱  PANGU_CHUNKED_RECOVERY=1，"
+                    f"chunk_size={_env_int('PANGU_RECOVERY_CHUNK_SIZE', 1)}"
+                )
+            if _is_enabled("PANGU_DIRECT_RECOVERY"):
+                print(
+                    "🧩  PANGU_DIRECT_RECOVERY=1，使用 direct patch unembedding，"
+                    f"width_chunk={_env_int('PANGU_DIRECT_RECOVERY_WIDTH_CHUNK', 16)}"
+                )
             if chunked_attention:
                 patched_attention = getattr(model, "_pangu_chunked_attention_count", 0)
                 print(

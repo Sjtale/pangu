@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 from onescience.models.pangu import Pangu
 from onescience.modules import OneRecovery, OneFuser
+from onescience.modules.attention.earthattention3d import EarthAttention3D
 
 
 def _is_enabled(name, default=False):
@@ -295,14 +296,264 @@ def _maybe_empty_cache(enabled):
         torch.cuda.empty_cache()
 
 
-def _run_fuser_layerwise(fuser, x, empty_cache=False):
+def _profile_layerwise_memory(tag, reset=False):
+    if not _is_enabled("PANGU_PROFILE_LAYERWISE_MEMORY"):
+        return
+    if not torch.cuda.is_available():
+        return
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated() / 1024**2
+    reserved = torch.cuda.memory_reserved() / 1024**2
+    peak = torch.cuda.max_memory_allocated() / 1024**2
+    print(
+        f"[LAYER-MEM] {tag}: allocated={allocated:.1f} MB, "
+        f"reserved={reserved:.1f} MB, peak={peak:.1f} MB"
+    )
+    if reset:
+        torch.cuda.reset_peak_memory_stats()
+
+
+def _crop_recovery_output(recovery, output):
+    _, _, PressureLevels, Height, Width = output.shape
+
+    PressureLevelsPad = PressureLevels - recovery.img_size[0]
+    HeightPad = Height - recovery.img_size[1]
+    WidthPad = Width - recovery.img_size[2]
+
+    if PressureLevelsPad < 0 or HeightPad < 0 or WidthPad < 0:
+        raise ValueError("Recovered feature map is smaller than the target img_size")
+
+    PaddingFront = PressureLevelsPad // 2
+    PaddingBack = PressureLevelsPad - PaddingFront
+    PaddingTop = HeightPad // 2
+    PaddingBottom = HeightPad - PaddingTop
+    PaddingLeft = WidthPad // 2
+    PaddingRight = WidthPad - PaddingLeft
+
+    return output[
+        :,
+        :,
+        PaddingFront : PressureLevels - PaddingBack,
+        PaddingTop : Height - PaddingBottom,
+        PaddingLeft : Width - PaddingRight,
+    ]
+
+
+def _recovery_crop_bounds(recovery, output_shape):
+    PressureLevels, Height, Width = output_shape
+
+    PressureLevelsPad = PressureLevels - recovery.img_size[0]
+    HeightPad = Height - recovery.img_size[1]
+    WidthPad = Width - recovery.img_size[2]
+
+    if PressureLevelsPad < 0 or HeightPad < 0 or WidthPad < 0:
+        raise ValueError("Recovered feature map is smaller than the target img_size")
+
+    PaddingFront = PressureLevelsPad // 2
+    PaddingTop = HeightPad // 2
+    PaddingLeft = WidthPad // 2
+    return (
+        PaddingFront,
+        PaddingFront + recovery.img_size[0],
+        PaddingTop,
+        PaddingTop + recovery.img_size[1],
+        PaddingLeft,
+        PaddingLeft + recovery.img_size[2],
+    )
+
+
+def _direct_patch_unembed_chunk(recovery, x):
+    proj = recovery.proj
+    patch_pressure, patch_height, patch_width = tuple(proj.kernel_size)
+    Batch, Channels, PressureLevels, Height, Width = x.shape
+    weight = proj.weight.reshape(
+        Channels,
+        recovery.out_chans * patch_pressure * patch_height * patch_width,
+    )
+    blocks = x.permute(0, 2, 3, 4, 1).reshape(-1, Channels).matmul(weight)
+    blocks = blocks.reshape(
+        Batch,
+        PressureLevels,
+        Height,
+        Width,
+        recovery.out_chans,
+        patch_pressure,
+        patch_height,
+        patch_width,
+    )
+    output = blocks.permute(0, 4, 1, 5, 2, 6, 3, 7).reshape(
+        Batch,
+        recovery.out_chans,
+        PressureLevels * patch_pressure,
+        Height * patch_height,
+        Width * patch_width,
+    )
+    if proj.bias is not None:
+        output = output + proj.bias.view(1, -1, 1, 1, 1)
+    return output
+
+
+def _direct_patch_recovery(recovery_module, x, width_chunk_size=None):
+    """Recover non-overlapping patches without ConvTranspose3d workspace."""
+
+    recovery = getattr(recovery_module, "recovery", recovery_module)
+    squeeze_pressure_dim = False
+    if x.ndim == 4:
+        x = x.unsqueeze(2)
+        squeeze_pressure_dim = True
+    elif x.ndim != 5:
+        return recovery_module(x)
+
+    if x.shape[1] != recovery.in_chans:
+        raise ValueError(
+            f"Expected input channels {recovery.in_chans}, but received {x.shape[1]}"
+        )
+
+    proj = recovery.proj
+    unsupported = (
+        getattr(proj, "groups", 1) != 1
+        or tuple(proj.stride) != tuple(proj.kernel_size)
+        or tuple(proj.padding) != (0, 0, 0)
+        or tuple(proj.output_padding) != (0, 0, 0)
+        or tuple(proj.dilation) != (1, 1, 1)
+    )
+    if unsupported:
+        return recovery_module(x.squeeze(2) if squeeze_pressure_dim else x)
+
+    patch_pressure, patch_height, patch_width = tuple(proj.kernel_size)
+    full_shape = (
+        x.shape[2] * patch_pressure,
+        x.shape[3] * patch_height,
+        x.shape[4] * patch_width,
+    )
+    (
+        crop_pressure_start,
+        crop_pressure_end,
+        crop_height_start,
+        crop_height_end,
+        crop_width_start,
+        crop_width_end,
+    ) = _recovery_crop_bounds(recovery, full_shape)
+
+    width_chunk_size = (
+        x.shape[4]
+        if width_chunk_size is None or int(width_chunk_size) <= 0
+        else min(int(width_chunk_size), x.shape[4])
+    )
+    output = x.new_empty((x.shape[0], recovery.out_chans, *tuple(recovery.img_size)))
+
+    for start in range(0, x.shape[4], width_chunk_size):
+        end = min(start + width_chunk_size, x.shape[4])
+        chunk = _direct_patch_unembed_chunk(recovery, x[:, :, :, :, start:end])
+        chunk_width_start = start * patch_width
+        chunk_width_end = end * patch_width
+        overlap_start = max(chunk_width_start, crop_width_start)
+        overlap_end = min(chunk_width_end, crop_width_end)
+        if overlap_start < overlap_end:
+            source_width = slice(
+                overlap_start - chunk_width_start,
+                overlap_end - chunk_width_start,
+            )
+            dest_width = slice(
+                overlap_start - crop_width_start,
+                overlap_end - crop_width_start,
+            )
+            output[:, :, :, :, dest_width].copy_(
+                chunk[
+                    :,
+                    :,
+                    crop_pressure_start:crop_pressure_end,
+                    crop_height_start:crop_height_end,
+                    source_width,
+                ]
+            )
+        del chunk
+
+    if squeeze_pressure_dim:
+        output = output.squeeze(2)
+    return output
+
+
+def _chunked_patchrecovery3d(recovery_module, x, chunk_size):
+    """Recover upper-air variables in output-channel chunks to lower peak VRAM."""
+
+    recovery = getattr(recovery_module, "recovery", recovery_module)
+    if x.ndim != 5:
+        return recovery_module(x)
+    if x.shape[1] != recovery.in_chans:
+        raise ValueError(
+            f"Expected input channels {recovery.in_chans}, but received {x.shape[1]}"
+        )
+
+    proj = recovery.proj
+    if getattr(proj, "groups", 1) != 1:
+        return recovery_module(x)
+
+    out_chans = int(recovery.out_chans)
+    chunk_size = max(1, min(int(chunk_size), out_chans))
+    if chunk_size >= out_chans:
+        return recovery_module(x)
+
+    output = x.new_empty((x.shape[0], out_chans, *tuple(recovery.img_size)))
+    bias = proj.bias
+    for start in range(0, out_chans, chunk_size):
+        end = min(start + chunk_size, out_chans)
+        chunk = F.conv_transpose3d(
+            x,
+            proj.weight[:, start:end, :, :, :],
+            bias=None if bias is None else bias[start:end],
+            stride=proj.stride,
+            padding=proj.padding,
+            output_padding=proj.output_padding,
+            groups=proj.groups,
+            dilation=proj.dilation,
+        )
+        output[:, start:end, :, :, :].copy_(_crop_recovery_output(recovery, chunk))
+        del chunk
+        _profile_layerwise_memory(f"recover.upper_air.chunk{start}:{end}", reset=True)
+    return output
+
+
+def _direct_recovery_width_chunk(default=16):
+    return _env_int("PANGU_DIRECT_RECOVERY_WIDTH_CHUNK", default)
+
+
+def _recover_surface(model, output_surface):
+    if _is_enabled("PANGU_DIRECT_RECOVERY"):
+        return _direct_patch_recovery(
+            model.patchrecovery2d,
+            output_surface,
+            width_chunk_size=_direct_recovery_width_chunk(),
+        )
+    return model.patchrecovery2d(output_surface)
+
+
+def _recover_upper_air(model, output_upper_air):
+    if _is_enabled("PANGU_DIRECT_RECOVERY"):
+        return _direct_patch_recovery(
+            model.patchrecovery3d,
+            output_upper_air,
+            width_chunk_size=_direct_recovery_width_chunk(),
+        )
+    if _is_enabled("PANGU_CHUNKED_RECOVERY"):
+        chunk_size = _env_int("PANGU_RECOVERY_CHUNK_SIZE", 1)
+        return _chunked_patchrecovery3d(model.patchrecovery3d, output_upper_air, chunk_size)
+    return model.patchrecovery3d(output_upper_air)
+
+
+def _run_fuser_layerwise(fuser, x, empty_cache=False, label=None):
     blocks = getattr(fuser, "blocks", None)
     if blocks is None:
         blocks = getattr(getattr(fuser, "fuser", None), "blocks", None)
     if blocks is None:
-        return fuser(x)
-    for block in blocks:
+        x = fuser(x)
+        if label is not None:
+            _profile_layerwise_memory(label, reset=True)
+        return x
+    for idx, block in enumerate(blocks):
         x = block(x)
+        if label is not None:
+            _profile_layerwise_memory(f"{label}.block{idx}", reset=True)
         _maybe_empty_cache(empty_cache)
     return x
 
@@ -313,9 +564,12 @@ def _recover_outputs(model, sequence, Batch, PressureLevels, Height, Width):
     )
     output_surface = OutputFeatures[:, :, 0, :, :]
     output_upper_air = OutputFeatures[:, :, 1:, :, :]
+    _profile_layerwise_memory("recover.reshape_views", reset=True)
 
-    output_surface = model.patchrecovery2d(output_surface)
-    output_upper_air = model.patchrecovery3d(output_upper_air)
+    output_surface = _recover_surface(model, output_surface)
+    _profile_layerwise_memory("recover.surface", reset=True)
+    output_upper_air = _recover_upper_air(model, output_upper_air)
+    _profile_layerwise_memory("recover.upper_air", reset=True)
     return output_surface, output_upper_air
 
 
@@ -339,51 +593,64 @@ def _forward_recompute_skip(self, x):
     output_surface = OutputFeatures[:, :, 0, :, :]
     output_upper_air = OutputFeatures[:, :, 1:, :, :]
 
-    output_surface = self.patchrecovery2d(output_surface)
-    output_upper_air = self.patchrecovery3d(output_upper_air)
+    output_surface = _recover_surface(self, output_surface)
+    output_upper_air = _recover_upper_air(self, output_upper_air)
     return output_surface, output_upper_air
 
 
 def _forward_layerwise(self, x):
     empty_cache = bool(getattr(self, "_layerwise_empty_cache", False))
+    _profile_layerwise_memory("forward.start", reset=True)
     sequence, Batch, PressureLevels, Height, Width = _embed_sequence(self, x)
+    _profile_layerwise_memory("embed_sequence", reset=True)
 
-    sequence = _run_fuser_layerwise(self.layer1, sequence, empty_cache)
+    sequence = _run_fuser_layerwise(self.layer1, sequence, empty_cache, "layer1")
     skip_sequence = sequence
     _maybe_empty_cache(empty_cache)
 
     sequence = self.downsample(sequence)
+    _profile_layerwise_memory("downsample", reset=True)
     _maybe_empty_cache(empty_cache)
-    sequence = _run_fuser_layerwise(self.layer2, sequence, empty_cache)
-    sequence = _run_fuser_layerwise(self.layer3, sequence, empty_cache)
+    sequence = _run_fuser_layerwise(self.layer2, sequence, empty_cache, "layer2")
+    sequence = _run_fuser_layerwise(self.layer3, sequence, empty_cache, "layer3")
     sequence = self.upsample(sequence)
+    _profile_layerwise_memory("upsample", reset=True)
     _maybe_empty_cache(empty_cache)
-    sequence = _run_fuser_layerwise(self.layer4, sequence, empty_cache)
+    sequence = _run_fuser_layerwise(self.layer4, sequence, empty_cache, "layer4")
 
     sequence = torch.concat([sequence, skip_sequence], dim=-1)
     del skip_sequence
+    _profile_layerwise_memory("skip_concat", reset=True)
     _maybe_empty_cache(empty_cache)
     return _recover_outputs(self, sequence, Batch, PressureLevels, Height, Width)
 
 
 def _forward_layerwise_recompute_skip(self, x):
     empty_cache = bool(getattr(self, "_layerwise_empty_cache", False))
+    _profile_layerwise_memory("forward.start", reset=True)
     sequence, Batch, PressureLevels, Height, Width = _embed_sequence(self, x)
+    _profile_layerwise_memory("embed_sequence", reset=True)
 
-    sequence = _run_fuser_layerwise(self.layer1, sequence, empty_cache)
+    sequence = _run_fuser_layerwise(self.layer1, sequence, empty_cache, "layer1.main")
     sequence = self.downsample(sequence)
+    _profile_layerwise_memory("downsample", reset=True)
     _maybe_empty_cache(empty_cache)
-    sequence = _run_fuser_layerwise(self.layer2, sequence, empty_cache)
-    sequence = _run_fuser_layerwise(self.layer3, sequence, empty_cache)
+    sequence = _run_fuser_layerwise(self.layer2, sequence, empty_cache, "layer2")
+    sequence = _run_fuser_layerwise(self.layer3, sequence, empty_cache, "layer3")
     sequence = self.upsample(sequence)
+    _profile_layerwise_memory("upsample", reset=True)
     _maybe_empty_cache(empty_cache)
-    sequence = _run_fuser_layerwise(self.layer4, sequence, empty_cache)
+    sequence = _run_fuser_layerwise(self.layer4, sequence, empty_cache, "layer4")
 
     skip_sequence, _, _, _, _ = _embed_sequence(self, x)
-    skip_sequence = _run_fuser_layerwise(self.layer1, skip_sequence, empty_cache)
+    _profile_layerwise_memory("skip.embed_sequence", reset=True)
+    skip_sequence = _run_fuser_layerwise(
+        self.layer1, skip_sequence, empty_cache, "layer1.skip"
+    )
 
     sequence = torch.concat([sequence, skip_sequence], dim=-1)
     del skip_sequence
+    _profile_layerwise_memory("skip_concat", reset=True)
     _maybe_empty_cache(empty_cache)
     return _recover_outputs(self, sequence, Batch, PressureLevels, Height, Width)
 
@@ -484,8 +751,8 @@ def _forward_memory_efficient(self, x):
     output_surface = OutputFeatures[:, :, 0, :, :]
     output_upper_air = OutputFeatures[:, :, 1:, :, :]
 
-    output_surface = self.patchrecovery2d(output_surface)
-    output_upper_air = self.patchrecovery3d(output_upper_air)
+    output_surface = _recover_surface(self, output_surface)
+    output_upper_air = _recover_upper_air(self, output_upper_air)
     return output_surface, output_upper_air
 
 
@@ -494,6 +761,9 @@ def enable_memory_efficient_forward(model):
 
     model.forward = types.MethodType(_forward_memory_efficient, model)
     return model
+
+
+Pangu.forward = _forward_memory_efficient
 
 
 def _forward_chunked_earth_attention_3d(self, x, mask=None):
@@ -531,6 +801,7 @@ def _forward_chunked_earth_attention_3d(self, x, mask=None):
         q_chunk = q[start:end]
         k_chunk = k[start:end]
         v_chunk = v[start:end]
+
         attn_chunk = q_chunk @ k_chunk.transpose(-2, -1)
         attn_chunk = attn_chunk + earth_position_bias
 
@@ -541,6 +812,7 @@ def _forward_chunked_earth_attention_3d(self, x, mask=None):
             )
             mask_chunk = mask.index_select(0, mask_indices)
             attn_chunk = attn_chunk + mask_chunk.unsqueeze(1)
+
         attn_chunk = self.softmax(attn_chunk)
         attn_chunk = self.attn_drop(attn_chunk)
 

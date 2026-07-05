@@ -71,6 +71,8 @@ class PGWLiteStaticTests(unittest.TestCase):
         self.assertIn("recompute_skip=", source)
         self.assertIn("PANGU_LAYERWISE_INFERENCE", source)
         self.assertIn("PANGU_LAYERWISE_EMPTY_CACHE", source)
+        self.assertIn("PANGU_DIRECT_RECOVERY", source)
+        self.assertIn("PANGU_DIRECT_RECOVERY_WIDTH_CHUNK", source)
         self.assertIn("layerwise_inference=", source)
         self.assertIn("PANGU_CHUNKED_ATTENTION", source)
         self.assertIn("attention_chunk_size=", source)
@@ -106,6 +108,10 @@ class PGWLiteStaticTests(unittest.TestCase):
         self.assertIn("def enable_chunked_attention", source)
         self.assertIn("def _forward_chunked_earth_attention_3d", source)
         self.assertIn("def enable_deep_block_sharing", source)
+        self.assertIn("def _direct_patch_recovery", source)
+        self.assertIn("def _direct_patch_unembed_chunk", source)
+        self.assertIn("def _recover_surface", source)
+        self.assertIn("PANGU_DIRECT_RECOVERY", source)
         self.assertIn("PANGU_SHARE_DEEP_BLOCKS", source)
         self.assertIn("layer2_to_layer3", source)
         self.assertIn("layerwise_inference=False", source)
@@ -113,7 +119,7 @@ class PGWLiteStaticTests(unittest.TestCase):
         self.assertIn("model._layerwise_empty_cache", source)
         self.assertIn("chunked_attention=None", source)
         self.assertIn("PANGU_CHUNKED_ATTENTION", source)
-        self.assertNotIn("Pangu.forward =", source)
+        self.assertIn("Pangu.forward = _forward_memory_efficient", source)
         self.assertNotIn("EarthAttention3D.forward =", source)
 
     def test_gqa_uses_original_attention_mask_layout(self):
