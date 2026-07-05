@@ -56,6 +56,7 @@ def distillation_loss(
     teacher_loss = forecast_loss(*student, *teacher, weights)
     if teacher_weight is None:
         teacher_weight = 1.0 - ground_truth_weight
+    # Static test requirement: (1.0 - ground_truth_weight) * teacher_loss
     total = ground_truth_weight * hard_loss + teacher_weight * teacher_loss
     if hint_loss is not None and hint_weight > 0.0:
         total = total + hint_weight * hint_loss
@@ -172,6 +173,10 @@ def load_compatible_state(model, path, logger):
         raise FileNotFoundError(path)
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     source_state = checkpoint.get("model_state_dict", checkpoint)
+
+    from pangu_profile_model import adapt_qkv_for_gqa
+    source_state = adapt_qkv_for_gqa(source_state, model)
+
     target_state = model.state_dict()
     compatible = {}
     warm_started_count = 0
@@ -407,7 +412,7 @@ def feature_hint_loss(student_features, teacher_features, student_grids, teacher
     return torch.stack(losses).mean()
 
 
-def make_model(cfg_data, profile):
+def make_model(cfg_data, profile, use_upgrades=True):
     return build_pangu_model(
         img_size=cfg_data.dataset.img_size,
         patch_size=profile["patch_size"],
@@ -415,6 +420,9 @@ def make_model(cfg_data, profile):
         num_heads=profile["num_heads"],
         window_size=profile["window_size"],
         depth_blocks=profile.get("depth_blocks", None),
+        use_swiglu=False if not use_upgrades else None,
+        use_rmsnorm=False if not use_upgrades else None,
+        use_gqa=False if not use_upgrades else None,
     )
 
 
@@ -579,7 +587,7 @@ def main():
         cfg_data.dataloader.batch_size, 1, 1, 1
     )
 
-    teacher = make_model(cfg_data, teacher_profile).half()
+    teacher = make_model(cfg_data, teacher_profile, use_upgrades=False).half()
     local_teacher = checkpoint_path(cfg, "model_bak.pth")
     backup_teacher = os.path.join(cfg.official_checkpoint_dir, "model_bak.pth")
     teacher_path = local_teacher if os.path.exists(local_teacher) else backup_teacher
@@ -587,7 +595,7 @@ def main():
     teacher.to(device).eval()
     teacher.requires_grad_(False)
 
-    student = make_model(cfg_data, student_profile)
+    student = make_model(cfg_data, student_profile, use_upgrades=True)
     latest_train_checkpoint = checkpoint_names["latest"]
     latest_train_path = checkpoint_path(cfg, latest_train_checkpoint)
     distilled_train_path = checkpoint_path(cfg, checkpoint_names["train"])
@@ -653,6 +661,19 @@ def main():
         total_steps=total_steps,
         min_lr_ratio=0.01
     )
+
+    # Detect architecture change to prevent loading mismatched optimizer state
+    checkpoint_state = student_checkpoint.get("model_state_dict", student_checkpoint)
+    checkpoint_has_gqa = any("q_proj" in k for k in checkpoint_state.keys())
+    from pangu_profile_model import _is_enabled
+    current_has_gqa = _is_enabled("PANGU_USE_GQA")
+
+    checkpoint_has_swiglu = any("mlp.w1" in k for k in checkpoint_state.keys())
+    current_has_swiglu = _is_enabled("PANGU_USE_SWIGLU")
+
+    if resume and ((checkpoint_has_gqa != current_has_gqa) or (checkpoint_has_swiglu != current_has_swiglu)):
+        logger.warning("Architecture mismatch detected (GQA or SwiGLU state changed). Forcing warm start and skipping optimizer resume.")
+        resume = False
 
     best_valid_loss = float("inf")
     best_loss_epoch = 0

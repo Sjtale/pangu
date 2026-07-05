@@ -6,10 +6,258 @@ by profile checkpoints here instead of relying on local OneScience edits.
 """
 
 import types
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from onescience.models.pangu import Pangu
 from onescience.modules import OneRecovery, OneFuser
-import torch
+
+
+def _is_enabled(name, default=False):
+    default_value = "1" if default else "0"
+    return os.environ.get(name, default_value).lower() not in {"0", "false", "no"}
+
+
+def _env_int(name, default):
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        return int(raw_value)
+    except ValueError:
+        return default
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        variance = x.pow(2).mean(-1, keepdim=True)
+        return x * torch.rsqrt(variance + self.eps) * self.weight
+
+
+class SwiGLUMlp(nn.Module):
+    def __init__(self, in_features, hidden_features, out_features=None, act_layer=None, drop=0.0):
+        super().__init__()
+        out_features = out_features or in_features
+        self.w1 = nn.Linear(in_features, hidden_features, bias=False)
+        self.w2 = nn.Linear(in_features, hidden_features, bias=False)
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=True)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = F.silu(self.w1(x)) * self.w2(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class GQAEarthAttention3D(nn.Module):
+    def __init__(self, original_attn, kv_group_size=2):
+        super().__init__()
+        self.dim = original_attn.dim
+        self.window_size = original_attn.window_size
+        self.num_heads = original_attn.num_heads
+        self.kv_group_size = kv_group_size
+        self.num_kv_heads = self.num_heads // kv_group_size
+
+        head_dim = self.dim // self.num_heads
+        self.scale = original_attn.scale
+        self.num_pressure_height_windows = original_attn.num_pressure_height_windows
+
+        self.earth_position_bias_table = original_attn.earth_position_bias_table
+        self.register_buffer("earth_position_index", original_attn.earth_position_index)
+
+        qkv_bias = original_attn.qkv.bias is not None
+        self.q_proj = nn.Linear(self.dim, self.dim, bias=qkv_bias)
+        kv_dim = self.num_kv_heads * head_dim
+        self.kv_proj = nn.Linear(self.dim, kv_dim * 2, bias=qkv_bias)
+
+        self.attn_drop = original_attn.attn_drop
+        self.proj = original_attn.proj
+        self.proj_drop = original_attn.proj_drop
+        self.softmax = original_attn.softmax
+
+    def forward(self, x, mask=None):
+        BatchTimesWidthWindows, NumPressureHeightWindows, WindowTokens, Channels = x.shape
+        head_dim = Channels // self.num_heads
+
+        q = self.q_proj(x).reshape(
+            BatchTimesWidthWindows,
+            NumPressureHeightWindows,
+            WindowTokens,
+            self.num_heads,
+            head_dim
+        ).permute(0, 3, 1, 2, 4)
+
+        kv = self.kv_proj(x).reshape(
+            BatchTimesWidthWindows,
+            NumPressureHeightWindows,
+            WindowTokens,
+            2,
+            self.num_kv_heads,
+            head_dim
+        ).permute(3, 0, 4, 1, 2, 5)
+        k, v = kv[0], kv[1]
+
+        if self.kv_group_size > 1:
+            k = k.repeat_interleave(self.kv_group_size, dim=1)
+            v = v.repeat_interleave(self.kv_group_size, dim=1)
+            if k.shape[1] < self.num_heads:
+                diff = self.num_heads - k.shape[1]
+                last_k = k[:, -1:, :, :, :]
+                last_v = v[:, -1:, :, :, :]
+                k = torch.cat([k, last_k.repeat(1, diff, 1, 1, 1)], dim=1)
+                v = torch.cat([v, last_v.repeat(1, diff, 1, 1, 1)], dim=1)
+
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1)
+
+        earth_position_bias = self.earth_position_bias_table[
+            self.earth_position_index.view(-1)
+        ].view(
+            self.window_size[0] * self.window_size[1] * self.window_size[2],
+            self.window_size[0] * self.window_size[1] * self.window_size[2],
+            self.num_pressure_height_windows,
+            -1,
+        )
+        earth_position_bias = earth_position_bias.permute(3, 2, 0, 1).contiguous()
+        attn = attn + earth_position_bias.unsqueeze(0)
+
+        if mask is not None:
+            NumWidthWindows = mask.shape[0]
+            attn = attn.view(
+                BatchTimesWidthWindows // NumWidthWindows,
+                NumWidthWindows,
+                self.num_heads,
+                NumPressureHeightWindows,
+                WindowTokens,
+                WindowTokens,
+            ) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(
+                -1,
+                self.num_heads,
+                NumPressureHeightWindows,
+                WindowTokens,
+                WindowTokens,
+            )
+            attn = self.softmax(attn)
+        else:
+            attn = self.softmax(attn)
+
+        attn = self.attn_drop(attn)
+        x = (attn @ v).permute(0, 2, 3, 1, 4).reshape(
+            BatchTimesWidthWindows,
+            NumPressureHeightWindows,
+            WindowTokens,
+            Channels,
+        )
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+def apply_architectural_upgrades(model, use_swiglu=False, use_rmsnorm=False, use_gqa=False, kv_group_size=2):
+    from onescience.modules.transformer.onetransformer import OneTransformer
+    for name, module in model.named_modules():
+        if isinstance(module, OneTransformer) and hasattr(module, "transformer"):
+            trans = module.transformer
+            if trans.__class__.__name__ == "EarthTransformer3DBlock":
+                if use_rmsnorm:
+                    if hasattr(trans, "norm1") and isinstance(trans.norm1, nn.LayerNorm):
+                        trans.norm1 = RMSNorm(trans.norm1.normalized_shape[0], eps=trans.norm1.eps)
+                    if hasattr(trans, "norm2") and isinstance(trans.norm2, nn.LayerNorm):
+                        trans.norm2 = RMSNorm(trans.norm2.normalized_shape[0], eps=trans.norm2.eps)
+                if use_swiglu:
+                    if hasattr(trans, "mlp"):
+                        old_mlp = trans.mlp
+                        if old_mlp.__class__.__name__ == "Mlp":
+                            in_features = old_mlp.fc1.in_features
+                            out_features = old_mlp.fc2.out_features
+                            old_hidden = old_mlp.fc1.out_features
+                            new_hidden = int(old_hidden * 2 / 3)
+                            trans.mlp = SwiGLUMlp(
+                                in_features=in_features,
+                                hidden_features=new_hidden,
+                                out_features=out_features,
+                                drop=old_mlp.drop.p
+                            )
+                if use_gqa:
+                    if hasattr(trans, "attn") and hasattr(trans.attn, "attentioner"):
+                        old_attn = trans.attn.attentioner
+                        if old_attn.__class__.__name__ == "EarthAttention3D":
+                            trans.attn.attentioner = GQAEarthAttention3D(old_attn, kv_group_size=kv_group_size)
+
+
+def adapt_qkv_for_gqa(source_state, model):
+    new_state = {}
+    for key, val in source_state.items():
+        if key.endswith(".attn.qkv.weight") or key.endswith(".attn.qkv.bias"):
+            base_key = key.rsplit(".qkv.", 1)[0]
+            parts = base_key.split(".")
+            curr = model
+            for part in parts:
+                if part.isdigit():
+                    curr = curr[int(part)]
+                else:
+                    curr = getattr(curr, part, None)
+                    if curr is None:
+                        break
+            attn_module = None
+            if hasattr(curr, "transformer"):
+                attn_module = curr.transformer
+            elif hasattr(curr, "attentioner"):
+                attn_module = curr.attentioner
+            elif hasattr(curr, "attn"):
+                attn_module = curr.attn
+                if hasattr(attn_module, "attentioner"):
+                    attn_module = attn_module.attentioner
+
+            if attn_module.__class__.__name__ == "GQAEarthAttention3D":
+                is_bias = key.endswith(".bias")
+                suffix = ".bias" if is_bias else ".weight"
+                q_key = f"{base_key}.q_proj{suffix}"
+                kv_key = f"{base_key}.kv_proj{suffix}"
+
+                dim = val.shape[0] // 3
+                q_val = val[:dim]
+                k_val = val[dim:2 * dim]
+                v_val = val[2 * dim:]
+
+                kv_group_size = attn_module.kv_group_size
+                num_heads = attn_module.num_heads
+                num_kv_heads = attn_module.num_kv_heads
+                head_dim = dim // num_heads
+
+                if not is_bias:
+                    k_reshaped = k_val.view(num_heads, head_dim, -1)
+                    indices = [i * kv_group_size for i in range(num_kv_heads)]
+                    k_pooled = k_reshaped[indices, :, :].reshape(num_kv_heads * head_dim, -1)
+
+                    v_reshaped = v_val.view(num_heads, head_dim, -1)
+                    v_pooled = v_reshaped[indices, :, :].reshape(num_kv_heads * head_dim, -1)
+                else:
+                    k_reshaped = k_val.view(num_heads, head_dim)
+                    indices = [i * kv_group_size for i in range(num_kv_heads)]
+                    k_pooled = k_reshaped[indices, :].reshape(num_kv_heads * head_dim)
+
+                    v_reshaped = v_val.view(num_heads, head_dim)
+                    v_pooled = v_reshaped[indices, :].reshape(num_kv_heads * head_dim)
+
+                new_state[q_key] = q_val
+                new_state[kv_key] = torch.cat([k_pooled, v_pooled], dim=0)
+            else:
+                new_state[key] = val
+        else:
+            new_state[key] = val
+    return new_state
+
 
 
 def _as_int_list(value):
@@ -28,6 +276,35 @@ def _embed_sequence(model, x):
     Batch, Channels, PressureLevels, Height, Width = CombinedFeatures.shape
     sequence = CombinedFeatures.reshape(Batch, Channels, -1).transpose(1, 2)
     return sequence, Batch, PressureLevels, Height, Width
+
+
+def _maybe_empty_cache(enabled):
+    if enabled and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _run_fuser_layerwise(fuser, x, empty_cache=False):
+    blocks = getattr(fuser, "blocks", None)
+    if blocks is None:
+        blocks = getattr(getattr(fuser, "fuser", None), "blocks", None)
+    if blocks is None:
+        return fuser(x)
+    for block in blocks:
+        x = block(x)
+        _maybe_empty_cache(empty_cache)
+    return x
+
+
+def _recover_outputs(model, sequence, Batch, PressureLevels, Height, Width):
+    OutputFeatures = sequence.transpose(1, 2).reshape(
+        Batch, -1, PressureLevels, Height, Width
+    )
+    output_surface = OutputFeatures[:, :, 0, :, :]
+    output_upper_air = OutputFeatures[:, :, 1:, :, :]
+
+    output_surface = model.patchrecovery2d(output_surface)
+    output_upper_air = model.patchrecovery3d(output_upper_air)
+    return output_surface, output_upper_air
 
 
 def _forward_recompute_skip(self, x):
@@ -55,10 +332,63 @@ def _forward_recompute_skip(self, x):
     return output_surface, output_upper_air
 
 
+def _forward_layerwise(self, x):
+    empty_cache = bool(getattr(self, "_layerwise_empty_cache", False))
+    sequence, Batch, PressureLevels, Height, Width = _embed_sequence(self, x)
+
+    sequence = _run_fuser_layerwise(self.layer1, sequence, empty_cache)
+    skip_sequence = sequence
+    _maybe_empty_cache(empty_cache)
+
+    sequence = self.downsample(sequence)
+    _maybe_empty_cache(empty_cache)
+    sequence = _run_fuser_layerwise(self.layer2, sequence, empty_cache)
+    sequence = _run_fuser_layerwise(self.layer3, sequence, empty_cache)
+    sequence = self.upsample(sequence)
+    _maybe_empty_cache(empty_cache)
+    sequence = _run_fuser_layerwise(self.layer4, sequence, empty_cache)
+
+    sequence = torch.concat([sequence, skip_sequence], dim=-1)
+    del skip_sequence
+    _maybe_empty_cache(empty_cache)
+    return _recover_outputs(self, sequence, Batch, PressureLevels, Height, Width)
+
+
+def _forward_layerwise_recompute_skip(self, x):
+    empty_cache = bool(getattr(self, "_layerwise_empty_cache", False))
+    sequence, Batch, PressureLevels, Height, Width = _embed_sequence(self, x)
+
+    sequence = _run_fuser_layerwise(self.layer1, sequence, empty_cache)
+    sequence = self.downsample(sequence)
+    _maybe_empty_cache(empty_cache)
+    sequence = _run_fuser_layerwise(self.layer2, sequence, empty_cache)
+    sequence = _run_fuser_layerwise(self.layer3, sequence, empty_cache)
+    sequence = self.upsample(sequence)
+    _maybe_empty_cache(empty_cache)
+    sequence = _run_fuser_layerwise(self.layer4, sequence, empty_cache)
+
+    skip_sequence, _, _, _, _ = _embed_sequence(self, x)
+    skip_sequence = _run_fuser_layerwise(self.layer1, skip_sequence, empty_cache)
+
+    sequence = torch.concat([sequence, skip_sequence], dim=-1)
+    del skip_sequence
+    _maybe_empty_cache(empty_cache)
+    return _recover_outputs(self, sequence, Batch, PressureLevels, Height, Width)
+
+
 def enable_skip_recompute(model):
     """Trade extra layer1 compute for a shorter-lived skip activation."""
 
     model.forward = types.MethodType(_forward_recompute_skip, model)
+    return model
+
+
+def enable_layerwise_inference(model, recompute_skip=False, empty_cache=False):
+    """Run Pangu stages and fuser blocks explicitly for memory A/B tests."""
+
+    model._layerwise_empty_cache = bool(empty_cache)
+    forward = _forward_layerwise_recompute_skip if recompute_skip else _forward_layerwise
+    model.forward = types.MethodType(forward, model)
     return model
 
 
@@ -70,6 +400,12 @@ def build_pangu_model(
     window_size,
     depth_blocks=None,
     recompute_skip=False,
+    layerwise_inference=False,
+    layerwise_empty_cache=False,
+    use_swiglu=None,
+    use_rmsnorm=None,
+    use_gqa=None,
+    kv_group_size=None,
 ):
     """Create a Pangu model and patch submission-local profile differences.
 
@@ -182,7 +518,30 @@ def build_pangu_model(
             out_chans=5,
         )
 
-    if recompute_skip:
+    if use_swiglu is None:
+        use_swiglu = _is_enabled("PANGU_USE_SWIGLU")
+    if use_rmsnorm is None:
+        use_rmsnorm = _is_enabled("PANGU_USE_RMSNORM")
+    if use_gqa is None:
+        use_gqa = _is_enabled("PANGU_USE_GQA")
+    if kv_group_size is None:
+        kv_group_size = _env_int("PANGU_GQA_GROUP_SIZE", 2)
+
+    apply_architectural_upgrades(
+        model,
+        use_swiglu=use_swiglu,
+        use_rmsnorm=use_rmsnorm,
+        use_gqa=use_gqa,
+        kv_group_size=kv_group_size
+    )
+
+    if layerwise_inference:
+        enable_layerwise_inference(
+            model,
+            recompute_skip=recompute_skip,
+            empty_cache=layerwise_empty_cache,
+        )
+    elif recompute_skip:
         enable_skip_recompute(model)
 
     return model

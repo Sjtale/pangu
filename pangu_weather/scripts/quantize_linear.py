@@ -87,22 +87,6 @@ def main():
     cfg = YParams(config_path, "model")
     profile = get_quantization_profile(cfg)
 
-    # Instantiate the target student structure so Linear keys match its profile.
-    model = build_pangu_model(
-        img_size=[721, 1440],  # AI4S benchmark resolution
-        patch_size=profile["patch_size"],
-        embed_dim=profile["embed_dim"],
-        num_heads=profile["num_heads"],
-        window_size=profile["window_size"],
-        depth_blocks=profile.get("depth_blocks", None),
-    )
-
-    # Record all weight keys belonging to Linear layers
-    linear_keys = set()
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Linear):
-            linear_keys.add(name + ".weight")
-
     # Prioritize loading the latest training checkpoint, fallback to distilled FP16/train state.
     possible_paths = candidate_checkpoints(cfg, profile)
     distilled_path = None
@@ -117,6 +101,30 @@ def main():
     print(f"Loading distilled weights from: {distilled_path}")
     ckpt = torch.load(distilled_path, map_location="cpu", weights_only=False)
     state_dict = ckpt.get("model_state_dict", ckpt)
+
+    # Detect architecture configurations from loaded checkpoint
+    use_gqa = any("q_proj" in k for k in state_dict.keys())
+    use_swiglu = any("mlp.w1" in k for k in state_dict.keys())
+    use_rmsnorm = any("norm1.weight" in k for k in state_dict.keys()) and not any("norm1.bias" in k for k in state_dict.keys())
+
+    # Instantiate the target student structure so Linear keys match its profile.
+    model = build_pangu_model(
+        img_size=[721, 1440],  # AI4S benchmark resolution
+        patch_size=profile["patch_size"],
+        embed_dim=profile["embed_dim"],
+        num_heads=profile["num_heads"],
+        window_size=profile["window_size"],
+        depth_blocks=profile.get("depth_blocks", None),
+        use_swiglu=use_swiglu,
+        use_rmsnorm=use_rmsnorm,
+        use_gqa=use_gqa,
+    )
+
+    # Record all weight keys belonging to Linear layers
+    linear_keys = set()
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            linear_keys.add(name + ".weight")
 
     # Perform quantization
     quantized_state_dict = {}

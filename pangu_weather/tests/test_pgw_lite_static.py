@@ -60,6 +60,18 @@ class PGWLiteStaticTests(unittest.TestCase):
         self.assertIn("model_profile['patch_size']", source)
         self.assertIn("PANGU_RECOMPUTE_SKIP", source)
         self.assertIn("recompute_skip=", source)
+        self.assertIn("PANGU_LAYERWISE_INFERENCE", source)
+        self.assertIn("PANGU_LAYERWISE_EMPTY_CACHE", source)
+        self.assertIn("layerwise_inference=", source)
+        self.assertIn("PANGU_CHECKPOINT", source)
+        self.assertIn("PANGU_AUTO_SCAN_CHECKPOINT", source)
+        self.assertIn('os.environ.setdefault("PANGU_AUTO_SCAN_CHECKPOINT", "0")', source)
+        self.assertIn('os.environ.setdefault("PANGU_DISABLE_CUDA_GRAPH", "1")', source)
+        self.assertIn("_scan_checkpoint_path", source)
+        self.assertIn("_detect_architecture_from_state", source)
+        self.assertIn("_infer_gqa_group_size", source)
+        self.assertIn("_layer_index_from_key", source)
+        self.assertIn("kv_group_size=gqa_group_size", source)
 
     def test_profile_model_can_enable_skip_recompute_forward(self):
         source = PROFILE_MODEL.read_text(encoding="utf-8")
@@ -70,6 +82,25 @@ class PGWLiteStaticTests(unittest.TestCase):
         self.assertIn("model.forward = types.MethodType", source)
         self.assertIn("recompute_skip=False", source)
         self.assertIn("skip_sequence = self.layer1(skip_sequence)", source)
+
+    def test_profile_model_can_enable_layerwise_forward(self):
+        source = PROFILE_MODEL.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        self.assertIsNotNone(tree)
+        self.assertIn("def _forward_layerwise", source)
+        self.assertIn("def _run_fuser_layerwise", source)
+        self.assertIn("def enable_layerwise_inference", source)
+        self.assertIn("layerwise_inference=False", source)
+        self.assertIn("layerwise_empty_cache=False", source)
+        self.assertIn("model._layerwise_empty_cache", source)
+
+    def test_gqa_uses_original_attention_mask_layout(self):
+        source = PROFILE_MODEL.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        self.assertIsNotNone(tree)
+        self.assertIn("class GQAEarthAttention3D", source)
+        self.assertIn("mask.unsqueeze(1).unsqueeze(0)", source)
+        self.assertNotIn("scaled_dot_product_attention", source)
 
     def test_quantizer_outputs_per_channel_versioned_metadata(self):
         source = QUANTIZE.read_text(encoding="utf-8")

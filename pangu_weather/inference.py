@@ -12,6 +12,11 @@ from onescience.utils.YParams import YParams
 from onescience.datapipes.climate import ERA5Datapipe
 from pangu_profile_model import build_pangu_model
 
+# Submission defaults: the platform only executes inference.py and does not
+# pass environment variables. Keep these overrideable for server A/B tests.
+os.environ.setdefault("PANGU_AUTO_SCAN_CHECKPOINT", "0")
+os.environ.setdefault("PANGU_DISABLE_CUDA_GRAPH", "1")
+
 # ---- 方向4.2: cuDNN 自动调优（固定输入尺寸 721×1440, batch=1）----
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
@@ -25,7 +30,7 @@ class CUDAGraphWrapper:
     应 fallback 到原始 PyTorch 推理。
     """
 
-    def __init__(self, model, example_input, warmup_iters=3):
+    def __init__(self, model, example_input, warmup_iters=1):
         self.model = model
         self.static_input = torch.empty_like(example_input)
 
@@ -33,9 +38,11 @@ class CUDAGraphWrapper:
         # 显式禁用 autograd，否则 warmup 会保留整个 Pangu 前向图。
         with torch.inference_mode():
             # Warmup: 让 caching allocator 稳定，确保后续捕获时内存地址不变
+            warmup_output = None
             for _ in range(warmup_iters):
                 warmup_output = model(self.static_input)
-            del warmup_output
+            if warmup_output is not None:
+                del warmup_output
             torch.cuda.synchronize()
 
             # Capture: 将整个 forward 录制为 CUDA Graph
@@ -145,8 +152,46 @@ def _cfg_list(value):
     return [int(v) for v in value]
 
 
-def _is_enabled(name):
-    return os.environ.get(name, "0").lower() not in {"0", "false", "no"}
+def _is_enabled(name, default=False):
+    default_value = "1" if default else "0"
+    return os.environ.get(name, default_value).lower() not in {"0", "false", "no"}
+
+
+def _env_int(name, default):
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw_value!r}") from exc
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0, got {value}")
+    return value
+
+
+def _profile_cuda_memory(tag):
+    if not _is_enabled("PANGU_PROFILE_MEMORY"):
+        return
+    if not torch.cuda.is_available():
+        print(f"[MEM] {tag}: CUDA unavailable")
+        return
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated() / 1024**2
+    reserved = torch.cuda.memory_reserved() / 1024**2
+    peak = torch.cuda.max_memory_allocated() / 1024**2
+    print(
+        f"[MEM] {tag}: allocated={allocated:.1f} MB, "
+        f"reserved={reserved:.1f} MB, peak={peak:.1f} MB"
+    )
+
+
+def _reset_cuda_peak(tag):
+    if not torch.cuda.is_available():
+        return
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    print(f"[MEM] {tag}: reset CUDA peak memory stats")
 
 
 def _profile_from_config(cfg, profile_name):
@@ -235,6 +280,146 @@ def _infer_profile_from_state(cfg, ckpt, state_dict):
     return profile
 
 
+def _state_dict_keys(state_dict):
+    return list(state_dict.keys())
+
+
+def _layer_index_from_key(key):
+    for idx, layer_name in enumerate(("layer1.", "layer2.", "layer3.", "layer4.")):
+        if layer_name in key:
+            return idx
+    return None
+
+
+def _infer_gqa_group_size(state_dict, model_profile, default):
+    votes = {}
+    num_heads_by_layer = [int(v) for v in model_profile["num_heads"]]
+    for q_key in _state_dict_keys(state_dict):
+        if not q_key.endswith(".q_proj.weight"):
+            continue
+        layer_idx = _layer_index_from_key(q_key)
+        if layer_idx is None:
+            continue
+        kv_key = q_key[:-len(".q_proj.weight")] + ".kv_proj.weight"
+        if kv_key not in state_dict:
+            continue
+        num_heads = num_heads_by_layer[layer_idx]
+        q_weight = state_dict[q_key]
+        kv_weight = state_dict[kv_key]
+        q_dim = int(q_weight.shape[0])
+        if q_dim % num_heads != 0:
+            continue
+        head_dim = q_dim // num_heads
+        if head_dim == 0:
+            continue
+        kv_heads = int(kv_weight.shape[0]) // 2 // head_dim
+        if kv_heads <= 0:
+            continue
+        group_size = max(1, num_heads // kv_heads)
+        votes[group_size] = votes.get(group_size, 0) + 1
+    if not votes:
+        return default
+    return max(votes.items(), key=lambda item: (item[1], -item[0]))[0]
+
+
+def _detect_architecture_from_state(state_dict, model_profile):
+    keys = _state_dict_keys(state_dict)
+    use_gqa = any(".q_proj." in key or ".kv_proj." in key for key in keys)
+    use_swiglu = any(".mlp.w1." in key or ".mlp.w2." in key for key in keys)
+    has_norm_weight = any(".norm1.weight" in key or ".norm2.weight" in key for key in keys)
+    has_norm_bias = any(".norm1.bias" in key or ".norm2.bias" in key for key in keys)
+    use_rmsnorm = has_norm_weight and not has_norm_bias
+
+    gqa_group_size = _env_int("PANGU_GQA_GROUP_SIZE", 2)
+    if use_gqa:
+        gqa_group_size = _infer_gqa_group_size(state_dict, model_profile, gqa_group_size)
+
+    return {
+        "use_gqa": use_gqa,
+        "use_swiglu": use_swiglu,
+        "use_rmsnorm": use_rmsnorm,
+        "gqa_group_size": gqa_group_size,
+    }
+
+
+def _checkpoint_score(path, cfg, ckpt, state_dict, preferred_profile):
+    basename = os.path.basename(path)
+    score = 0
+    quant_meta = ckpt.get("quantization", {}) if isinstance(ckpt, dict) else {}
+    model_meta = ckpt.get("model_profile", {}) if isinstance(ckpt, dict) else {}
+    distill_meta = ckpt.get("distillation", {}) if isinstance(ckpt, dict) else {}
+
+    quant_profile = quant_meta.get("target_profile") if isinstance(quant_meta, dict) else None
+    model_profile = model_meta.get("name") if isinstance(model_meta, dict) else None
+    distill_profile = distill_meta.get("student_profile") if isinstance(distill_meta, dict) else None
+    profile_names = {p for p in (quant_profile, model_profile, distill_profile) if p}
+
+    if isinstance(quant_meta, dict) and quant_meta:
+        score += 100
+    if preferred_profile in profile_names:
+        score += 60
+    if any(str(profile).startswith("pgw_lite") for profile in profile_names):
+        score += 30
+    if "quant" in basename:
+        score += 20
+    if preferred_profile and preferred_profile in basename:
+        score += 20
+    if basename in {"model_bak.pth", "model_fp16.pth"}:
+        score -= 40
+
+    keys = _state_dict_keys(state_dict)
+    if any(".q_proj." in key or ".kv_proj." in key for key in keys):
+        score += 20
+    if any(".mlp.w1." in key or ".mlp.w2." in key for key in keys):
+        score += 20
+    if any(key.endswith("_scale") for key in keys):
+        score += 20
+
+    try:
+        profile = _infer_profile_from_state(cfg, ckpt, state_dict)
+        if profile["name"] == preferred_profile:
+            score += 30
+        if profile["patch_size"][-2:] == [8, 8] and profile["embed_dim"] == 96:
+            score += 20
+    except Exception:
+        pass
+
+    return score
+
+
+def _scan_checkpoint_path(cfg, preferred_profile):
+    pattern = os.path.join(cfg.checkpoint_dir, "*.pth")
+    candidates = sorted(glob.glob(pattern))
+    if not candidates:
+        return None
+
+    best = None
+    for path in candidates:
+        try:
+            ckpt = torch.load(path, map_location="cpu")
+            state_dict = ckpt.get("model_state_dict", ckpt)
+            score = _checkpoint_score(path, cfg, ckpt, state_dict, preferred_profile)
+        except Exception as exc:
+            print(f"⚠️ 跳过无法读取的 checkpoint: {path} ({exc})")
+            continue
+        finally:
+            try:
+                del ckpt
+                del state_dict
+            except Exception:
+                pass
+
+        item = (score, os.path.getmtime(path), path)
+        if best is None or item > best:
+            best = item
+
+    if best is None:
+        return None
+    score, _, path = best
+    print(f"🔎 自动扫描 checkpoint: {path} (score={score})")
+    return path
+
+
 def _load_checkpoint(path):
     ckpt = torch.load(path, map_location="cuda:0")
     state_dict = ckpt.get("model_state_dict", ckpt)
@@ -290,6 +475,7 @@ if __name__ == "__main__":
     surface_mask = torch.stack([land_mask, soil_type, topography], dim=0).to('cuda:0')
     surface_mask = surface_mask.unsqueeze(0).repeat(cfg_data.dataloader.batch_size, 1, 1, 1)
     surface_mask = surface_mask.half()  # FP16: static mask 也转为半精度
+    _profile_cuda_memory("after static mask load")
 
     # ---- 模型加载: 优先使用 ONNX Runtime，回退到 PyTorch FP16 ----
     onnx_sim_path = f"{cfg.checkpoint_dir}/model_fp16_sim.onnx"
@@ -316,6 +502,19 @@ if __name__ == "__main__":
         pgw_lite_ckpt_path = f"{cfg.checkpoint_dir}/{cfg.pgw_lite_distilled_checkpoint}"
 
     distilled_quantized_path = f"{cfg.checkpoint_dir}/{getattr(cfg, 'quantized_checkpoint', 'model_distilled_quantized.pth')}"
+    explicit_checkpoint = os.environ.get("PANGU_CHECKPOINT")
+    explicit_ckpt_path = None
+    if explicit_checkpoint:
+        explicit_ckpt_path = (
+            explicit_checkpoint
+            if os.path.isabs(explicit_checkpoint)
+            else f"{cfg.checkpoint_dir}/{explicit_checkpoint}"
+        )
+        if not os.path.exists(explicit_ckpt_path):
+            raise FileNotFoundError(f"PANGU_CHECKPOINT not found: {explicit_ckpt_path}")
+    auto_ckpt_path = None
+    if explicit_ckpt_path is None and _is_enabled("PANGU_AUTO_SCAN_CHECKPOINT", default=True):
+        auto_ckpt_path = _scan_checkpoint_path(cfg, profile_name)
     enable_pgw_lite = (
         _is_enabled("PANGU_USE_PGW_LITE")
         and (os.path.exists(pgw_lite_quantized_path) or os.path.exists(pgw_lite_ckpt_path))
@@ -334,6 +533,8 @@ if __name__ == "__main__":
     # DCU 实测 ONNX ROCm EP 比 PyTorch FP16 慢，因此默认使用 PyTorch。
     enable_onnx = (
         _is_enabled("PANGU_USE_ONNX")
+        and explicit_ckpt_path is None
+        and auto_ckpt_path is None
         and not enable_pruned
         and not enable_distilled
         and not enable_pgw_lite
@@ -366,30 +567,48 @@ if __name__ == "__main__":
             fp32_ckpt_path = (
                 local_fp32_path if os.path.exists(local_fp32_path) else backup_fp32_path
             )
-            if enable_pgw_lite:
+            if explicit_ckpt_path is not None:
+                selected_path = explicit_ckpt_path
+                print(f"📌 加载显式指定权重: {selected_path}")
+                ckpt, state_dict = _load_checkpoint(selected_path)
+                _profile_cuda_memory("after checkpoint load")
+                model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
+            elif enable_pgw_lite:
                 selected_path = pgw_lite_quantized_path if os.path.exists(pgw_lite_quantized_path) else pgw_lite_ckpt_path
                 print(f"加载 PGW-Lite 学生权重: {selected_path}")
                 ckpt, state_dict = _load_checkpoint(selected_path)
+                _profile_cuda_memory("after checkpoint load")
+                model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
+            elif auto_ckpt_path is not None:
+                selected_path = auto_ckpt_path
+                print(f"🔎 加载自动扫描权重: {selected_path}")
+                ckpt, state_dict = _load_checkpoint(selected_path)
+                _profile_cuda_memory("after checkpoint load")
                 model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
             elif enable_distilled:
                 print(f"加载知识蒸馏学生权重: {distilled_ckpt_path}")
                 ckpt, state_dict = _load_checkpoint(distilled_ckpt_path)
+                _profile_cuda_memory("after checkpoint load")
                 model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
             elif enable_pruned:
                 print(f"✂️  加载结构化剪枝权重: {pruned_ckpt_path}")
                 ckpt, state_dict = _load_checkpoint(pruned_ckpt_path)
+                _profile_cuda_memory("after checkpoint load")
                 model_profile = _profile_from_config(cfg, "student_160")
             elif os.path.exists(fp16_ckpt_path):
                 print(f"⚡ 加载 FP16 权重: {fp16_ckpt_path}")
                 ckpt, state_dict = _load_checkpoint(fp16_ckpt_path)
+                _profile_cuda_memory("after checkpoint load")
                 model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
             elif os.path.exists(distilled_quantized_path):
                 print(f"⚡ 加载量化学生权重: {distilled_quantized_path}")
                 ckpt, state_dict = _load_checkpoint(distilled_quantized_path)
+                _profile_cuda_memory("after checkpoint load")
                 model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
             else:
                 print(f"ℹ️  未找到 FP16 权重，回退加载 FP32: {fp32_ckpt_path}")
                 ckpt, state_dict = _load_checkpoint(fp32_ckpt_path)
+                _profile_cuda_memory("after checkpoint load")
                 model_profile = _infer_profile_from_state(cfg, ckpt, state_dict)
             print(
                 f"ℹ️  模型结构 profile={model_profile['name']} "
@@ -401,6 +620,23 @@ if __name__ == "__main__":
 
             # ---- 反量化重建逻辑（仅在模型加载时运行，不影响单样本推理计时）----
             ckpt["model_state_dict"] = _dequantize_state_dict(state_dict, target_dtype)
+            _profile_cuda_memory("after state dict dequantize/cast")
+
+            layerwise_inference = _is_enabled("PANGU_LAYERWISE_INFERENCE")
+            layerwise_empty_cache = _is_enabled("PANGU_LAYERWISE_EMPTY_CACHE")
+            recompute_skip = _is_enabled("PANGU_RECOMPUTE_SKIP")
+
+            # Detect architecture configurations from loaded checkpoint
+            arch_flags = _detect_architecture_from_state(state_dict, model_profile)
+            use_gqa = arch_flags["use_gqa"]
+            use_swiglu = arch_flags["use_swiglu"]
+            use_rmsnorm = arch_flags["use_rmsnorm"]
+            gqa_group_size = arch_flags["gqa_group_size"]
+            print(
+                "ℹ️  架构开关 "
+                f"SwiGLU={int(use_swiglu)} RMSNorm={int(use_rmsnorm)} "
+                f"GQA={int(use_gqa)} GQA_GROUP_SIZE={gqa_group_size}"
+            )
 
             model = build_pangu_model(
                 img_size=cfg_data.dataset.img_size,
@@ -409,19 +645,34 @@ if __name__ == "__main__":
                 num_heads=model_profile["num_heads"],
                 window_size=model_profile["window_size"],
                 depth_blocks=model_profile.get("depth_blocks", None),
-                recompute_skip=_is_enabled("PANGU_RECOMPUTE_SKIP"),
+                recompute_skip=recompute_skip,
+                layerwise_inference=layerwise_inference,
+                layerwise_empty_cache=layerwise_empty_cache,
+                use_swiglu=use_swiglu,
+                use_rmsnorm=use_rmsnorm,
+                use_gqa=use_gqa,
+                kv_group_size=gqa_group_size,
             ).to('cuda:0')
-            if _is_enabled("PANGU_RECOMPUTE_SKIP"):
+            _profile_cuda_memory("after model build/to cuda")
+            if layerwise_inference:
+                print("🧩  PANGU_LAYERWISE_INFERENCE=1，启用逐层推理 forward")
+                if layerwise_empty_cache:
+                    print("🧹  PANGU_LAYERWISE_EMPTY_CACHE=1，逐层推理时清理 CUDA cache")
+            if recompute_skip:
                 print("♻️  PANGU_RECOMPUTE_SKIP=1，推理时重算 skip activation")
+            from pangu_profile_model import adapt_qkv_for_gqa
+            ckpt["model_state_dict"] = adapt_qkv_for_gqa(ckpt["model_state_dict"], model)
             model.load_state_dict(ckpt["model_state_dict"], strict=False)
             if use_fp16:
                 model.half()   # FP16: 确保整个模型在半精度下运行
             model.eval()
+            _profile_cuda_memory("after load_state_dict/model eval")
 
             # ---- 方向4.3: 释放 checkpoint 变量，清理显存碎片 ----
             del ckpt
             gc.collect()
             torch.cuda.empty_cache()
+            _profile_cuda_memory("after checkpoint cleanup")
         except Exception as e:
             print(f"❌ 加载模型或权重出错: {e}")
             import traceback
@@ -436,23 +687,36 @@ if __name__ == "__main__":
         target_dtype = torch.float16 if use_fp16 else torch.float32
         # ---- 方向4.5: CUDA Graph 捕获（可选，DCU 上可能不支持）----
         _example = None
-        try:
-            _example = torch.empty(1, 72, cfg_data.dataset.img_size[0],
-                                   cfg_data.dataset.img_size[1],
-                                   dtype=target_dtype, device='cuda:0')
-            model = CUDAGraphWrapper(model, _example)
-            del _example
-            torch.cuda.empty_cache()
-            print("✅ CUDA Graph 捕获成功，推理将使用 Graph Replay")
-        except Exception as e:
-            print(f"⚠️ CUDA Graph 捕获失败 ({e})，使用标准 PyTorch 推理")
-            if _example is not None:
+        if _is_enabled("PANGU_DISABLE_CUDA_GRAPH"):
+            print("ℹ️  PANGU_DISABLE_CUDA_GRAPH=1，跳过 CUDA Graph 捕获，使用标准 PyTorch 推理")
+        elif _is_enabled("PANGU_LAYERWISE_INFERENCE") and not _is_enabled("PANGU_LAYERWISE_CUDA_GRAPH"):
+            print("ℹ️  Layerwise 推理默认跳过整模型 CUDA Graph；如需捕获请设置 PANGU_LAYERWISE_CUDA_GRAPH=1")
+        else:
+            try:
+                graph_warmup_iters = _env_int("PANGU_CUDA_GRAPH_WARMUP_ITERS", 1)
+                if graph_warmup_iters != 1:
+                    print(f"ℹ️  PANGU_CUDA_GRAPH_WARMUP_ITERS={graph_warmup_iters}")
+                _example = torch.empty(1, 72, cfg_data.dataset.img_size[0],
+                                       cfg_data.dataset.img_size[1],
+                                       dtype=target_dtype, device='cuda:0')
+                model = CUDAGraphWrapper(model, _example, warmup_iters=graph_warmup_iters)
                 del _example
-            gc.collect()
-            torch.cuda.empty_cache()
+                torch.cuda.empty_cache()
+                print("✅ CUDA Graph 捕获成功，推理将使用 Graph Replay")
+                _profile_cuda_memory("after CUDA Graph capture")
+            except Exception as e:
+                print(f"⚠️ CUDA Graph 捕获失败 ({e})，使用标准 PyTorch 推理")
+                if _example is not None:
+                    del _example
+                gc.collect()
+                torch.cuda.empty_cache()
+                _profile_cuda_memory("after CUDA Graph fallback cleanup")
 
     os.makedirs('result/output/', exist_ok=True)                          # AI4S, 输出路径不可更改
     print(f"📂 samples will be generated to './result/output/'")
+    _profile_cuda_memory("before inference loop")
+    if _is_enabled("PANGU_RESET_PEAK_AFTER_LOAD"):
+        _reset_cuda_peak("before inference loop")
 
     time_list = []
     first = True
@@ -480,12 +744,23 @@ if __name__ == "__main__":
             end_time = time.perf_counter()        # AI4S(时间度量，位置不可更改)
             time_list.append(end_time-start_time) # AI4S(时间度量，位置不可更改)
             #---------------------------------------------------------------------
+            if _is_enabled("PANGU_PROFILE_MEMORY") and len(time_list) == 1:
+                _profile_cuda_memory("after first timed forward")
 
             out_upper_air = out_upper_air.reshape(invar_upper_air.shape)
             # FP16: 输出转回 float32 再做反归一化，避免半精度下乘法精度损失
-            pred_var = torch.concat([out_surface, out_upper_air], dim=1).float().cpu().numpy()
+            if _is_enabled("PANGU_CPU_OUTPUT_POSTPROCESS", default=True):
+                pred_tensor = torch.concat(
+                    [out_surface.detach().cpu(), out_upper_air.detach().cpu()],
+                    dim=1,
+                ).float()
+                pred_var = pred_tensor.numpy()
+            else:
+                pred_var = torch.concat([out_surface, out_upper_air], dim=1).float().cpu().numpy()
             pred_var = pred_var * stds + means
             np.save(f"result/output/{filename}.npy", pred_var)
+            if _is_enabled("PANGU_PROFILE_MEMORY") and len(time_list) == 1:
+                _profile_cuda_memory("after first output postprocess")
 
 
         #----------------------AI4S(时间度量不可更改)---------------------------
