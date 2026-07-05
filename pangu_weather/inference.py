@@ -22,6 +22,41 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
 
 
+class RuntimeQuantLinear(torch.nn.Module):
+    """Weight-only INT8 Linear with resident quantized weights.
+
+    This is an experimental U_vram path. It keeps INT8 weights and per-output
+    scales as module buffers, then materializes one temporary FP16 weight inside
+    each forward call. It reduces resident parameter memory but may trade speed
+    for transient dequantization work.
+    """
+
+    def __init__(self, source_linear):
+        super().__init__()
+        self.in_features = int(source_linear.in_features)
+        self.out_features = int(source_linear.out_features)
+        self.register_buffer(
+            "qweight",
+            torch.empty(self.out_features, self.in_features, dtype=torch.int8),
+            persistent=False,
+        )
+        self.register_buffer(
+            "scale",
+            torch.empty(self.out_features, 1, dtype=torch.float16),
+            persistent=False,
+        )
+        if source_linear.bias is None:
+            self.register_parameter("bias", None)
+        else:
+            self.bias = torch.nn.Parameter(torch.empty(self.out_features))
+
+    def forward(self, x):
+        compute_dtype = x.dtype if torch.is_floating_point(x) else torch.float16
+        weight = self.qweight.to(dtype=compute_dtype) * self.scale.to(dtype=compute_dtype)
+        bias = self.bias.to(dtype=compute_dtype) if self.bias is not None else None
+        return torch.nn.functional.linear(x, weight, bias)
+
+
 class CUDAGraphWrapper:
     """CUDA Graph 推理包装类，兼容 model(invar) 调用格式。
 
@@ -441,6 +476,114 @@ def _dequantize_tensor_for_model(key, value, state_dict, target_tensor):
     return value.to(device=target_device, dtype=target_dtype)
 
 
+def _quantized_linear_module_names(state_dict):
+    names = set()
+    for key, value in state_dict.items():
+        if (
+            key.endswith(".weight")
+            and isinstance(value, torch.Tensor)
+            and value.dtype == torch.int8
+            and key + "_scale" in state_dict
+        ):
+            names.add(key[: -len(".weight")])
+    return names
+
+
+def _set_module_by_name(root, module_name, new_module):
+    parts = module_name.split(".")
+    parent = root
+    for part in parts[:-1]:
+        parent = parent[int(part)] if part.isdigit() else getattr(parent, part)
+    last = parts[-1]
+    if last.isdigit():
+        parent[int(last)] = new_module
+    else:
+        setattr(parent, last, new_module)
+
+
+def _replace_quantized_linear_modules(model, state_dict):
+    quantized_names = _quantized_linear_module_names(state_dict)
+    replaced = 0
+    for name, module in list(model.named_modules()):
+        if name in quantized_names and isinstance(module, torch.nn.Linear):
+            _set_module_by_name(model, name, RuntimeQuantLinear(module))
+            replaced += 1
+    return replaced, len(quantized_names)
+
+
+def _copy_runtime_quant_linear(module, key, value, state_dict):
+    scale_key = key + "_scale"
+    if scale_key not in state_dict:
+        raise KeyError(f"Missing quantization scale for {key}")
+    if tuple(value.shape) != tuple(module.qweight.shape):
+        raise RuntimeError(
+            f"Shape mismatch for {key}: checkpoint "
+            f"{tuple(value.shape)} vs runtime quant {tuple(module.qweight.shape)}"
+        )
+    scale = state_dict[scale_key]
+    if scale.ndim == 1:
+        scale = scale.view(-1, 1)
+    if tuple(scale.shape) != tuple(module.scale.shape):
+        raise RuntimeError(
+            f"Shape mismatch for {scale_key}: checkpoint "
+            f"{tuple(scale.shape)} vs runtime quant {tuple(module.scale.shape)}"
+        )
+    module.qweight.copy_(value.to(device=module.qweight.device, dtype=torch.int8))
+    module.scale.copy_(scale.to(device=module.scale.device, dtype=module.scale.dtype))
+
+
+def _load_runtime_quant_state_dict(model, state_dict):
+    modules = dict(model.named_modules())
+    model_state = model.state_dict()
+    missing_keys = []
+    unexpected_keys = []
+    loaded_count = 0
+    consumed_keys = set()
+
+    with torch.no_grad():
+        for key, value in state_dict.items():
+            if key.endswith("_scale"):
+                continue
+            module_name = key[: -len(".weight")] if key.endswith(".weight") else None
+            module = modules.get(module_name) if module_name else None
+            if isinstance(module, RuntimeQuantLinear):
+                _copy_runtime_quant_linear(module, key, value, state_dict)
+                consumed_keys.add(key)
+                consumed_keys.add(key + "_scale")
+                loaded_count += 1
+                continue
+
+            if key not in model_state:
+                unexpected_keys.append(key)
+                continue
+            target_tensor = model_state[key]
+            loaded_tensor = _dequantize_tensor_for_model(
+                key, value, state_dict, target_tensor
+            )
+            if tuple(loaded_tensor.shape) != tuple(target_tensor.shape):
+                raise RuntimeError(
+                    f"Shape mismatch for {key}: checkpoint "
+                    f"{tuple(loaded_tensor.shape)} vs model {tuple(target_tensor.shape)}"
+                )
+            target_tensor.copy_(loaded_tensor)
+            consumed_keys.add(key)
+            loaded_count += 1
+            del loaded_tensor
+
+    source_keys = {key for key in state_dict if not key.endswith("_scale")}
+    for key in model_state:
+        if key not in source_keys:
+            missing_keys.append(key)
+
+    skipped_scales = {
+        key for key in state_dict if key.endswith("_scale") and key not in consumed_keys
+    }
+    if skipped_scales:
+        unexpected_keys.extend(sorted(skipped_scales))
+
+    return missing_keys, unexpected_keys, loaded_count
+
+
 def _load_dequantized_state_dict_incremental(model, state_dict):
     model_state = model.state_dict()
     missing_keys = []
@@ -698,6 +841,23 @@ if __name__ == "__main__":
                 use_gqa=use_gqa,
                 kv_group_size=gqa_group_size,
             )
+            runtime_quant_linear = (
+                _is_enabled("PANGU_RUNTIME_QUANT_LINEAR")
+                and not use_gqa
+                and use_fp16
+            )
+            runtime_quant_replaced = 0
+            if runtime_quant_linear:
+                runtime_quant_replaced, runtime_quant_available = (
+                    _replace_quantized_linear_modules(model, state_dict)
+                )
+                print(
+                    "ℹ️  PANGU_RUNTIME_QUANT_LINEAR=1，替换 Linear "
+                    f"{runtime_quant_replaced}/{runtime_quant_available}"
+                )
+                if runtime_quant_replaced == 0:
+                    print("⚠️  未找到可替换的量化 Linear，回退常规增量加载")
+                    runtime_quant_linear = False
             if use_fp16:
                 model.half()   # FP16: ensure model storage is half before moving to GPU
             model = model.to('cuda:0')
@@ -711,7 +871,19 @@ if __name__ == "__main__":
             incremental_state_load = _is_enabled(
                 "PANGU_INCREMENTAL_STATE_LOAD", default=True
             )
-            if incremental_state_load and not use_gqa:
+            if runtime_quant_linear:
+                print("ℹ️  使用 runtime QuantLinear 常驻 INT8 权重加载")
+                missing_keys, unexpected_keys, loaded_count = (
+                    _load_runtime_quant_state_dict(model, state_dict)
+                )
+                print(
+                    f"ℹ️  QuantLinear 加载完成: loaded={loaded_count}, "
+                    f"missing={len(missing_keys)}, unexpected={len(unexpected_keys)}"
+                )
+                if unexpected_keys:
+                    print(f"⚠️  忽略未使用权重数: {len(unexpected_keys)}")
+                _profile_cuda_memory("after runtime quant state load")
+            elif incremental_state_load and not use_gqa:
                 print("ℹ️  PANGU_INCREMENTAL_STATE_LOAD=1，逐 tensor 反量化并加载")
                 missing_keys, unexpected_keys, loaded_count = (
                     _load_dequantized_state_dict_incremental(model, state_dict)
