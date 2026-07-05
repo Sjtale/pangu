@@ -20,6 +20,7 @@ os.environ.setdefault("PANGU_LAYERWISE_INFERENCE", "1")
 os.environ.setdefault("PANGU_RECOMPUTE_SKIP", "0")
 os.environ.setdefault("PANGU_DIRECT_RECOVERY", "1")
 os.environ.setdefault("PANGU_DIRECT_RECOVERY_WIDTH_CHUNK", "16")
+os.environ.setdefault("PANGU_SCORED_ONLY_RECOVERY", "1")
 
 
 # ---- 方向4.2: cuDNN 自动调优（固定输入尺寸 721×1440, batch=1）----
