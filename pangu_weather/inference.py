@@ -67,7 +67,10 @@ class CUDAGraphWrapper:
 
     def __init__(self, model, example_input, warmup_iters=1):
         self.model = model
-        self.static_input = torch.empty_like(example_input)
+        if isinstance(example_input, (tuple, list)):
+            self.static_input = tuple(torch.empty_like(t) for t in example_input)
+        else:
+            self.static_input = torch.empty_like(example_input)
 
         # 初始化发生在主推理的 inference_mode 之外，因此必须在这里
         # 显式禁用 autograd，否则 warmup 会保留整个 Pangu 前向图。
@@ -86,7 +89,11 @@ class CUDAGraphWrapper:
                 self.static_out_surface, self.static_out_upper = model(self.static_input)
 
     def __call__(self, x):
-        self.static_input.copy_(x)
+        if isinstance(x, (tuple, list)):
+            for src, dst in zip(x, self.static_input):
+                dst.copy_(src)
+        else:
+            self.static_input.copy_(x)
         self.graph.replay()
         return self.static_out_surface, self.static_out_upper
 
@@ -818,6 +825,8 @@ if __name__ == "__main__":
             layerwise_inference = _is_enabled("PANGU_LAYERWISE_INFERENCE")
             layerwise_empty_cache = _is_enabled("PANGU_LAYERWISE_EMPTY_CACHE")
             recompute_skip = _is_enabled("PANGU_RECOMPUTE_SKIP")
+            chunked_attention = _is_enabled("PANGU_CHUNKED_ATTENTION")
+            attention_chunk_size = _env_int("PANGU_ATTN_CHUNK_SIZE", 3)
 
             # Detect architecture configurations from loaded checkpoint
             arch_flags = _detect_architecture_from_state(state_dict, model_profile)
@@ -830,6 +839,7 @@ if __name__ == "__main__":
                 f"SwiGLU={int(use_swiglu)} RMSNorm={int(use_rmsnorm)} "
                 f"GQA={int(use_gqa)} GQA_GROUP_SIZE={gqa_group_size}"
             )
+
 
             model = build_pangu_model(
                 img_size=cfg_data.dataset.img_size,
@@ -846,6 +856,8 @@ if __name__ == "__main__":
                 use_gqa=use_gqa,
                 kv_group_size=gqa_group_size,
                 share_deep_blocks=share_deep_blocks,
+                chunked_attention=chunked_attention,
+                attention_chunk_size=attention_chunk_size,
             )
             runtime_quant_linear = (
                 _is_enabled("PANGU_RUNTIME_QUANT_LINEAR")
@@ -874,6 +886,12 @@ if __name__ == "__main__":
                     print("🧹  PANGU_LAYERWISE_EMPTY_CACHE=1，逐层推理时清理 CUDA cache")
             if recompute_skip:
                 print("♻️  PANGU_RECOMPUTE_SKIP=1，推理时重算 skip activation")
+            if chunked_attention:
+                patched_attention = getattr(model, "_pangu_chunked_attention_count", 0)
+                print(
+                    "🧠  PANGU_CHUNKED_ATTENTION=1，"
+                    f"chunk_size={attention_chunk_size}，patched={patched_attention}"
+                )
             incremental_state_load = _is_enabled(
                 "PANGU_INCREMENTAL_STATE_LOAD", default=True
             )
@@ -942,11 +960,15 @@ if __name__ == "__main__":
                 graph_warmup_iters = _env_int("PANGU_CUDA_GRAPH_WARMUP_ITERS", 1)
                 if graph_warmup_iters != 1:
                     print(f"ℹ️  PANGU_CUDA_GRAPH_WARMUP_ITERS={graph_warmup_iters}")
-                _example = torch.empty(1, 72, cfg_data.dataset.img_size[0],
-                                       cfg_data.dataset.img_size[1],
-                                       dtype=target_dtype, device='cuda:0')
+                _example_surface = torch.empty(1, 7, cfg_data.dataset.img_size[0],
+                                               cfg_data.dataset.img_size[1],
+                                               dtype=target_dtype, device='cuda:0')
+                _example_upper = torch.empty(1, 5, 13, cfg_data.dataset.img_size[0],
+                                             cfg_data.dataset.img_size[1],
+                                             dtype=target_dtype, device='cuda:0')
+                _example = (_example_surface, _example_upper)
                 model = CUDAGraphWrapper(model, _example, warmup_iters=graph_warmup_iters)
-                del _example
+                del _example_surface, _example_upper, _example
                 torch.cuda.empty_cache()
                 print("✅ CUDA Graph 捕获成功，推理将使用 Graph Replay")
                 _profile_cuda_memory("after CUDA Graph capture")
@@ -981,7 +1003,12 @@ if __name__ == "__main__":
             # 方向4.3: non_blocking 异步数据传输，重叠 CPU/GPU 工作
             invar_surface = invar[:, :4, :, :].to("cuda:0", dtype=target_dtype, non_blocking=True)
             invar_upper_air = invar[:, 4:, :, :].to("cuda:0", dtype=target_dtype, non_blocking=True)
-            invar = torch.concat([invar_surface, surface_mask, invar_upper_air], dim=1)
+            # Avoid GPU concatenation of invar (150 MB saving)
+            invar_surface_with_mask = torch.concat([invar_surface, surface_mask], dim=1)
+            invar_upper_air_reshaped = invar_upper_air.reshape(
+                invar_upper_air.shape[0], 5, 13, invar_upper_air.shape[2], invar_upper_air.shape[3]
+            )
+            invar = (invar_surface_with_mask, invar_upper_air_reshaped)
 
             #----------------------AI4S(时间度量不可更改)---------------------------
             start_time = time.perf_counter()      # AI4S(时间度量，位置不可更改)
@@ -1007,6 +1034,12 @@ if __name__ == "__main__":
             np.save(f"result/output/{filename}.npy", pred_var)
             if _is_enabled("PANGU_PROFILE_MEMORY") and len(time_list) == 1:
                 _profile_cuda_memory("after first output postprocess")
+
+            # Explicitly clear loop-local GPU tensor references to prevent caching allocator double-buffering peak VRAM
+            del invar_surface, invar_upper_air, invar_surface_with_mask, invar_upper_air_reshaped, invar
+            del out_surface, out_upper_air
+            if _is_enabled("PANGU_CPU_OUTPUT_POSTPROCESS", default=True):
+                del pred_tensor
 
 
         #----------------------AI4S(时间度量不可更改)---------------------------

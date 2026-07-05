@@ -274,8 +274,11 @@ def _as_int_list(value):
 
 
 def _embed_sequence(model, x):
-    SurfaceInput = x[:, :7, :, :]
-    UpperAirInput = x[:, 7:, :, :].reshape(x.shape[0], 5, 13, x.shape[2], x.shape[3])
+    if isinstance(x, (tuple, list)):
+        SurfaceInput, UpperAirInput = x
+    else:
+        SurfaceInput = x[:, :7, :, :]
+        UpperAirInput = x[:, 7:, :, :].reshape(x.shape[0], 5, 13, x.shape[2], x.shape[3])
 
     SurfaceFeatures = model.patchembed2d(SurfaceInput)
     UpperAirFeatures = model.patchembed3d(UpperAirInput)
@@ -449,6 +452,125 @@ def enable_deep_block_sharing(model, mode="layer2_to_layer3"):
     return model
 
 
+def _forward_memory_efficient(self, x):
+    if isinstance(x, (tuple, list)):
+        SurfaceInput, UpperAirInput = x
+    else:
+        SurfaceInput = x[:, :7, :, :]
+        UpperAirInput = x[:, 7:, :, :].reshape(x.shape[0], 5, 13, x.shape[2], x.shape[3])
+
+    SurfaceFeatures = self.patchembed2d(SurfaceInput)
+    UpperAirFeatures = self.patchembed3d(UpperAirInput)
+
+    CombinedFeatures = torch.concat(
+        [SurfaceFeatures.unsqueeze(2), UpperAirFeatures], dim=2
+    )
+    Batch, Channels, PressureLevels, Height, Width = CombinedFeatures.shape
+    sequence = CombinedFeatures.reshape(Batch, Channels, -1).transpose(1, 2)
+
+    sequence = self.layer1(sequence)
+    skip_sequence = sequence
+
+    sequence = self.downsample(sequence)
+    sequence = self.layer2(sequence)
+    sequence = self.layer3(sequence)
+    sequence = self.upsample(sequence)
+    sequence = self.layer4(sequence)
+
+    OutputFeatures = torch.concat([sequence, skip_sequence], dim=-1)
+    OutputFeatures = OutputFeatures.transpose(1, 2).reshape(
+        Batch, -1, PressureLevels, Height, Width
+    )
+    output_surface = OutputFeatures[:, :, 0, :, :]
+    output_upper_air = OutputFeatures[:, :, 1:, :, :]
+
+    output_surface = self.patchrecovery2d(output_surface)
+    output_upper_air = self.patchrecovery3d(output_upper_air)
+    return output_surface, output_upper_air
+
+
+def enable_memory_efficient_forward(model):
+    """Accept tuple inputs so inference can avoid building a 72-channel tensor."""
+
+    model.forward = types.MethodType(_forward_memory_efficient, model)
+    return model
+
+
+def _forward_chunked_earth_attention_3d(self, x, mask=None):
+    BatchTimesWidthWindows, NumPressureHeightWindows, WindowTokens, Channels = x.shape
+    qkv = (
+        self.qkv(x)
+        .reshape(
+            BatchTimesWidthWindows,
+            NumPressureHeightWindows,
+            WindowTokens,
+            3,
+            self.num_heads,
+            Channels // self.num_heads,
+        )
+        .permute(3, 0, 4, 1, 2, 5)
+    )
+    q, k, v = qkv[0], qkv[1], qkv[2]
+
+    q = q * self.scale
+    earth_position_bias = self.earth_position_bias_table[
+        self.earth_position_index.view(-1)
+    ].view(
+        self.window_size[0] * self.window_size[1] * self.window_size[2],
+        self.window_size[0] * self.window_size[1] * self.window_size[2],
+        self.num_pressure_height_windows,
+        -1,
+    )
+    earth_position_bias = earth_position_bias.permute(3, 2, 0, 1).contiguous()
+    earth_position_bias = earth_position_bias.unsqueeze(0)
+
+    chunk_size = max(1, int(getattr(self, "_pangu_attention_chunk_size", 3)))
+    chunks = []
+    for start in range(0, BatchTimesWidthWindows, chunk_size):
+        end = min(start + chunk_size, BatchTimesWidthWindows)
+        q_chunk = q[start:end]
+        k_chunk = k[start:end]
+        v_chunk = v[start:end]
+        attn_chunk = q_chunk @ k_chunk.transpose(-2, -1)
+        attn_chunk = attn_chunk + earth_position_bias
+
+        if mask is not None:
+            NumWidthWindows = mask.shape[0]
+            mask_indices = (
+                torch.arange(start, end, device=mask.device) % NumWidthWindows
+            )
+            mask_chunk = mask.index_select(0, mask_indices)
+            attn_chunk = attn_chunk + mask_chunk.unsqueeze(1)
+        attn_chunk = self.softmax(attn_chunk)
+        attn_chunk = self.attn_drop(attn_chunk)
+
+        out_chunk = (
+            (attn_chunk @ v_chunk)
+            .permute(0, 2, 3, 1, 4)
+            .reshape(q_chunk.shape[0], NumPressureHeightWindows, WindowTokens, Channels)
+        )
+        chunks.append(out_chunk)
+
+    x = torch.cat(chunks, dim=0)
+    x = self.proj(x)
+    x = self.proj_drop(x)
+    return x
+
+
+def enable_chunked_attention(model, chunk_size=3):
+    """Patch model-local EarthAttention3D instances for memory A/B testing."""
+
+    patched = 0
+    chunk_size = max(1, int(chunk_size))
+    for module in model.modules():
+        if module.__class__.__name__ == "EarthAttention3D":
+            module._pangu_attention_chunk_size = chunk_size
+            module.forward = types.MethodType(_forward_chunked_earth_attention_3d, module)
+            patched += 1
+    return patched
+
+
+
 def build_pangu_model(
     img_size,
     patch_size,
@@ -464,6 +586,8 @@ def build_pangu_model(
     use_gqa=None,
     kv_group_size=None,
     share_deep_blocks=None,
+    chunked_attention=None,
+    attention_chunk_size=None,
 ):
     """Create a Pangu model and patch submission-local profile differences.
 
@@ -598,6 +722,15 @@ def build_pangu_model(
     if share_deep_blocks:
         enable_deep_block_sharing(model, mode=share_deep_blocks)
 
+    if chunked_attention is None:
+        chunked_attention = _is_enabled("PANGU_CHUNKED_ATTENTION")
+    if attention_chunk_size is None:
+        attention_chunk_size = _env_int("PANGU_ATTN_CHUNK_SIZE", 3)
+    if chunked_attention:
+        model._pangu_chunked_attention_count = enable_chunked_attention(
+            model, chunk_size=attention_chunk_size
+        )
+
     if layerwise_inference:
         enable_layerwise_inference(
             model,
@@ -606,5 +739,7 @@ def build_pangu_model(
         )
     elif recompute_skip:
         enable_skip_recompute(model)
+    else:
+        enable_memory_efficient_forward(model)
 
     return model
