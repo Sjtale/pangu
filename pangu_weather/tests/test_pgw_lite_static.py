@@ -143,6 +143,7 @@ class PGWLiteStaticTests(unittest.TestCase):
         self.assertIn("dequantize_linear_weight_state", source)
         self.assertIn("average_layer2_layer3_for_sharing", source)
         self.assertIn("PANGU_SHARE_DEEP_BLOCKS", source)
+        self.assertIn('share_deep_blocks=profile.get("share_deep_blocks", False)', source)
 
 
 if __name__ == "__main__":
