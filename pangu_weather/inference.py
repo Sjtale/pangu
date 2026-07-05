@@ -15,8 +15,8 @@ from pangu_profile_model import build_pangu_model
 # Submission defaults: the platform only executes inference.py and does not
 # pass environment variables. Keep these overrideable for server A/B tests.
 os.environ.setdefault("PANGU_AUTO_SCAN_CHECKPOINT", "0")
-os.environ.setdefault("PANGU_DISABLE_CUDA_GRAPH", "0")
-os.environ.setdefault("PANGU_LAYERWISE_INFERENCE", "0")
+os.environ.setdefault("PANGU_DISABLE_CUDA_GRAPH", "1")
+os.environ.setdefault("PANGU_LAYERWISE_INFERENCE", "1")
 os.environ.setdefault("PANGU_RECOMPUTE_SKIP", "0")
 os.environ.setdefault("PANGU_DIRECT_RECOVERY", "1")
 os.environ.setdefault("PANGU_DIRECT_RECOVERY_WIDTH_CHUNK", "16")
