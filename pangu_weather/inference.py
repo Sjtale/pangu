@@ -421,9 +421,58 @@ def _scan_checkpoint_path(cfg, preferred_profile):
 
 
 def _load_checkpoint(path):
-    ckpt = torch.load(path, map_location="cuda:0")
+    ckpt = torch.load(path, map_location="cpu")
     state_dict = ckpt.get("model_state_dict", ckpt)
     return ckpt, state_dict
+
+
+def _dequantize_tensor_for_model(key, value, state_dict, target_tensor):
+    target_device = target_tensor.device
+    target_dtype = target_tensor.dtype
+    if key.endswith(".weight") and value.dtype == torch.int8:
+        scale_key = key + "_scale"
+        if scale_key in state_dict:
+            scale = state_dict[scale_key].to(device=target_device, dtype=torch.float32)
+            if scale.ndim == 1 and value.ndim == 2:
+                scale = scale.view(-1, 1)
+            return (
+                value.to(device=target_device, dtype=torch.float32) * scale
+            ).to(target_dtype)
+    return value.to(device=target_device, dtype=target_dtype)
+
+
+def _load_dequantized_state_dict_incremental(model, state_dict):
+    model_state = model.state_dict()
+    missing_keys = []
+    unexpected_keys = []
+    loaded_count = 0
+
+    with torch.no_grad():
+        for key, value in state_dict.items():
+            if key.endswith("_scale"):
+                continue
+            if key not in model_state:
+                unexpected_keys.append(key)
+                continue
+            target_tensor = model_state[key]
+            loaded_tensor = _dequantize_tensor_for_model(
+                key, value, state_dict, target_tensor
+            )
+            if tuple(loaded_tensor.shape) != tuple(target_tensor.shape):
+                raise RuntimeError(
+                    f"Shape mismatch for {key}: checkpoint "
+                    f"{tuple(loaded_tensor.shape)} vs model {tuple(target_tensor.shape)}"
+                )
+            target_tensor.copy_(loaded_tensor)
+            loaded_count += 1
+            del loaded_tensor
+
+    source_keys = {key for key in state_dict if not key.endswith("_scale")}
+    for key in model_state:
+        if key not in source_keys:
+            missing_keys.append(key)
+
+    return missing_keys, unexpected_keys, loaded_count
 
 
 def _dequantize_state_dict(state_dict, target_dtype):
@@ -618,10 +667,6 @@ if __name__ == "__main__":
             use_fp16 = os.environ.get("PANGU_USE_FP16", "1") == "1"
             target_dtype = torch.float16 if use_fp16 else torch.float32
 
-            # ---- 反量化重建逻辑（仅在模型加载时运行，不影响单样本推理计时）----
-            ckpt["model_state_dict"] = _dequantize_state_dict(state_dict, target_dtype)
-            _profile_cuda_memory("after state dict dequantize/cast")
-
             layerwise_inference = _is_enabled("PANGU_LAYERWISE_INFERENCE")
             layerwise_empty_cache = _is_enabled("PANGU_LAYERWISE_EMPTY_CACHE")
             recompute_skip = _is_enabled("PANGU_RECOMPUTE_SKIP")
@@ -652,7 +697,10 @@ if __name__ == "__main__":
                 use_rmsnorm=use_rmsnorm,
                 use_gqa=use_gqa,
                 kv_group_size=gqa_group_size,
-            ).to('cuda:0')
+            )
+            if use_fp16:
+                model.half()   # FP16: ensure model storage is half before moving to GPU
+            model = model.to('cuda:0')
             _profile_cuda_memory("after model build/to cuda")
             if layerwise_inference:
                 print("🧩  PANGU_LAYERWISE_INFERENCE=1，启用逐层推理 forward")
@@ -660,15 +708,35 @@ if __name__ == "__main__":
                     print("🧹  PANGU_LAYERWISE_EMPTY_CACHE=1，逐层推理时清理 CUDA cache")
             if recompute_skip:
                 print("♻️  PANGU_RECOMPUTE_SKIP=1，推理时重算 skip activation")
-            from pangu_profile_model import adapt_qkv_for_gqa
-            ckpt["model_state_dict"] = adapt_qkv_for_gqa(ckpt["model_state_dict"], model)
-            model.load_state_dict(ckpt["model_state_dict"], strict=False)
-            if use_fp16:
-                model.half()   # FP16: 确保整个模型在半精度下运行
+            incremental_state_load = _is_enabled(
+                "PANGU_INCREMENTAL_STATE_LOAD", default=True
+            )
+            if incremental_state_load and not use_gqa:
+                print("ℹ️  PANGU_INCREMENTAL_STATE_LOAD=1，逐 tensor 反量化并加载")
+                missing_keys, unexpected_keys, loaded_count = (
+                    _load_dequantized_state_dict_incremental(model, state_dict)
+                )
+                print(
+                    f"ℹ️  增量加载完成: loaded={loaded_count}, "
+                    f"missing={len(missing_keys)}, unexpected={len(unexpected_keys)}"
+                )
+                if unexpected_keys:
+                    print(f"⚠️  忽略未使用权重数: {len(unexpected_keys)}")
+                _profile_cuda_memory("after incremental state load")
+            else:
+                if use_gqa and incremental_state_load:
+                    print("ℹ️  GQA checkpoint 需要 qkv 适配，回退完整 state_dict 加载")
+                # ---- 反量化重建逻辑（仅在模型加载时运行，不影响单样本推理计时）----
+                ckpt["model_state_dict"] = _dequantize_state_dict(state_dict, target_dtype)
+                _profile_cuda_memory("after state dict dequantize/cast")
+                from pangu_profile_model import adapt_qkv_for_gqa
+                ckpt["model_state_dict"] = adapt_qkv_for_gqa(ckpt["model_state_dict"], model)
+                model.load_state_dict(ckpt["model_state_dict"], strict=False)
             model.eval()
             _profile_cuda_memory("after load_state_dict/model eval")
 
             # ---- 方向4.3: 释放 checkpoint 变量，清理显存碎片 ----
+            del state_dict
             del ckpt
             gc.collect()
             torch.cuda.empty_cache()
