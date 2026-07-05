@@ -79,6 +79,15 @@ def cfg_str_list(value):
     return [str(item) for item in value]
 
 
+def cfg_share_deep_blocks():
+    raw_value = os.environ.get("PANGU_SHARE_DEEP_BLOCKS", "0").strip().lower()
+    if raw_value in {"0", "false", "no", "off", ""}:
+        return None
+    if raw_value in {"1", "true", "yes", "on"}:
+        return "layer2_to_layer3"
+    return raw_value
+
+
 def cfg_float(cfg, name, default):
     env_name = f"PANGU_{name.upper()}"
     if env_name in os.environ:
@@ -136,7 +145,11 @@ def get_student_profile(cfg):
     profile_name = os.environ.get(
         "PANGU_STUDENT_PROFILE", getattr(cfg, "default_student_profile", "student_160")
     )
-    return get_model_profile(cfg, profile_name)
+    profile = get_model_profile(cfg, profile_name)
+    share_deep_blocks = cfg_share_deep_blocks()
+    if share_deep_blocks:
+        profile["share_deep_blocks"] = share_deep_blocks
+    return profile
 
 
 def get_profile_checkpoint_names(cfg, profile):
@@ -168,14 +181,73 @@ def load_state(model, path, strict=True):
     return checkpoint
 
 
+def dequantize_linear_weight_state(source_state, target_dtype=torch.float32):
+    """Convert weight-only INT8 checkpoint tensors back to floating point.
+
+    Quantized checkpoints store Linear weights as ``int8`` plus a sibling
+    ``*_scale`` tensor. Training and structural surgery must use dequantized
+    floating point weights, otherwise ``load_state_dict`` would copy raw int8
+    codes into FP parameters.
+    """
+
+    dequantized = {}
+    for key, value in source_state.items():
+        clean_key = key.replace("module.", "")
+        if clean_key.endswith("_scale"):
+            continue
+        scale_key = clean_key + "_scale"
+        source_scale_key = key + "_scale"
+        scale = source_state.get(scale_key, source_state.get(source_scale_key))
+        if isinstance(value, torch.Tensor) and value.dtype == torch.int8 and isinstance(scale, torch.Tensor):
+            view_shape = [value.shape[0]] + [1] * (value.dim() - 1)
+            dequantized[clean_key] = (
+                value.to(torch.float32) * scale.to(torch.float32).view(*view_shape)
+            ).to(target_dtype)
+        elif isinstance(value, torch.Tensor) and torch.is_floating_point(value):
+            dequantized[clean_key] = value.to(target_dtype)
+        else:
+            dequantized[clean_key] = value
+    return dequantized
+
+
+def average_layer2_layer3_for_sharing(source_state):
+    averaged = {}
+    for key, value in source_state.items():
+        clean_key = key.replace("module.", "")
+        if clean_key.startswith("layer3."):
+            continue
+        if clean_key.startswith("layer2."):
+            layer3_key = "layer3." + clean_key[len("layer2."):]
+            layer3_value = source_state.get(layer3_key)
+            if (
+                isinstance(value, torch.Tensor)
+                and isinstance(layer3_value, torch.Tensor)
+                and torch.is_floating_point(value)
+                and torch.is_floating_point(layer3_value)
+                and tuple(value.shape) == tuple(layer3_value.shape)
+            ):
+                averaged[clean_key] = ((value.float() + layer3_value.float()) * 0.5).to(value.dtype)
+                continue
+        averaged[clean_key] = value
+    return averaged
+
+
 def load_compatible_state(model, path, logger):
     if not os.path.exists(path):
         raise FileNotFoundError(path)
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     source_state = checkpoint.get("model_state_dict", checkpoint)
+    if isinstance(source_state, dict) and any(
+        isinstance(v, torch.Tensor) and v.dtype == torch.int8 for v in source_state.values()
+    ):
+        source_state = dequantize_linear_weight_state(source_state, target_dtype=torch.float32)
+        logger.info("Dequantized INT8 Linear weights from initialization checkpoint: %s", path)
 
     from pangu_profile_model import adapt_qkv_for_gqa
     source_state = adapt_qkv_for_gqa(source_state, model)
+    if getattr(model, "_share_deep_blocks", None) == "layer2_to_layer3":
+        source_state = average_layer2_layer3_for_sharing(source_state)
+        logger.info("Averaged layer2/layer3 tensors for shared deep-block initialization")
 
     target_state = model.state_dict()
     compatible = {}
@@ -420,6 +492,7 @@ def make_model(cfg_data, profile, use_upgrades=True):
         num_heads=profile["num_heads"],
         window_size=profile["window_size"],
         depth_blocks=profile.get("depth_blocks", None),
+        share_deep_blocks=profile.get("share_deep_blocks", None),
         use_swiglu=False if not use_upgrades else None,
         use_rmsnorm=False if not use_upgrades else None,
         use_gqa=False if not use_upgrades else None,

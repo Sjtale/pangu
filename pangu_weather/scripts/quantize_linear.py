@@ -45,6 +45,19 @@ def get_quantization_profile(cfg):
     return get_model_profile(cfg, profile_name)
 
 
+def merge_source_profile_metadata(profile, ckpt):
+    source_profile = ckpt.get("model_profile", {}) if isinstance(ckpt, dict) else {}
+    if not isinstance(source_profile, dict):
+        return profile
+    if source_profile.get("name") and source_profile.get("name") != profile["name"]:
+        return profile
+    if source_profile.get("share_deep_blocks"):
+        profile["share_deep_blocks"] = str(source_profile["share_deep_blocks"])
+    if source_profile.get("depth_blocks") and "depth_blocks" not in profile:
+        profile["depth_blocks"] = cfg_list(source_profile["depth_blocks"])
+    return profile
+
+
 def candidate_checkpoints(cfg, profile):
     name = profile["name"]
     if name == "student_160":
@@ -101,6 +114,7 @@ def main():
     print(f"Loading distilled weights from: {distilled_path}")
     ckpt = torch.load(distilled_path, map_location="cpu", weights_only=False)
     state_dict = ckpt.get("model_state_dict", ckpt)
+    profile = merge_source_profile_metadata(profile, ckpt)
 
     # Detect architecture configurations from loaded checkpoint
     use_gqa = any("q_proj" in k for k in state_dict.keys())
@@ -118,6 +132,7 @@ def main():
         use_swiglu=use_swiglu,
         use_rmsnorm=use_rmsnorm,
         use_gqa=use_gqa,
+        share_deep_blocks=profile.get("share_deep_blocks", None),
     )
 
     # Record all weight keys belonging to Linear layers
@@ -137,6 +152,11 @@ def main():
     for key, value in state_dict.items():
         # Dynamically strip DDP prefix 'module.' for both matching and final loading compatibility
         clean_key = key.replace("module.", "")
+
+        # Shared layer3 reuses layer2 blocks at runtime; storing duplicate layer3
+        # weights would erase most of the checkpoint-size benefit.
+        if profile.get("share_deep_blocks") == "layer2_to_layer3" and clean_key.startswith("layer3."):
+            continue
         
         # Drop static buffers that are re-created at __init__ to save massive space (~800MB)
         if clean_key.endswith("attn_mask") or clean_key.endswith("relative_position_index"):
@@ -179,6 +199,7 @@ def main():
             "target_profile": profile["name"],
             "target_embed_dim": profile["embed_dim"],
             "target_num_heads": tuple(profile["num_heads"]),
+            "share_deep_blocks": profile.get("share_deep_blocks"),
         },
         "model_profile": profile,
     }

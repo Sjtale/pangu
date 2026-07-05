@@ -276,6 +276,8 @@ def _profile_from_metadata(cfg, metadata):
         profile["window_size"] = _cfg_list(metadata["window_size"])
     if "depth_blocks" in metadata:
         profile["depth_blocks"] = _cfg_list(metadata["depth_blocks"])
+    if metadata.get("share_deep_blocks"):
+        profile["share_deep_blocks"] = str(metadata["share_deep_blocks"])
     return profile
 
 
@@ -806,6 +808,9 @@ if __name__ == "__main__":
                 f"ℹ️  模型结构 profile={model_profile['name']} "
                 f"patch={model_profile['patch_size']} embed={model_profile['embed_dim']}"
             )
+            share_deep_blocks = model_profile.get("share_deep_blocks")
+            if share_deep_blocks:
+                print(f"ℹ️  深层共享 share_deep_blocks={share_deep_blocks}")
 
             use_fp16 = os.environ.get("PANGU_USE_FP16", "1") == "1"
             target_dtype = torch.float16 if use_fp16 else torch.float32
@@ -840,6 +845,7 @@ if __name__ == "__main__":
                 use_rmsnorm=use_rmsnorm,
                 use_gqa=use_gqa,
                 kv_group_size=gqa_group_size,
+                share_deep_blocks=share_deep_blocks,
             )
             runtime_quant_linear = (
                 _is_enabled("PANGU_RUNTIME_QUANT_LINEAR")

@@ -20,6 +20,15 @@ def _is_enabled(name, default=False):
     return os.environ.get(name, default_value).lower() not in {"0", "false", "no"}
 
 
+def _env_share_deep_blocks():
+    raw_value = os.environ.get("PANGU_SHARE_DEEP_BLOCKS", "0").strip().lower()
+    if raw_value in {"0", "false", "no", "off", ""}:
+        return None
+    if raw_value in {"1", "true", "yes", "on"}:
+        return "layer2_to_layer3"
+    return raw_value
+
+
 def _env_int(name, default):
     raw_value = os.environ.get(name)
     if raw_value is None:
@@ -392,6 +401,54 @@ def enable_layerwise_inference(model, recompute_skip=False, empty_cache=False):
     return model
 
 
+def _get_fuser_blocks(fuser):
+    if hasattr(fuser, "blocks"):
+        return getattr(fuser, "blocks")
+    inner = getattr(fuser, "fuser", None)
+    if inner is not None and hasattr(inner, "blocks"):
+        return getattr(inner, "blocks")
+    return None
+
+
+def _set_fuser_blocks(fuser, blocks):
+    shared_blocks = nn.ModuleList(list(blocks))
+    if hasattr(fuser, "blocks"):
+        fuser.blocks = shared_blocks
+        return
+    inner = getattr(fuser, "fuser", None)
+    if inner is not None and hasattr(inner, "blocks"):
+        inner.blocks = shared_blocks
+        return
+    raise AttributeError("Pangu fuser does not expose a blocks ModuleList")
+
+
+def enable_deep_block_sharing(model, mode="layer2_to_layer3"):
+    """Share same-resolution deep blocks to reduce resident parameters.
+
+    The patch8+96 profile has matching ``layer2`` and ``layer3`` dimensions and
+    block counts, making this the least invasive weight-sharing experiment. It
+    should be followed by distillation/fine-tuning before any scoring run.
+    """
+
+    if mode in {None, "", "0", "false", "no", "off"}:
+        return model
+    if mode != "layer2_to_layer3":
+        raise ValueError(f"Unsupported PANGU_SHARE_DEEP_BLOCKS mode: {mode}")
+
+    layer2_blocks = _get_fuser_blocks(model.layer2)
+    layer3_blocks = _get_fuser_blocks(model.layer3)
+    if layer2_blocks is None or layer3_blocks is None:
+        raise AttributeError("Cannot share deep blocks because layer2/layer3 blocks are unavailable")
+    if len(layer2_blocks) != len(layer3_blocks):
+        raise ValueError(
+            "Cannot share layer2/layer3 blocks with different depths: "
+            f"{len(layer2_blocks)} != {len(layer3_blocks)}"
+        )
+    _set_fuser_blocks(model.layer3, layer2_blocks)
+    model._share_deep_blocks = mode
+    return model
+
+
 def build_pangu_model(
     img_size,
     patch_size,
@@ -406,6 +463,7 @@ def build_pangu_model(
     use_rmsnorm=None,
     use_gqa=None,
     kv_group_size=None,
+    share_deep_blocks=None,
 ):
     """Create a Pangu model and patch submission-local profile differences.
 
@@ -534,6 +592,11 @@ def build_pangu_model(
         use_gqa=use_gqa,
         kv_group_size=kv_group_size
     )
+
+    if share_deep_blocks is None:
+        share_deep_blocks = _env_share_deep_blocks()
+    if share_deep_blocks:
+        enable_deep_block_sharing(model, mode=share_deep_blocks)
 
     if layerwise_inference:
         enable_layerwise_inference(

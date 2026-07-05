@@ -61,6 +61,7 @@ class PGWLiteStaticTests(unittest.TestCase):
         self.assertIn("_replace_quantized_linear_modules", source)
         self.assertIn("_load_runtime_quant_state_dict", source)
         self.assertIn("PANGU_RUNTIME_QUANT_LINEAR", source)
+        self.assertIn("share_deep_blocks", source)
         self.assertIn("PANGU_USE_PGW_LITE", source)
         self.assertIn("pgw_lite_quantized_checkpoint", source)
         self.assertIn("scale.view(-1, 1)", source)
@@ -80,6 +81,7 @@ class PGWLiteStaticTests(unittest.TestCase):
         self.assertIn("_infer_gqa_group_size", source)
         self.assertIn("_layer_index_from_key", source)
         self.assertIn("kv_group_size=gqa_group_size", source)
+        self.assertIn("share_deep_blocks=share_deep_blocks", source)
 
     def test_profile_model_can_enable_skip_recompute_forward(self):
         source = PROFILE_MODEL.read_text(encoding="utf-8")
@@ -98,6 +100,9 @@ class PGWLiteStaticTests(unittest.TestCase):
         self.assertIn("def _forward_layerwise", source)
         self.assertIn("def _run_fuser_layerwise", source)
         self.assertIn("def enable_layerwise_inference", source)
+        self.assertIn("def enable_deep_block_sharing", source)
+        self.assertIn("PANGU_SHARE_DEEP_BLOCKS", source)
+        self.assertIn("layer2_to_layer3", source)
         self.assertIn("layerwise_inference=False", source)
         self.assertIn("layerwise_empty_cache=False", source)
         self.assertIn("model._layerwise_empty_cache", source)
@@ -119,6 +124,9 @@ class PGWLiteStaticTests(unittest.TestCase):
         self.assertIn("quantize_per_output_channel", source)
         self.assertIn('"scheme": "per_channel_int8"', source)
         self.assertIn('"model_profile": profile', source)
+        self.assertIn("merge_source_profile_metadata", source)
+        self.assertIn('clean_key.startswith("layer3.")', source)
+        self.assertIn('"share_deep_blocks": profile.get("share_deep_blocks")', source)
         self.assertIn("pgw_lite_quantized_checkpoint", source)
 
     def test_distillation_can_select_pgw_lite_profile(self):
@@ -132,6 +140,9 @@ class PGWLiteStaticTests(unittest.TestCase):
         self.assertIn('"model_profile": student_profile', source)
         self.assertIn("PANGU_DISTILL_INIT_CHECKPOINT", source)
         self.assertIn("resolve_checkpoint_arg", source)
+        self.assertIn("dequantize_linear_weight_state", source)
+        self.assertIn("average_layer2_layer3_for_sharing", source)
+        self.assertIn("PANGU_SHARE_DEEP_BLOCKS", source)
 
 
 if __name__ == "__main__":
