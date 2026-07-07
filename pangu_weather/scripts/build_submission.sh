@@ -25,11 +25,16 @@ mkdir -p $PANGU_DIR/result/output
 echo "📋 正在复制必要文件..."
 cp conf/config.yaml $PANGU_DIR/conf/
 cp train.py $PANGU_DIR/
+cp distill_train.py $PANGU_DIR/
 cp inference.py $PANGU_DIR/
 cp pangu_profile_model.py $PANGU_DIR/
 cp README.md $PANGU_DIR/
-cp -r scripts $PANGU_DIR/
-rm -rf $PANGU_DIR/scripts/__pycache__
+mkdir -p $PANGU_DIR/scripts
+cp scripts/calibrate_outputs.py $PANGU_DIR/scripts/
+cp scripts/quantize_mixed_precision.py $PANGU_DIR/scripts/
+cp scripts/analyze_quant_sensitivity.py $PANGU_DIR/scripts/
+cp scripts/quantize_linear.py $PANGU_DIR/scripts/
+
 
 
 # 3. 检查 download_model_url.txt
