@@ -10,7 +10,7 @@ import json
 import gc
 from onescience.utils.YParams import YParams
 from onescience.datapipes.climate import ERA5Datapipe
-from pangu_profile_model import build_pangu_model
+from pangu_profile_model import build_pangu_model, enable_streamed_weight_residency
 
 # Submission defaults: the platform only executes inference.py and does not
 # pass environment variables. Keep these overrideable for server A/B tests.
@@ -21,6 +21,12 @@ os.environ.setdefault("PANGU_RECOMPUTE_SKIP", "0")
 os.environ.setdefault("PANGU_DIRECT_RECOVERY", "1")
 os.environ.setdefault("PANGU_DIRECT_RECOVERY_WIDTH_CHUNK", "16")
 os.environ.setdefault("PANGU_SCORED_ONLY_RECOVERY", "1")
+os.environ.setdefault("PANGU_CHUNKED_ATTENTION", "1")
+os.environ.setdefault("PANGU_ATTN_CHUNK_SIZE", "3")
+os.environ.setdefault("PANGU_CHUNKED_MLP", "1")
+os.environ.setdefault("PANGU_MLP_CHUNK_SIZE", "32768")
+os.environ.setdefault("PANGU_STREAM_WEIGHTS", "0")
+
 
 
 # ---- 方向4.2: cuDNN 自动调优（固定输入尺寸 721×1440, batch=1）----
@@ -216,6 +222,18 @@ def _env_int(name, default):
     if value < 0:
         raise ValueError(f"{name} must be >= 0, got {value}")
     return value
+
+
+def _stream_weights_mode():
+    raw_value = os.environ.get("PANGU_STREAM_WEIGHTS", "0").strip().lower()
+    if raw_value in {"", "0", "false", "no", "off"}:
+        return None
+    if raw_value not in {"stage", "block"}:
+        raise ValueError(
+            "PANGU_STREAM_WEIGHTS must be one of: 0, stage, block; "
+            f"got {raw_value!r}"
+        )
+    return raw_value
 
 
 def _profile_cuda_memory(tag):
@@ -672,6 +690,17 @@ if __name__ == "__main__":
 
     means, stds = get_stats(cfg_data.dataset.data_dir, cfg_data.dataset.stats_dir, cfg_data.dataset.channels)
 
+    # Apply output channel calibration coefficients if available (Phase W boost)
+    calibration_path = os.path.join(cfg.checkpoint_dir, "calibration_coeffs.npy")
+    if os.path.exists(calibration_path):
+        try:
+            coeffs = np.load(calibration_path)
+            coeffs = coeffs.reshape(1, -1, 1, 1)
+            stds = stds * coeffs
+            print(f"🎯  Loaded calibration coefficients from {calibration_path} and adjusted stds.")
+        except Exception as e:
+            print(f"⚠️  Failed to load calibration coefficients: {e}")
+
     datapipe = ERA5Datapipe(params=cfg_data, distributed=False)
     test_dataloader = datapipe.test_dataloader()
 
@@ -833,6 +862,15 @@ if __name__ == "__main__":
             recompute_skip = _is_enabled("PANGU_RECOMPUTE_SKIP")
             chunked_attention = _is_enabled("PANGU_CHUNKED_ATTENTION")
             attention_chunk_size = _env_int("PANGU_ATTN_CHUNK_SIZE", 3)
+            stream_weights = _stream_weights_mode()
+            stream_weights_pin_memory = _is_enabled(
+                "PANGU_STREAM_WEIGHTS_PIN_MEMORY", default=True
+            )
+            stream_weights_empty_cache = _is_enabled(
+                "PANGU_STREAM_WEIGHTS_EMPTY_CACHE", default=True
+            )
+            if stream_weights:
+                layerwise_inference = True
 
             # Detect architecture configurations from loaded checkpoint
             arch_flags = _detect_architecture_from_state(state_dict, model_profile)
@@ -890,6 +928,11 @@ if __name__ == "__main__":
                 print("🧩  PANGU_LAYERWISE_INFERENCE=1，启用逐层推理 forward")
                 if layerwise_empty_cache:
                     print("🧹  PANGU_LAYERWISE_EMPTY_CACHE=1，逐层推理时清理 CUDA cache")
+            if stream_weights:
+                print(
+                    "🪝  PANGU_STREAM_WEIGHTS="
+                    f"{stream_weights}，推理时流式搬运 backbone 权重"
+                )
             if recompute_skip:
                 print("♻️  PANGU_RECOMPUTE_SKIP=1，推理时重算 skip activation")
             if _is_enabled("PANGU_CHUNKED_RECOVERY"):
@@ -946,6 +989,21 @@ if __name__ == "__main__":
                 model.load_state_dict(ckpt["model_state_dict"], strict=False)
             model.eval()
             _profile_cuda_memory("after load_state_dict/model eval")
+            if stream_weights:
+                offloaded_count, offloaded_bytes = enable_streamed_weight_residency(
+                    model,
+                    mode=stream_weights,
+                    pin_memory=stream_weights_pin_memory,
+                    empty_cache=stream_weights_empty_cache,
+                )
+                print(
+                    "🪝  流式权重驻留已准备: "
+                    f"mode={stream_weights}, modules={offloaded_count}, "
+                    f"offloaded={offloaded_bytes / 1024**2:.1f} MB, "
+                    f"pin_memory={int(stream_weights_pin_memory)}, "
+                    f"empty_cache={int(stream_weights_empty_cache)}"
+                )
+                _profile_cuda_memory("after streamed weight offload")
 
             # ---- 方向4.3: 释放 checkpoint 变量，清理显存碎片 ----
             del state_dict
@@ -969,6 +1027,8 @@ if __name__ == "__main__":
         _example = None
         if _is_enabled("PANGU_DISABLE_CUDA_GRAPH"):
             print("ℹ️  PANGU_DISABLE_CUDA_GRAPH=1，跳过 CUDA Graph 捕获，使用标准 PyTorch 推理")
+        elif stream_weights:
+            print("ℹ️  PANGU_STREAM_WEIGHTS 启用时跳过 CUDA Graph 捕获")
         elif _is_enabled("PANGU_LAYERWISE_INFERENCE") and not _is_enabled("PANGU_LAYERWISE_CUDA_GRAPH"):
             print("ℹ️  Layerwise 推理默认跳过整模型 CUDA Graph；如需捕获请设置 PANGU_LAYERWISE_CUDA_GRAPH=1")
         else:

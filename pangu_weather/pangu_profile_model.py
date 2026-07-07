@@ -296,6 +296,129 @@ def _maybe_empty_cache(enabled):
         torch.cuda.empty_cache()
 
 
+def _stream_weights_mode(value=None):
+    raw_value = os.environ.get("PANGU_STREAM_WEIGHTS", "0") if value is None else value
+    raw_value = str(raw_value).strip().lower()
+    if raw_value in {"", "0", "false", "no", "off"}:
+        return None
+    if raw_value not in {"stage", "block"}:
+        raise ValueError(
+            "PANGU_STREAM_WEIGHTS must be one of: 0, stage, block; "
+            f"got {raw_value!r}"
+        )
+    return raw_value
+
+
+def _module_tensor_bytes(module):
+    total = 0
+    for tensor in list(module.parameters(recurse=True)) + list(module.buffers(recurse=True)):
+        total += tensor.numel() * tensor.element_size()
+    return total
+
+
+def _pin_cpu_module_tensors(module):
+    if not torch.cuda.is_available():
+        return
+    for param in module.parameters(recurse=True):
+        if param.data.device.type == "cpu" and not param.data.is_pinned():
+            try:
+                param.data = param.data.pin_memory()
+            except RuntimeError:
+                pass
+    for child in module.modules():
+        for name, buffer in list(child._buffers.items()):
+            if buffer is None or buffer.device.type != "cpu":
+                continue
+            if buffer.is_pinned():
+                continue
+            try:
+                child._buffers[name] = buffer.pin_memory()
+            except RuntimeError:
+                pass
+
+
+def _offload_stream_module(module, pin_memory=True):
+    module.to("cpu")
+    if pin_memory:
+        _pin_cpu_module_tensors(module)
+
+
+def _streamed_stage_modules(model):
+    return [
+        ("layer1", model.layer1),
+        ("downsample", model.downsample),
+        ("layer2", model.layer2),
+        ("layer3", model.layer3),
+        ("upsample", model.upsample),
+        ("layer4", model.layer4),
+    ]
+
+
+def _streamed_block_modules(model):
+    modules = [("downsample", model.downsample), ("upsample", model.upsample)]
+    for layer_name in ("layer1", "layer2", "layer3", "layer4"):
+        blocks = _get_fuser_blocks(getattr(model, layer_name))
+        if blocks is None:
+            modules.append((layer_name, getattr(model, layer_name)))
+            continue
+        for idx, block in enumerate(blocks):
+            modules.append((f"{layer_name}.block{idx}", block))
+    return modules
+
+
+def _stream_module_to_device(module, device):
+    module.to(device)
+    return module
+
+
+def _run_streamed_module(owner, module, x, label=None):
+    mode = getattr(owner, "_pangu_stream_weights", None)
+    if mode not in {"stage", "block"}:
+        return module(x)
+
+    device = x.device
+    _stream_module_to_device(module, device)
+    if label is not None:
+        _profile_layerwise_memory(f"{label}.stream_to_device", reset=True)
+    try:
+        out = module(x)
+    finally:
+        _offload_stream_module(
+            module,
+            pin_memory=bool(getattr(owner, "_pangu_stream_pin_memory", True)),
+        )
+        _maybe_empty_cache(bool(getattr(owner, "_pangu_stream_empty_cache", True)))
+    return out
+
+
+def enable_streamed_weight_residency(model, mode="stage", pin_memory=True, empty_cache=True):
+    """Keep selected backbone weights on CPU and move only the active stage/block to device."""
+
+    mode = _stream_weights_mode(mode)
+    if mode is None:
+        return 0, 0
+
+    model._pangu_stream_weights = mode
+    model._pangu_stream_pin_memory = bool(pin_memory)
+    model._pangu_stream_empty_cache = bool(empty_cache)
+
+    modules = _streamed_stage_modules(model) if mode == "stage" else _streamed_block_modules(model)
+    seen = set()
+    offloaded_count = 0
+    offloaded_bytes = 0
+    for _, module in modules:
+        module_id = id(module)
+        if module_id in seen:
+            continue
+        seen.add(module_id)
+        offloaded_bytes += _module_tensor_bytes(module)
+        _offload_stream_module(module, pin_memory=pin_memory)
+        offloaded_count += 1
+
+    _maybe_empty_cache(empty_cache)
+    return offloaded_count, offloaded_bytes
+
+
 def _profile_layerwise_memory(tag, reset=False):
     if not _is_enabled("PANGU_PROFILE_LAYERWISE_MEMORY"):
         return
@@ -617,20 +740,38 @@ def _recover_upper_air(model, output_upper_air):
     return model.patchrecovery3d(output_upper_air)
 
 
-def _run_fuser_layerwise(fuser, x, empty_cache=False, label=None):
+def _run_fuser_layerwise(owner, fuser, x, empty_cache=False, label=None):
+    stream_mode = getattr(owner, "_pangu_stream_weights", None)
+    if stream_mode == "stage":
+        x = _run_streamed_module(owner, fuser, x, label)
+        if label is not None:
+            _profile_layerwise_memory(label, reset=True)
+        return x
+
     blocks = getattr(fuser, "blocks", None)
     if blocks is None:
         blocks = getattr(getattr(fuser, "fuser", None), "blocks", None)
     if blocks is None:
-        x = fuser(x)
+        x = _run_streamed_module(owner, fuser, x, label)
         if label is not None:
             _profile_layerwise_memory(label, reset=True)
         return x
     for idx, block in enumerate(blocks):
-        x = block(x)
+        if stream_mode == "block":
+            x = _run_streamed_module(owner, block, x, f"{label}.block{idx}" if label else None)
+        else:
+            x = block(x)
         if label is not None:
             _profile_layerwise_memory(f"{label}.block{idx}", reset=True)
         _maybe_empty_cache(empty_cache)
+    return x
+
+
+def _run_sample_layerwise(owner, sampler, x, empty_cache=False, label=None):
+    x = _run_streamed_module(owner, sampler, x, label)
+    if label is not None:
+        _profile_layerwise_memory(label, reset=True)
+    _maybe_empty_cache(empty_cache)
     return x
 
 
@@ -680,19 +821,15 @@ def _forward_layerwise(self, x):
     sequence, Batch, PressureLevels, Height, Width = _embed_sequence(self, x)
     _profile_layerwise_memory("embed_sequence", reset=True)
 
-    sequence = _run_fuser_layerwise(self.layer1, sequence, empty_cache, "layer1")
+    sequence = _run_fuser_layerwise(self, self.layer1, sequence, empty_cache, "layer1")
     skip_sequence = sequence
     _maybe_empty_cache(empty_cache)
 
-    sequence = self.downsample(sequence)
-    _profile_layerwise_memory("downsample", reset=True)
-    _maybe_empty_cache(empty_cache)
-    sequence = _run_fuser_layerwise(self.layer2, sequence, empty_cache, "layer2")
-    sequence = _run_fuser_layerwise(self.layer3, sequence, empty_cache, "layer3")
-    sequence = self.upsample(sequence)
-    _profile_layerwise_memory("upsample", reset=True)
-    _maybe_empty_cache(empty_cache)
-    sequence = _run_fuser_layerwise(self.layer4, sequence, empty_cache, "layer4")
+    sequence = _run_sample_layerwise(self, self.downsample, sequence, empty_cache, "downsample")
+    sequence = _run_fuser_layerwise(self, self.layer2, sequence, empty_cache, "layer2")
+    sequence = _run_fuser_layerwise(self, self.layer3, sequence, empty_cache, "layer3")
+    sequence = _run_sample_layerwise(self, self.upsample, sequence, empty_cache, "upsample")
+    sequence = _run_fuser_layerwise(self, self.layer4, sequence, empty_cache, "layer4")
 
     sequence = torch.concat([sequence, skip_sequence], dim=-1)
     del skip_sequence
@@ -707,21 +844,17 @@ def _forward_layerwise_recompute_skip(self, x):
     sequence, Batch, PressureLevels, Height, Width = _embed_sequence(self, x)
     _profile_layerwise_memory("embed_sequence", reset=True)
 
-    sequence = _run_fuser_layerwise(self.layer1, sequence, empty_cache, "layer1.main")
-    sequence = self.downsample(sequence)
-    _profile_layerwise_memory("downsample", reset=True)
-    _maybe_empty_cache(empty_cache)
-    sequence = _run_fuser_layerwise(self.layer2, sequence, empty_cache, "layer2")
-    sequence = _run_fuser_layerwise(self.layer3, sequence, empty_cache, "layer3")
-    sequence = self.upsample(sequence)
-    _profile_layerwise_memory("upsample", reset=True)
-    _maybe_empty_cache(empty_cache)
-    sequence = _run_fuser_layerwise(self.layer4, sequence, empty_cache, "layer4")
+    sequence = _run_fuser_layerwise(self, self.layer1, sequence, empty_cache, "layer1.main")
+    sequence = _run_sample_layerwise(self, self.downsample, sequence, empty_cache, "downsample")
+    sequence = _run_fuser_layerwise(self, self.layer2, sequence, empty_cache, "layer2")
+    sequence = _run_fuser_layerwise(self, self.layer3, sequence, empty_cache, "layer3")
+    sequence = _run_sample_layerwise(self, self.upsample, sequence, empty_cache, "upsample")
+    sequence = _run_fuser_layerwise(self, self.layer4, sequence, empty_cache, "layer4")
 
     skip_sequence, _, _, _, _ = _embed_sequence(self, x)
     _profile_layerwise_memory("skip.embed_sequence", reset=True)
     skip_sequence = _run_fuser_layerwise(
-        self.layer1, skip_sequence, empty_cache, "layer1.skip"
+        self, self.layer1, skip_sequence, empty_cache, "layer1.skip"
     )
 
     sequence = torch.concat([sequence, skip_sequence], dim=-1)
@@ -918,6 +1051,109 @@ def enable_chunked_attention(model, chunk_size=3):
     return patched
 
 
+def _forward_chunked_mlp_block(self, x: torch.Tensor):
+    from onescience.modules.func_utils import crop3d, window_partition, window_reverse
+    PressureLevels, Height, Width = self.input_resolution
+    Batch, NumTokens, Channels = x.shape
+
+    shortcut = x
+    x = self.norm1(x)
+    x = x.view(Batch, PressureLevels, Height, Width, Channels)
+
+    x = self.pad(x.permute(0, 4, 1, 2, 3)).permute(0, 2, 3, 4, 1)
+    _, PaddedPressureLevels, PaddedHeight, PaddedWidth, _ = x.shape
+
+    ShiftPressureLevels, ShiftHeight, ShiftWidth = self.shift_size
+    if self.use_roll:
+        shifted_x = torch.roll(
+            x,
+            shifts=(-ShiftPressureLevels, -ShiftHeight, -ShiftWidth),
+            dims=(1, 2, 3),
+        )
+        x_windows = window_partition(shifted_x, self.window_size)
+    else:
+        shifted_x = x
+        x_windows = window_partition(shifted_x, self.window_size)
+
+    WindowPressureLevels, WindowHeight, WindowWidth = self.window_size
+    x_windows = x_windows.view(
+        x_windows.shape[0],
+        x_windows.shape[1],
+        WindowPressureLevels * WindowHeight * WindowWidth,
+        Channels,
+    )
+
+    attn_windows = self.attn(x_windows, mask=self.attn_mask)
+
+    attn_windows = attn_windows.view(
+        attn_windows.shape[0],
+        attn_windows.shape[1],
+        WindowPressureLevels,
+        WindowHeight,
+        WindowWidth,
+        Channels,
+    )
+
+    if self.use_roll:
+        shifted_x = window_reverse(
+            attn_windows,
+            self.window_size,
+            Pl=PaddedPressureLevels,
+            Lat=PaddedHeight,
+            Lon=PaddedWidth,
+        )
+        x = torch.roll(
+            shifted_x,
+            shifts=(ShiftPressureLevels, ShiftHeight, ShiftWidth),
+            dims=(1, 2, 3),
+        )
+    else:
+        shifted_x = window_reverse(
+            attn_windows,
+            self.window_size,
+            Pl=PaddedPressureLevels,
+            Lat=PaddedHeight,
+            Lon=PaddedWidth,
+        )
+        x = shifted_x
+
+    x = crop3d(x.permute(0, 4, 1, 2, 3), self.input_resolution).permute(
+        0, 2, 3, 4, 1
+    )
+
+    x = x.reshape(Batch, PressureLevels * Height * Width, Channels)
+    x = shortcut + self.drop_path(x)
+
+    # Chunked MLP computation to reduce peak dynamic activations VRAM
+    chunk_size = getattr(self, "_pangu_mlp_chunk_size", 32768)
+    x_norm = self.norm2(x)
+    
+    if chunk_size >= NumTokens:
+        x_mlp = self.mlp(x_norm)
+    else:
+        mlp_chunks = []
+        for start in range(0, NumTokens, chunk_size):
+            end = min(start + chunk_size, NumTokens)
+            mlp_chunks.append(self.mlp(x_norm[:, start:end]))
+        x_mlp = torch.cat(mlp_chunks, dim=1)
+        
+    x = x + self.drop_path(x_mlp)
+    return x
+
+
+def enable_chunked_mlp(model, chunk_size=32768):
+    """Patch model-local EarthTransformer3DBlock instances to save memory on MLP forward pass."""
+    patched = 0
+    chunk_size = max(1, int(chunk_size))
+    for module in model.modules():
+        if module.__class__.__name__ == "EarthTransformer3DBlock":
+            module._pangu_mlp_chunk_size = chunk_size
+            module.forward = types.MethodType(_forward_chunked_mlp_block, module)
+            patched += 1
+    return patched
+
+
+
 
 def build_pangu_model(
     img_size,
@@ -1078,6 +1314,11 @@ def build_pangu_model(
         model._pangu_chunked_attention_count = enable_chunked_attention(
             model, chunk_size=attention_chunk_size
         )
+
+    if _is_enabled("PANGU_CHUNKED_MLP", default=True):
+        mlp_chunk_size = _env_int("PANGU_MLP_CHUNK_SIZE", 32768)
+        model._pangu_chunked_mlp_count = enable_chunked_mlp(model, chunk_size=mlp_chunk_size)
+        print(f"🧠  PANGU_CHUNKED_MLP=1，chunk_size={mlp_chunk_size}，patched={model._pangu_chunked_mlp_count}")
 
     if layerwise_inference:
         enable_layerwise_inference(
