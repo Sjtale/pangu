@@ -28,6 +28,9 @@ cp train.py $PANGU_DIR/
 cp inference.py $PANGU_DIR/
 cp pangu_profile_model.py $PANGU_DIR/
 cp README.md $PANGU_DIR/
+cp -r scripts $PANGU_DIR/
+rm -rf $PANGU_DIR/scripts/__pycache__
+
 
 # 3. 检查 download_model_url.txt
 if [ -f "data/download_model_url.txt" ]; then
