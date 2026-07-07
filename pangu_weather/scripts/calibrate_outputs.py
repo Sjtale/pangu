@@ -55,7 +55,7 @@ def main():
     print(f"Found {len(npy_files)} prediction files. Loading stats...")
     stats_dir = cfg_data.dataset.stats_dir
     mu = np.load(os.path.join(stats_dir, "global_means.npy"))
-    clim_mean = mu[:, channel_indices, :, :].squeeze()  # [C, H, W]
+    clim_mean = mu[0, channel_indices, :, :]
 
     num_channels = len(channel_indices)
     
