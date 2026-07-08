@@ -1004,7 +1004,9 @@ def _forward_chunked_earth_attention_3d(self, x, mask=None):
     earth_position_bias = earth_position_bias.unsqueeze(0)
 
     chunk_size = max(1, int(getattr(self, "_pangu_attention_chunk_size", 3)))
-    chunks = []
+    out = x.new_empty(
+        BatchTimesWidthWindows, NumPressureHeightWindows, WindowTokens, Channels
+    )
     for start in range(0, BatchTimesWidthWindows, chunk_size):
         end = min(start + chunk_size, BatchTimesWidthWindows)
         q_chunk = q[start:end]
@@ -1030,10 +1032,9 @@ def _forward_chunked_earth_attention_3d(self, x, mask=None):
             .permute(0, 2, 3, 1, 4)
             .reshape(q_chunk.shape[0], NumPressureHeightWindows, WindowTokens, Channels)
         )
-        chunks.append(out_chunk)
+        out[start:end].copy_(out_chunk)
 
-    x = torch.cat(chunks, dim=0)
-    x = self.proj(x)
+    x = self.proj(out)
     x = self.proj_drop(x)
     return x
 
@@ -1126,17 +1127,15 @@ def _forward_chunked_mlp_block(self, x: torch.Tensor):
 
     # Chunked MLP computation to reduce peak dynamic activations VRAM
     chunk_size = getattr(self, "_pangu_mlp_chunk_size", 32768)
-    x_norm = self.norm2(x)
-    
+
     if chunk_size >= NumTokens:
-        x_mlp = self.mlp(x_norm)
+        x_mlp = self.mlp(self.norm2(x))
     else:
-        mlp_chunks = []
+        x_mlp = x.new_empty(Batch, NumTokens, Channels)
         for start in range(0, NumTokens, chunk_size):
             end = min(start + chunk_size, NumTokens)
-            mlp_chunks.append(self.mlp(x_norm[:, start:end]))
-        x_mlp = torch.cat(mlp_chunks, dim=1)
-        
+            x_mlp[:, start:end].copy_(self.mlp(self.norm2(x[:, start:end])))
+
     x = x + self.drop_path(x_mlp)
     return x
 

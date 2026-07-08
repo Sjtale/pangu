@@ -10,6 +10,27 @@ current_path = os.getcwd()
 sys.path.append(current_path)
 
 from onescience.utils.YParams import YParams
+from calibration_utils import (
+    GlobalMeanCorrection,
+    fit_affine_from_sums,
+    fit_anomaly_scale,
+    latitude_weights,
+    save_affine_calibration,
+    save_global_mean_correction,
+    weighted_channel_mean,
+)
+
+
+def physics_channel_mask(channels):
+    selected = []
+    for name in channels:
+        selected.append(
+            name == "mean_sea_level_pressure"
+            or name == "2m_temperature"
+            or name.startswith("geopotential_")
+            or name.startswith("temperature_")
+        )
+    return np.asarray(selected, dtype=bool)
 
 def main():
     config_file_path = os.path.join(os.getcwd(), 'conf/config.yaml')
@@ -55,15 +76,24 @@ def main():
     print(f"Found {len(npy_files)} prediction files. Loading stats...")
     stats_dir = cfg_data.dataset.stats_dir
     mu = np.load(os.path.join(stats_dir, "global_means.npy"))
-    clim_mean = mu[0, channel_indices, :, :]
-
+    std = np.load(os.path.join(stats_dir, "global_stds.npy"))
     num_channels = len(channel_indices)
+    clim_mean = mu[0, channel_indices, :, :]
+    channel_stds = std[0, channel_indices, :, :].reshape(num_channels)
     
     # Accumulators for each channel
     numerator = np.zeros(num_channels, dtype=np.float64)
     denominator = np.zeros(num_channels, dtype=np.float64)
+    sum_x = np.zeros(num_channels, dtype=np.float64)
+    sum_y = np.zeros(num_channels, dtype=np.float64)
+    sum_xx = np.zeros(num_channels, dtype=np.float64)
+    sum_xy = np.zeros(num_channels, dtype=np.float64)
+    pixel_count = 0
+    weights = latitude_weights(clim_mean.shape[-2])
+    target_global_mean_sum = np.zeros(num_channels, dtype=np.float64)
+    matched_files = 0
 
-    print("Computing channel-wise anomaly correlation scaling coefficients...")
+    print("Computing channel-wise anomaly scaling and affine calibration coefficients...")
     for file in tqdm(npy_files, unit="files"):
         fname = file[:-4]  # remove .npy
         if fname not in h5_map:
@@ -81,23 +111,61 @@ def main():
         # Accumulate sums for optimal slope a_c = sum(x*y) / sum(x^2)
         numerator += np.sum(pred_anom * label_anom, axis=(1, 2))
         denominator += np.sum(pred_anom ** 2, axis=(1, 2))
+        sum_x += np.sum(pred_anom, axis=(1, 2))
+        sum_y += np.sum(label_anom, axis=(1, 2))
+        sum_xx += np.sum(pred_anom ** 2, axis=(1, 2))
+        sum_xy += np.sum(pred_anom * label_anom, axis=(1, 2))
+        pixel_count += pred_anom.shape[1] * pred_anom.shape[2]
+        target_global_mean_sum += weighted_channel_mean(label, weights)
+        matched_files += 1
 
     # Calculate optimal scaling factors
-    coeffs = np.ones(num_channels, dtype=np.float32)
+    if matched_files == 0:
+        preview = ", ".join(npy_files[:5])
+        raise RuntimeError(
+            "No prediction files matched the HDF5 metadata map; refusing to save "
+            f"default calibration coefficients. First prediction files: {preview}"
+        )
+
+    coeffs = fit_anomaly_scale(numerator, denominator, lower=0.2, upper=2.0)
+    affine = fit_affine_from_sums(
+        sum_x,
+        sum_y,
+        sum_xx,
+        sum_xy,
+        pixel_count,
+        channel_stds,
+        scale_bounds=(0.5, 1.5),
+        bias_std_clip=float(os.environ.get("PANGU_AFFINE_BIAS_STD_CLIP", "0.25")),
+    )
     for c in range(num_channels):
         if denominator[c] > 1e-8:
-            a_c = numerator[c] / denominator[c]
-            # Guardrails: prevent extreme scaling factor scaling, bound it between 0.2 and 2.0
-            a_c = max(min(a_c, 2.0), 0.2)
-            coeffs[c] = a_c
-            print(f"  Channel {c} ({channels[c]}): optimal coeff = {a_c:.6f}")
+            print(
+                f"  Channel {c} ({channels[c]}): "
+                f"slope={coeffs[c]:.6f}, affine_scale={affine.scale[c]:.6f}, "
+                f"affine_bias={affine.bias[c]:.6f}"
+            )
         else:
-            print(f"  Channel {c} ({channels[c]}): denominator too small, default to 1.0")
+            print(f"  Channel {c} ({channels[c]}): denominator too small, defaults used")
 
     os.makedirs("./data/checkpoints", exist_ok=True)
     out_path = "./data/checkpoints/calibration_coeffs.npy"
     np.save(out_path, coeffs)
-    print(f"🎉 Calibration coefficients successfully saved to {out_path}!")
+    affine_path = "./data/checkpoints/calibration_affine.npz"
+    save_affine_calibration(affine_path, affine)
+    physics_path = "./data/checkpoints/physics_mean_targets.npz"
+    if matched_files > 0:
+        save_global_mean_correction(
+            physics_path,
+            GlobalMeanCorrection(
+                target_mean=(target_global_mean_sum / matched_files).astype(np.float32),
+                channel_mask=physics_channel_mask(channels),
+            ),
+        )
+    print(f"🎉 Slope calibration coefficients saved to {out_path}!")
+    print(f"🎉 Affine calibration coefficients saved to {affine_path}!")
+    if matched_files > 0:
+        print(f"🎉 Physics mean targets saved to {physics_path}!")
 
 if __name__ == "__main__":
     main()

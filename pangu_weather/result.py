@@ -16,7 +16,7 @@ rcParams['axes.linewidth'] = 0.9
 rcParams['xtick.major.width'] = 0.9
 rcParams['ytick.major.width'] = 0.9
 
-def get_metadata(data_dir, test_years, channels):
+def get_metadata(data_dir, test_years, channels, output_dir):
     """Multi-file HDF5 format: data/{year}/*.h5"""
     h5_files = []
     for year in test_years:
@@ -34,7 +34,7 @@ def get_metadata(data_dir, test_years, channels):
     variables = meta["variables"]
     channel_indices = [variables.index(v) for v in channels]
 
-    total_files = [f for f in os.listdir('./result/output/') if f.endswith('.npy')]
+    total_files = [f for f in os.listdir(output_dir) if f.endswith('.npy')]
     total_files.sort()
 
     # Build file map: YYYYMMDDHH → HDF5 path
@@ -44,7 +44,7 @@ def get_metadata(data_dir, test_years, channels):
         h5_map[basename] = h5f
     return total_files, channel_indices, h5_map
 
-def get_result(total_files, channel_indices, h5_map, clim_mean):
+def get_result(total_files, channel_indices, h5_map, clim_mean, output_dir):
     channel_rmse = np.zeros(len(channel_indices))
     channel_acc = np.zeros(len(channel_indices))
     clim_mean = clim_mean[0, :, :, :]
@@ -57,7 +57,7 @@ def get_result(total_files, channel_indices, h5_map, clim_mean):
         with h5py.File(h5_path, "r") as f:
             label = f["fields"][:].squeeze()  # [C, H, W]
             label = label[channel_indices]
-        pred = np.load(f'result/output/{file}').squeeze()
+        pred = np.load(os.path.join(output_dir, file)).squeeze()
 
         label_anom = label - clim_mean
         pred_anom = pred - clim_mean
@@ -183,14 +183,17 @@ if __name__ == "__main__":
 
     data_dir = cfg_data.dataset.data_dir
     test_years = cfg_data.dataset.test_ratio
-    total_files, channel_indices, h5_map = get_metadata(data_dir, test_years, cfg_data.dataset.channels)
+    output_dir = os.environ.get("PANGU_RESULT_OUTPUT_DIR", "./result/output")
+    total_files, channel_indices, h5_map = get_metadata(
+        data_dir, test_years, cfg_data.dataset.channels, output_dir
+    )
 
     # Load data & Compute RMSE/ACC per channel
     stats_dir = cfg_data.dataset.stats_dir
     mu = np.load(os.path.join(stats_dir, "global_means.npy"))
 
     clim_mean = mu[:, channel_indices, :, :]
-    get_result(total_files, channel_indices, h5_map, clim_mean)
+    get_result(total_files, channel_indices, h5_map, clim_mean, output_dir)
     show_result()
 
 

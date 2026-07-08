@@ -11,6 +11,12 @@ import gc
 from onescience.utils.YParams import YParams
 from onescience.datapipes.climate import ERA5Datapipe
 from pangu_profile_model import build_pangu_model, enable_streamed_weight_residency
+from calibration_utils import (
+    apply_affine_calibration,
+    apply_global_mean_correction,
+    load_affine_calibration,
+    load_global_mean_correction,
+)
 
 # Submission defaults: the platform only executes inference.py and does not
 # pass environment variables. Keep these overrideable for server A/B tests.
@@ -25,6 +31,8 @@ os.environ.setdefault("PANGU_CHUNKED_ATTENTION", "1")
 os.environ.setdefault("PANGU_ATTN_CHUNK_SIZE", "3")
 os.environ.setdefault("PANGU_CHUNKED_MLP", "1")
 os.environ.setdefault("PANGU_MLP_CHUNK_SIZE", "32768")
+os.environ.setdefault("PANGU_DISABLE_AFFINE_CALIBRATION", "1")
+os.environ.setdefault("PANGU_GLOBAL_MEAN_CORRECTION", "0")
 os.environ.setdefault("PANGU_STREAM_WEIGHTS", "0")
 
 
@@ -200,6 +208,50 @@ def get_stats(data_dir, stats_dir, channels):
     means = mu[:, channel_indices, :, :]
     stds = std[:, channel_indices, :, :]
     return means, stds
+
+
+def _load_output_calibration(checkpoint_dir, means, stds):
+    num_channels = int(stds.shape[1])
+    affine_path = os.path.join(checkpoint_dir, "calibration_affine.npz")
+    slope_path = os.path.join(checkpoint_dir, "calibration_coeffs.npy")
+
+    if os.path.exists(affine_path) and not _is_enabled("PANGU_DISABLE_AFFINE_CALIBRATION"):
+        try:
+            affine = load_affine_calibration(affine_path, num_channels)
+            print(f"🎯  Loaded affine calibration from {affine_path}.")
+            return stds, affine
+        except Exception as e:
+            print(f"⚠️  Failed to load affine calibration: {e}")
+
+    if os.path.exists(slope_path):
+        try:
+            coeffs = np.load(slope_path).reshape(1, -1, 1, 1)
+            if coeffs.shape[1] != num_channels:
+                raise ValueError(
+                    f"expected {num_channels} channels, got {coeffs.shape[1]}"
+                )
+            stds = stds * coeffs
+            print(f"🎯  Loaded slope calibration from {slope_path} and adjusted stds.")
+        except Exception as e:
+            print(f"⚠️  Failed to load slope calibration: {e}")
+    return stds, None
+
+
+def _load_global_mean_correction(checkpoint_dir, num_channels):
+    if not _is_enabled("PANGU_GLOBAL_MEAN_CORRECTION"):
+        return None
+    path = os.path.join(checkpoint_dir, "physics_mean_targets.npz")
+    if not os.path.exists(path):
+        print(f"⚠️  PANGU_GLOBAL_MEAN_CORRECTION=1 but {path} is missing.")
+        return None
+    try:
+        correction = load_global_mean_correction(path, num_channels)
+        active = int(np.count_nonzero(correction.channel_mask))
+        print(f"🌐  Loaded global mean correction from {path} for {active} channels.")
+        return correction
+    except Exception as e:
+        print(f"⚠️  Failed to load global mean correction: {e}")
+        return None
 
 
 def _cfg_list(value):
@@ -690,16 +742,10 @@ if __name__ == "__main__":
 
     means, stds = get_stats(cfg_data.dataset.data_dir, cfg_data.dataset.stats_dir, cfg_data.dataset.channels)
 
-    # Apply output channel calibration coefficients if available (Phase W boost)
-    calibration_path = os.path.join(cfg.checkpoint_dir, "calibration_coeffs.npy")
-    if os.path.exists(calibration_path):
-        try:
-            coeffs = np.load(calibration_path)
-            coeffs = coeffs.reshape(1, -1, 1, 1)
-            stds = stds * coeffs
-            print(f"🎯  Loaded calibration coefficients from {calibration_path} and adjusted stds.")
-        except Exception as e:
-            print(f"⚠️  Failed to load calibration coefficients: {e}")
+    stds, affine_calibration = _load_output_calibration(cfg.checkpoint_dir, means, stds)
+    global_mean_correction = _load_global_mean_correction(
+        cfg.checkpoint_dir, int(means.shape[1])
+    )
 
     datapipe = ERA5Datapipe(params=cfg_data, distributed=False)
     test_dataloader = datapipe.test_dataloader()
@@ -1064,8 +1110,12 @@ if __name__ == "__main__":
 
     time_list = []
     first = True
+    max_inference_batches = _env_int("PANGU_MAX_INFERENCE_BATCHES", 0)
     with torch.inference_mode():  # 方向4.1: 比 no_grad 更快（禁用 view tracking + version counters）
-        for data in tqdm(test_dataloader, desc="Inferring testset", unit="batch"):
+        for batch_index, data in enumerate(tqdm(test_dataloader, desc="Inferring testset", unit="batch"), start=1):
+            if max_inference_batches > 0 and batch_index > max_inference_batches:
+                print(f"ℹ️  PANGU_MAX_INFERENCE_BATCHES={max_inference_batches}; stopping early.")
+                break
             invar = data[0]
             outvar = data[1]
             filename = data[4][-1][0]
@@ -1107,6 +1157,8 @@ if __name__ == "__main__":
             else:
                 pred_var = torch.concat([out_surface, out_upper_air], dim=1).float().cpu().numpy()
             pred_var = pred_var * stds + means
+            pred_var = apply_affine_calibration(pred_var, means, affine_calibration)
+            pred_var = apply_global_mean_correction(pred_var, global_mean_correction)
             np.save(f"result/output/{filename}.npy", pred_var)
             if _is_enabled("PANGU_PROFILE_MEMORY") and len(time_list) == 1:
                 _profile_cuda_memory("after first output postprocess")

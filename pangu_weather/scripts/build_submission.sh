@@ -27,6 +27,7 @@ cp conf/config.yaml $PANGU_DIR/conf/
 cp inference.py $PANGU_DIR/
 cp result.py $PANGU_DIR/
 cp pangu_profile_model.py $PANGU_DIR/
+cp calibration_utils.py $PANGU_DIR/
 cp README.md $PANGU_DIR/
 
 

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+: "${PANGU_STUDENT_PROFILE:=pgw_lite_pruned_96}"
+: "${PANGU_DISTILL_GROUND_TRUTH_WEIGHT:=0.8}"
+: "${PANGU_DISTILL_TEACHER_WEIGHT:=0.2}"
+: "${PANGU_DISTILL_HINT_WEIGHT:=0.0}"
+: "${PANGU_DISTILL_EXTRA_EPOCHS:=1}"
+: "${PANGU_DISTILL_RESUME_FROM:=best}"
+: "${PANGU_DISTILL_INIT_CHECKPOINT:=./data/checkpoints/model_pgw_lite_pruned_96_fp16.pth}"
+
+export PANGU_STUDENT_PROFILE
+export PANGU_DISTILL_GROUND_TRUTH_WEIGHT
+export PANGU_DISTILL_TEACHER_WEIGHT
+export PANGU_DISTILL_HINT_WEIGHT
+export PANGU_DISTILL_EXTRA_EPOCHS
+export PANGU_DISTILL_RESUME_FROM
+export PANGU_DISTILL_INIT_CHECKPOINT
+
+echo "Starting truth-heavy fine-tune candidate:"
+echo "  PANGU_STUDENT_PROFILE=$PANGU_STUDENT_PROFILE"
+echo "  hard=$PANGU_DISTILL_GROUND_TRUTH_WEIGHT teacher=$PANGU_DISTILL_TEACHER_WEIGHT hint=$PANGU_DISTILL_HINT_WEIGHT"
+echo "  extra_epochs=$PANGU_DISTILL_EXTRA_EPOCHS resume_from=$PANGU_DISTILL_RESUME_FROM"
+echo "  init_checkpoint=$PANGU_DISTILL_INIT_CHECKPOINT"
+
+python distill_train.py

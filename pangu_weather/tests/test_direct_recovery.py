@@ -154,5 +154,48 @@ class DirectRecoveryTests(unittest.TestCase):
                 self.assertEqual(actual[:, v, lvl].abs().max().item(), 0.0)
 
 
+class StreamedWeightResidencyTests(unittest.TestCase):
+    def test_run_streamed_module_preserves_output(self):
+        torch.manual_seed(123)
+        owner = types.SimpleNamespace(
+            _pangu_stream_weights="stage",
+            _pangu_stream_pin_memory=False,
+            _pangu_stream_empty_cache=False,
+        )
+        module = nn.Linear(4, 3)
+        x = torch.randn(2, 4)
+
+        expected = module(x)
+        actual = pangu_profile_model._run_streamed_module(owner, module, x, "linear")
+
+        self.assertTrue(torch.allclose(actual, expected))
+        self.assertEqual(next(module.parameters()).device.type, "cpu")
+
+    def test_enable_streamed_weight_residency_block_mode_marks_model(self):
+        class TinyFuser(nn.Module):
+            def __init__(self, depth):
+                super().__init__()
+                self.blocks = nn.ModuleList(nn.Linear(4, 4) for _ in range(depth))
+
+        class TinyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer1 = TinyFuser(2)
+                self.downsample = nn.Linear(4, 4)
+                self.layer2 = TinyFuser(1)
+                self.layer3 = TinyFuser(1)
+                self.upsample = nn.Linear(4, 4)
+                self.layer4 = TinyFuser(1)
+
+        model = TinyModel()
+        count, bytes_offloaded = pangu_profile_model.enable_streamed_weight_residency(
+            model, mode="block", pin_memory=False, empty_cache=False
+        )
+
+        self.assertEqual(model._pangu_stream_weights, "block")
+        self.assertEqual(count, 7)
+        self.assertGreater(bytes_offloaded, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
