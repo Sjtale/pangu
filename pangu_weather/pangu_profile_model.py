@@ -278,7 +278,7 @@ def _embed_sequence(model, x):
     if isinstance(x, list):
         SurfaceInput = x[0]
         UpperAirInput = x[1]
-        x.clear()  # Break caller reference early
+        x.clear()
     elif isinstance(x, tuple):
         SurfaceInput, UpperAirInput = x
     else:
@@ -1062,21 +1062,13 @@ Pangu.forward = _forward_memory_efficient
 
 def _forward_chunked_earth_attention_3d(self, x, mask=None):
     BatchTimesWidthWindows, NumPressureHeightWindows, WindowTokens, Channels = x.shape
-    qkv = (
-        self.qkv(x)
-        .reshape(
-            BatchTimesWidthWindows,
-            NumPressureHeightWindows,
-            WindowTokens,
-            3,
-            self.num_heads,
-            Channels // self.num_heads,
-        )
-        .permute(3, 0, 4, 1, 2, 5)
+    bias_shape = (
+        1,
+        self.num_heads,
+        NumPressureHeightWindows,
+        WindowTokens,
+        WindowTokens,
     )
-    q, k, v = qkv[0], qkv[1], qkv[2]
-
-    q = q * self.scale
 
     # T0.5: Cache earth_position_bias to avoid recomputing every forward.
     # The bias depends only on earth_position_bias_table and earth_position_index,
@@ -1084,7 +1076,13 @@ def _forward_chunked_earth_attention_3d(self, x, mask=None):
     # indexing, permutation, and contiguous copy on every forward call.
     cache_bias = bool(getattr(self, "_pangu_cache_earth_bias", False))
     cached = getattr(self, "_cached_earth_position_bias", None)
-    if cache_bias and cached is not None and cached.device == q.device:
+    if (
+        cache_bias
+        and cached is not None
+        and cached.device == x.device
+        and cached.dtype == x.dtype
+        and tuple(cached.shape) == bias_shape
+    ):
         earth_position_bias = cached
     else:
         earth_position_bias = self.earth_position_bias_table[
@@ -1097,22 +1095,18 @@ def _forward_chunked_earth_attention_3d(self, x, mask=None):
         )
         earth_position_bias = earth_position_bias.permute(3, 2, 0, 1).contiguous()
         earth_position_bias = earth_position_bias.unsqueeze(0)
+        if earth_position_bias.dtype != x.dtype:
+            earth_position_bias = earth_position_bias.to(dtype=x.dtype)
         if cache_bias:
             self._cached_earth_position_bias = earth_position_bias
 
     chunk_size = max(1, int(getattr(self, "_pangu_attention_chunk_size", 3)))
-    out = x.new_empty(
-        BatchTimesWidthWindows, NumPressureHeightWindows, WindowTokens, Channels
-    )
-    for start in range(0, BatchTimesWidthWindows, chunk_size):
-        end = min(start + chunk_size, BatchTimesWidthWindows)
-        q_chunk = q[start:end]
-        k_chunk = k[start:end]
-        v_chunk = v[start:end]
+    chunked_qkv = bool(getattr(self, "_pangu_chunked_qkv", False))
+    chunked_proj = bool(getattr(self, "_pangu_chunked_proj", False))
 
+    def run_attention_chunk(start, end, q_chunk, k_chunk, v_chunk):
         attn_chunk = q_chunk @ k_chunk.transpose(-2, -1)
         attn_chunk = attn_chunk + earth_position_bias
-
         if mask is not None:
             NumWidthWindows = mask.shape[0]
             mask_indices = (
@@ -1120,23 +1114,84 @@ def _forward_chunked_earth_attention_3d(self, x, mask=None):
             )
             mask_chunk = mask.index_select(0, mask_indices)
             attn_chunk = attn_chunk + mask_chunk.unsqueeze(1)
-
         attn_chunk = self.softmax(attn_chunk)
         attn_chunk = self.attn_drop(attn_chunk)
-
-        out_chunk = (
+        return (
             (attn_chunk @ v_chunk)
             .permute(0, 2, 3, 1, 4)
             .reshape(q_chunk.shape[0], NumPressureHeightWindows, WindowTokens, Channels)
         )
-        out[start:end].copy_(out_chunk)
 
-    x = self.proj(out)
+    if chunked_proj:
+        projected = x.new_empty(
+            BatchTimesWidthWindows, NumPressureHeightWindows, WindowTokens, Channels
+        )
+    else:
+        out = x.new_empty(
+            BatchTimesWidthWindows, NumPressureHeightWindows, WindowTokens, Channels
+        )
+
+    if chunked_qkv:
+        for start in range(0, BatchTimesWidthWindows, chunk_size):
+            end = min(start + chunk_size, BatchTimesWidthWindows)
+            qkv_chunk = (
+                self.qkv(x[start:end])
+                .reshape(
+                    end - start,
+                    NumPressureHeightWindows,
+                    WindowTokens,
+                    3,
+                    self.num_heads,
+                    Channels // self.num_heads,
+                )
+                .permute(3, 0, 4, 1, 2, 5)
+            )
+            q_chunk = qkv_chunk[0] * self.scale
+            attn_out = run_attention_chunk(start, end, q_chunk, qkv_chunk[1], qkv_chunk[2])
+            if chunked_proj:
+                projected[start:end].copy_(self.proj(attn_out))
+            else:
+                out[start:end].copy_(attn_out)
+            del qkv_chunk, q_chunk, attn_out
+    else:
+        qkv = (
+            self.qkv(x)
+            .reshape(
+                BatchTimesWidthWindows,
+                NumPressureHeightWindows,
+                WindowTokens,
+                3,
+                self.num_heads,
+                Channels // self.num_heads,
+            )
+            .permute(3, 0, 4, 1, 2, 5)
+        )
+        q, k, v = qkv[0] * self.scale, qkv[1], qkv[2]
+        for start in range(0, BatchTimesWidthWindows, chunk_size):
+            end = min(start + chunk_size, BatchTimesWidthWindows)
+            attn_out = run_attention_chunk(start, end, q[start:end], k[start:end], v[start:end])
+            if chunked_proj:
+                projected[start:end].copy_(self.proj(attn_out))
+            else:
+                out[start:end].copy_(attn_out)
+            del attn_out
+        del qkv, q, k, v
+
+    if chunked_proj:
+        x = projected
+    else:
+        x = self.proj(out)
     x = self.proj_drop(x)
     return x
 
 
-def enable_chunked_attention(model, chunk_size=3, cache_earth_bias=False):
+def enable_chunked_attention(
+    model,
+    chunk_size=3,
+    cache_earth_bias=False,
+    chunked_qkv=False,
+    chunked_proj=False,
+):
     """Patch model-local EarthAttention3D instances for memory A/B testing."""
 
     patched = 0
@@ -1145,6 +1200,8 @@ def enable_chunked_attention(model, chunk_size=3, cache_earth_bias=False):
         if module.__class__.__name__ == "EarthAttention3D":
             module._pangu_attention_chunk_size = chunk_size
             module._pangu_cache_earth_bias = bool(cache_earth_bias)
+            module._pangu_chunked_qkv = bool(chunked_qkv)
+            module._pangu_chunked_proj = bool(chunked_proj)
             module.forward = types.MethodType(_forward_chunked_earth_attention_3d, module)
             patched += 1
     return patched
@@ -1420,11 +1477,20 @@ def build_pangu_model(
     if attention_chunk_size is None:
         attention_chunk_size = _env_int("PANGU_ATTN_CHUNK_SIZE", 3)
     cache_earth_bias = _is_enabled("PANGU_CACHE_EARTH_BIAS")
+    chunked_qkv = _is_enabled("PANGU_CHUNKED_QKV")
+    chunked_proj = _is_enabled("PANGU_CHUNKED_PROJ", default=chunked_qkv)
     if chunked_attention:
         model._pangu_chunked_attention_count = enable_chunked_attention(
             model, chunk_size=attention_chunk_size,
             cache_earth_bias=cache_earth_bias,
+            chunked_qkv=chunked_qkv,
+            chunked_proj=chunked_proj,
         )
+        if chunked_qkv or chunked_proj:
+            print(
+                "🧠  PANGU_CHUNKED_ATTENTION extra: "
+                f"qkv={int(chunked_qkv)} proj={int(chunked_proj)}"
+            )
 
     inplace_block = _is_enabled("PANGU_INPLACE_BLOCK")
     if _is_enabled("PANGU_CHUNKED_MLP", default=True):

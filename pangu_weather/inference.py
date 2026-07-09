@@ -21,10 +21,6 @@ from calibration_utils import (
 # Submission defaults: the platform only executes inference.py and does not
 # pass environment variables. Keep these overrideable for server A/B tests.
 os.environ.setdefault("PANGU_AUTO_SCAN_CHECKPOINT", "0")
-# 强制 PyTorch 积极交还空闲显存给操作系统，降低 Reserved Memory 峰值
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:True")
-
 os.environ.setdefault("PANGU_DISABLE_CUDA_GRAPH", "1")
 os.environ.setdefault("PANGU_LAYERWISE_INFERENCE", "1")
 os.environ.setdefault("PANGU_RECOMPUTE_SKIP", "0")
@@ -33,6 +29,8 @@ os.environ.setdefault("PANGU_DIRECT_RECOVERY_WIDTH_CHUNK", "16")
 os.environ.setdefault("PANGU_SCORED_ONLY_RECOVERY", "1")
 os.environ.setdefault("PANGU_CHUNKED_ATTENTION", "1")
 os.environ.setdefault("PANGU_ATTN_CHUNK_SIZE", "3")
+os.environ.setdefault("PANGU_CHUNKED_QKV", "1")
+os.environ.setdefault("PANGU_CHUNKED_PROJ", "1")
 os.environ.setdefault("PANGU_CHUNKED_MLP", "1")
 os.environ.setdefault("PANGU_MLP_CHUNK_SIZE", "32768")
 os.environ.setdefault("PANGU_DISABLE_AFFINE_CALIBRATION", "1")
@@ -41,6 +39,7 @@ os.environ.setdefault("PANGU_STREAM_WEIGHTS", "0")
 os.environ.setdefault("PANGU_SPLIT_RECOVERY", "0")
 os.environ.setdefault("PANGU_CACHE_EARTH_BIAS", "0")
 os.environ.setdefault("PANGU_INPLACE_BLOCK", "1")
+os.environ.setdefault("PANGU_CLEAR_INPUT_REFS", "1")
 
 
 
@@ -1141,9 +1140,12 @@ if __name__ == "__main__":
             invar_upper_air_reshaped = invar_upper_air.reshape(
                 invar_upper_air.shape[0], 5, 13, invar_upper_air.shape[2], invar_upper_air.shape[3]
             )
-            # Use a list so _embed_sequence can .clear() it and drop references early!
-            invar = [invar_surface_with_mask, invar_upper_air_reshaped]
-            del invar_surface, invar_upper_air, invar_surface_with_mask, invar_upper_air_reshaped
+            upper_air_shape = tuple(invar_upper_air.shape)
+            if _is_enabled("PANGU_CLEAR_INPUT_REFS", default=True):
+                invar = [invar_surface_with_mask, invar_upper_air_reshaped]
+                del invar_surface, invar_upper_air, invar_surface_with_mask, invar_upper_air_reshaped
+            else:
+                invar = (invar_surface_with_mask, invar_upper_air_reshaped)
 
             #----------------------AI4S(时间度量不可更改)---------------------------
             start_time = time.perf_counter()      # AI4S(时间度量，位置不可更改)
@@ -1155,9 +1157,7 @@ if __name__ == "__main__":
             if _is_enabled("PANGU_PROFILE_MEMORY") and len(time_list) == 1:
                 _profile_cuda_memory("after first timed forward")
 
-            # 恢复形状 (batch, 65, H, W)
-            # data[0] is the original input batch tensor
-            out_upper_air = out_upper_air.reshape(data[0].shape[0], 65, data[0].shape[2], data[0].shape[3])
+            out_upper_air = out_upper_air.reshape(upper_air_shape)
             # FP16: 输出转回 float32 再做反归一化，避免半精度下乘法精度损失
             if _is_enabled("PANGU_CPU_OUTPUT_POSTPROCESS", default=True):
                 pred_tensor = torch.concat(
@@ -1175,7 +1175,9 @@ if __name__ == "__main__":
                 _profile_cuda_memory("after first output postprocess")
 
             # Explicitly clear loop-local GPU tensor references to prevent caching allocator double-buffering peak VRAM
-            del invar
+            if not _is_enabled("PANGU_CLEAR_INPUT_REFS", default=True):
+                del invar_surface, invar_upper_air, invar_surface_with_mask, invar_upper_air_reshaped
+            del invar, upper_air_shape
             del out_surface, out_upper_air
             if _is_enabled("PANGU_CPU_OUTPUT_POSTPROCESS", default=True):
                 del pred_tensor

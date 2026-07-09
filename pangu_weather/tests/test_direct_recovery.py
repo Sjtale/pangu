@@ -197,5 +197,48 @@ class StreamedWeightResidencyTests(unittest.TestCase):
         self.assertGreater(bytes_offloaded, 0)
 
 
+class ChunkedAttentionTests(unittest.TestCase):
+    def test_chunked_qkv_and_proj_match_full_qkv_path(self):
+        class TinyAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_heads = 2
+                self.scale = 0.5
+                self.num_pressure_height_windows = 2
+                self.window_size = (1, 1, 3)
+                self.qkv = nn.Linear(4, 12)
+                self.proj = nn.Linear(4, 4)
+                self.attn_drop = nn.Identity()
+                self.proj_drop = nn.Identity()
+                self.softmax = nn.Softmax(dim=-1)
+                table_len = 3 * 3 * self.num_pressure_height_windows
+                self.earth_position_bias_table = nn.Parameter(
+                    torch.randn(table_len, self.num_heads)
+                )
+                self.register_buffer(
+                    "earth_position_index", torch.arange(table_len)
+                )
+
+        torch.manual_seed(2026)
+        attention = TinyAttention()
+        x = torch.randn(5, 2, 3, 4)
+
+        attention._pangu_attention_chunk_size = 2
+        attention._pangu_cache_earth_bias = False
+        attention._pangu_chunked_qkv = False
+        attention._pangu_chunked_proj = False
+        expected = pangu_profile_model._forward_chunked_earth_attention_3d(
+            attention, x
+        )
+
+        attention._pangu_chunked_qkv = True
+        attention._pangu_chunked_proj = True
+        actual = pangu_profile_model._forward_chunked_earth_attention_3d(
+            attention, x
+        )
+
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-6, rtol=1e-6))
+
+
 if __name__ == "__main__":
     unittest.main()

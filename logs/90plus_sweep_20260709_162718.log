@@ -1,0 +1,16 @@
+📝 Sweep log: logs/90plus_sweep_20260709_162718.log
+Traceback (most recent call last):
+  File "/Users/songjintao/Documents/WorkPlace/比赛/先导杯/src/xiandao2026-AI4S/pangu_weather/scripts/run_90plus_sweep.py", line 209, in <module>
+    main()
+  File "/Users/songjintao/Documents/WorkPlace/比赛/先导杯/src/xiandao2026-AI4S/pangu_weather/scripts/run_90plus_sweep.py", line 117, in main
+    require_files(
+  File "/Users/songjintao/Documents/WorkPlace/比赛/先导杯/src/xiandao2026-AI4S/pangu_weather/scripts/run_90plus_sweep.py", line 71, in require_files
+    raise FileNotFoundError(
+FileNotFoundError: Required source files are missing. Sync the latest pangu_weather code first:
+  - inference.py
+  - pangu_profile_model.py
+  - calibration_utils.py
+  - scripts/calibrate_outputs.py
+  - scripts/apply_calibration_to_outputs.py
+  - scripts/run_calibration_pipeline.py
+  - scripts/quantize_mixed_precision.py
