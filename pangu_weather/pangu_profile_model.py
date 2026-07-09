@@ -275,17 +275,25 @@ def _as_int_list(value):
 
 
 def _embed_sequence(model, x):
-    if isinstance(x, (tuple, list)):
+    if isinstance(x, list):
+        SurfaceInput = x[0]
+        UpperAirInput = x[1]
+        x.clear()  # Break caller reference early
+    elif isinstance(x, tuple):
         SurfaceInput, UpperAirInput = x
     else:
         SurfaceInput = x[:, :7, :, :]
         UpperAirInput = x[:, 7:, :, :].reshape(x.shape[0], 5, 13, x.shape[2], x.shape[3])
 
     SurfaceFeatures = model.patchembed2d(SurfaceInput)
+    del SurfaceInput
     UpperAirFeatures = model.patchembed3d(UpperAirInput)
+    del UpperAirInput
+
     CombinedFeatures = torch.concat(
         [SurfaceFeatures.unsqueeze(2), UpperAirFeatures], dim=2
     )
+    del SurfaceFeatures, UpperAirFeatures
     Batch, Channels, PressureLevels, Height, Width = CombinedFeatures.shape
     sequence = CombinedFeatures.reshape(Batch, Channels, -1).transpose(1, 2)
     return sequence, Batch, PressureLevels, Height, Width
@@ -838,6 +846,77 @@ def _forward_layerwise(self, x):
     return _recover_outputs(self, sequence, Batch, PressureLevels, Height, Width)
 
 
+def _recover_outputs_split(model, sequence, skip_sequence, Batch, PressureLevels, Height, Width):
+    """Recover surface and upper-air outputs without full skip concatenation.
+
+    Instead of concatenating the entire sequence and skip_sequence along the
+    channel dimension (which creates a transient tensor of size
+    [B, P*H*W, 2*embed_dim]), this function splits the token dimension into
+    surface (pressure_level=0) and upper-air (pressure_level=1+) parts and
+    concatenates only the smaller slices independently. This reduces peak
+    memory by avoiding the full-width concatenation.
+    """
+    HW = Height * Width
+    embed_dim = sequence.shape[-1]
+
+    # Surface: tokens [0, H*W) correspond to pressure_level=0
+    surface_seq = sequence[:, :HW, :]        # [B, H*W, C] - view, no alloc
+    surface_skip = skip_sequence[:, :HW, :]  # [B, H*W, C] - view, no alloc
+    surface_combined = torch.cat([surface_seq, surface_skip], dim=-1)  # [B, H*W, 2C]
+    # Transpose+reshape to recovery input format [B, 2C, H, W]
+    surface_input = surface_combined.reshape(Batch, Height, Width, 2 * embed_dim)
+    surface_input = surface_input.permute(0, 3, 1, 2).contiguous()
+    del surface_combined, surface_seq, surface_skip
+    _profile_layerwise_memory("split_recover.surface_prep", reset=True)
+
+    output_surface = _recover_surface(model, surface_input)
+    del surface_input
+    _profile_layerwise_memory("split_recover.surface", reset=True)
+
+    # Upper air: tokens [H*W, P*H*W) correspond to pressure_levels 1+
+    upper_seq = sequence[:, HW:, :]        # [B, (P-1)*H*W, C] - view
+    upper_skip = skip_sequence[:, HW:, :]  # [B, (P-1)*H*W, C] - view
+    upper_combined = torch.cat([upper_seq, upper_skip], dim=-1)  # [B, (P-1)*H*W, 2C]
+    del sequence, skip_sequence, upper_seq, upper_skip
+    # Reshape to recovery input format [B, 2C, P-1, H, W]
+    upper_input = upper_combined.reshape(
+        Batch, PressureLevels - 1, Height, Width, 2 * embed_dim
+    )
+    upper_input = upper_input.permute(0, 4, 1, 2, 3).contiguous()
+    del upper_combined
+    _profile_layerwise_memory("split_recover.upper_prep", reset=True)
+
+    output_upper_air = _recover_upper_air(model, upper_input)
+    del upper_input
+    _profile_layerwise_memory("split_recover.upper_air", reset=True)
+
+    return output_surface, output_upper_air
+
+
+def _forward_layerwise_split(self, x):
+    """Layerwise forward with split recovery to avoid full skip concatenation."""
+    empty_cache = bool(getattr(self, "_layerwise_empty_cache", False))
+    _profile_layerwise_memory("forward.start", reset=True)
+    sequence, Batch, PressureLevels, Height, Width = _embed_sequence(self, x)
+    _profile_layerwise_memory("embed_sequence", reset=True)
+
+    sequence = _run_fuser_layerwise(self, self.layer1, sequence, empty_cache, "layer1")
+    skip_sequence = sequence
+    _maybe_empty_cache(empty_cache)
+
+    sequence = _run_sample_layerwise(self, self.downsample, sequence, empty_cache, "downsample")
+    sequence = _run_fuser_layerwise(self, self.layer2, sequence, empty_cache, "layer2")
+    sequence = _run_fuser_layerwise(self, self.layer3, sequence, empty_cache, "layer3")
+    sequence = _run_sample_layerwise(self, self.upsample, sequence, empty_cache, "upsample")
+    sequence = _run_fuser_layerwise(self, self.layer4, sequence, empty_cache, "layer4")
+
+    _profile_layerwise_memory("before_split_recovery", reset=True)
+    _maybe_empty_cache(empty_cache)
+    return _recover_outputs_split(
+        self, sequence, skip_sequence, Batch, PressureLevels, Height, Width
+    )
+
+
 def _forward_layerwise_recompute_skip(self, x):
     empty_cache = bool(getattr(self, "_layerwise_empty_cache", False))
     _profile_layerwise_memory("forward.start", reset=True)
@@ -871,11 +950,17 @@ def enable_skip_recompute(model):
     return model
 
 
-def enable_layerwise_inference(model, recompute_skip=False, empty_cache=False):
+def enable_layerwise_inference(model, recompute_skip=False, empty_cache=False,
+                               split_recovery=False):
     """Run Pangu stages and fuser blocks explicitly for memory A/B tests."""
 
     model._layerwise_empty_cache = bool(empty_cache)
-    forward = _forward_layerwise_recompute_skip if recompute_skip else _forward_layerwise
+    if recompute_skip:
+        forward = _forward_layerwise_recompute_skip
+    elif split_recovery:
+        forward = _forward_layerwise_split
+    else:
+        forward = _forward_layerwise
     model.forward = types.MethodType(forward, model)
     return model
 
@@ -992,16 +1077,28 @@ def _forward_chunked_earth_attention_3d(self, x, mask=None):
     q, k, v = qkv[0], qkv[1], qkv[2]
 
     q = q * self.scale
-    earth_position_bias = self.earth_position_bias_table[
-        self.earth_position_index.view(-1)
-    ].view(
-        self.window_size[0] * self.window_size[1] * self.window_size[2],
-        self.window_size[0] * self.window_size[1] * self.window_size[2],
-        self.num_pressure_height_windows,
-        -1,
-    )
-    earth_position_bias = earth_position_bias.permute(3, 2, 0, 1).contiguous()
-    earth_position_bias = earth_position_bias.unsqueeze(0)
+
+    # T0.5: Cache earth_position_bias to avoid recomputing every forward.
+    # The bias depends only on earth_position_bias_table and earth_position_index,
+    # both of which are fixed model parameters. Caching eliminates redundant
+    # indexing, permutation, and contiguous copy on every forward call.
+    cache_bias = bool(getattr(self, "_pangu_cache_earth_bias", False))
+    cached = getattr(self, "_cached_earth_position_bias", None)
+    if cache_bias and cached is not None and cached.device == q.device:
+        earth_position_bias = cached
+    else:
+        earth_position_bias = self.earth_position_bias_table[
+            self.earth_position_index.view(-1)
+        ].view(
+            self.window_size[0] * self.window_size[1] * self.window_size[2],
+            self.window_size[0] * self.window_size[1] * self.window_size[2],
+            self.num_pressure_height_windows,
+            -1,
+        )
+        earth_position_bias = earth_position_bias.permute(3, 2, 0, 1).contiguous()
+        earth_position_bias = earth_position_bias.unsqueeze(0)
+        if cache_bias:
+            self._cached_earth_position_bias = earth_position_bias
 
     chunk_size = max(1, int(getattr(self, "_pangu_attention_chunk_size", 3)))
     out = x.new_empty(
@@ -1039,7 +1136,7 @@ def _forward_chunked_earth_attention_3d(self, x, mask=None):
     return x
 
 
-def enable_chunked_attention(model, chunk_size=3):
+def enable_chunked_attention(model, chunk_size=3, cache_earth_bias=False):
     """Patch model-local EarthAttention3D instances for memory A/B testing."""
 
     patched = 0
@@ -1047,6 +1144,7 @@ def enable_chunked_attention(model, chunk_size=3):
     for module in model.modules():
         if module.__class__.__name__ == "EarthAttention3D":
             module._pangu_attention_chunk_size = chunk_size
+            module._pangu_cache_earth_bias = bool(cache_earth_bias)
             module.forward = types.MethodType(_forward_chunked_earth_attention_3d, module)
             patched += 1
     return patched
@@ -1123,7 +1221,15 @@ def _forward_chunked_mlp_block(self, x: torch.Tensor):
     )
 
     x = x.reshape(Batch, PressureLevels * Height * Width, Channels)
-    x = shortcut + self.drop_path(x)
+    # T0.6: In-place residual update to avoid allocating a new tensor.
+    # Under torch.inference_mode(), drop_path is identity (eval mode, no dropout),
+    # so shortcut.add_(x) is safe — shortcut is not referenced elsewhere after this.
+    inplace = bool(getattr(self, "_pangu_inplace_block", False))
+    if inplace:
+        shortcut.add_(self.drop_path(x))
+        x = shortcut
+    else:
+        x = shortcut + self.drop_path(x)
 
     # Chunked MLP computation to reduce peak dynamic activations VRAM
     chunk_size = getattr(self, "_pangu_mlp_chunk_size", 32768)
@@ -1136,17 +1242,21 @@ def _forward_chunked_mlp_block(self, x: torch.Tensor):
             end = min(start + chunk_size, NumTokens)
             x_mlp[:, start:end].copy_(self.mlp(self.norm2(x[:, start:end])))
 
-    x = x + self.drop_path(x_mlp)
+    if inplace:
+        x.add_(self.drop_path(x_mlp))
+    else:
+        x = x + self.drop_path(x_mlp)
     return x
 
 
-def enable_chunked_mlp(model, chunk_size=32768):
+def enable_chunked_mlp(model, chunk_size=32768, inplace_block=False):
     """Patch model-local EarthTransformer3DBlock instances to save memory on MLP forward pass."""
     patched = 0
     chunk_size = max(1, int(chunk_size))
     for module in model.modules():
         if module.__class__.__name__ == "EarthTransformer3DBlock":
             module._pangu_mlp_chunk_size = chunk_size
+            module._pangu_inplace_block = bool(inplace_block)
             module.forward = types.MethodType(_forward_chunked_mlp_block, module)
             patched += 1
     return patched
@@ -1186,7 +1296,7 @@ def build_pangu_model(
     embed_dim = int(embed_dim)
     num_heads = _as_int_list(num_heads)
     window_size = _as_int_list(window_size)
-    
+
     model = Pangu(
         img_size=img_size,
         patch_size=patch_size,
@@ -1309,21 +1419,31 @@ def build_pangu_model(
         chunked_attention = _is_enabled("PANGU_CHUNKED_ATTENTION")
     if attention_chunk_size is None:
         attention_chunk_size = _env_int("PANGU_ATTN_CHUNK_SIZE", 3)
+    cache_earth_bias = _is_enabled("PANGU_CACHE_EARTH_BIAS")
     if chunked_attention:
         model._pangu_chunked_attention_count = enable_chunked_attention(
-            model, chunk_size=attention_chunk_size
+            model, chunk_size=attention_chunk_size,
+            cache_earth_bias=cache_earth_bias,
         )
 
+    inplace_block = _is_enabled("PANGU_INPLACE_BLOCK")
     if _is_enabled("PANGU_CHUNKED_MLP", default=True):
         mlp_chunk_size = _env_int("PANGU_MLP_CHUNK_SIZE", 32768)
-        model._pangu_chunked_mlp_count = enable_chunked_mlp(model, chunk_size=mlp_chunk_size)
+        model._pangu_chunked_mlp_count = enable_chunked_mlp(
+            model, chunk_size=mlp_chunk_size,
+            inplace_block=inplace_block,
+        )
         print(f"🧠  PANGU_CHUNKED_MLP=1，chunk_size={mlp_chunk_size}，patched={model._pangu_chunked_mlp_count}")
+        if inplace_block:
+            print("🔧  PANGU_INPLACE_BLOCK=1，启用 in-place 残差更新")
 
+    split_recovery = _is_enabled("PANGU_SPLIT_RECOVERY")
     if layerwise_inference:
         enable_layerwise_inference(
             model,
             recompute_skip=recompute_skip,
             empty_cache=layerwise_empty_cache,
+            split_recovery=split_recovery,
         )
     elif recompute_skip:
         enable_skip_recompute(model)
