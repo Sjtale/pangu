@@ -27,6 +27,14 @@ from onescience.datapipes.climate import ERA5Datapipe
 from onescience.memory.checkpoint import replace_function
 from onescience.utils.YParams import YParams
 from pangu_profile_model import build_pangu_model
+from score_training_utils import (
+    configure_trainable_stage,
+    load_sensitive_layer_names,
+    normalized_scored_rmse,
+    project_quantized_linear_weights,
+    score_aligned_loss,
+    score_validation_loss,
+)
 
 
 def weighted_l1(prediction, target, weights, level_weight=1.0):
@@ -102,6 +110,10 @@ def cfg_int(cfg, name, default):
     return int(getattr(cfg, name, default))
 
 
+def env_enabled(name):
+    return os.environ.get(name, "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def resolve_checkpoint_arg(cfg, value):
     if not value:
         return value
@@ -153,6 +165,15 @@ def get_student_profile(cfg):
 
 
 def get_profile_checkpoint_names(cfg, profile):
+    prefix = os.environ.get("PANGU_DISTILL_CHECKPOINT_PREFIX", "").strip()
+    if prefix:
+        if os.path.basename(prefix) != prefix:
+            raise ValueError("PANGU_DISTILL_CHECKPOINT_PREFIX must be a basename")
+        return {
+            "latest": f"{prefix}_latest.pth",
+            "train": f"{prefix}_train.pth",
+            "inference": f"{prefix}_fp16.pth",
+        }
     name = profile["name"]
     if name == "student_160":
         return {
@@ -367,6 +388,11 @@ def save_student(
             ),
             "hint_weight": cfg_float(cfg, "distill_hint_weight", 0.0),
             "hint_layers": cfg_hint_layers(cfg),
+            "score_aligned": env_enabled("PANGU_SCORE_ALIGNED"),
+            "score_stage": os.environ.get("PANGU_SCORE_STAGE", "all"),
+            "score_project_quantized": env_enabled(
+                "PANGU_SCORE_PROJECT_QUANTIZED"
+            ),
         },
         "model_profile": student_profile,
     }
@@ -717,6 +743,49 @@ def main():
         student_checkpoint = load_compatible_state(student, teacher_path, logger)
     student.to(device)
 
+    score_aligned = env_enabled("PANGU_SCORE_ALIGNED")
+    score_stage = os.environ.get("PANGU_SCORE_STAGE", "all").strip().lower()
+    sensitive_layers = []
+    score_rmse_normalizers = None
+    score_project_quantized = False
+    score_project_interval = 1
+    if score_aligned:
+        baseline_rmse_path = os.environ.get(
+            "PANGU_SCORE_BASELINE_RMSE", "./data/official_baseline_rmse.npy"
+        )
+        if not os.path.isfile(baseline_rmse_path):
+            raise FileNotFoundError(
+                f"Official baseline RMSE not found: {baseline_rmse_path}"
+            )
+        score_rmse_normalizers = normalized_scored_rmse(
+            np.load(baseline_rmse_path), np.asarray(train_loader.dataset.sd).reshape(-1)
+        ).to(device)
+        sensitivity_path = os.environ.get(
+            "PANGU_SCORE_SENSITIVITY_PATH", "./data/quant_sensitivity.json"
+        )
+        sensitive_count = int(os.environ.get("PANGU_SCORE_SENSITIVE_COUNT", "5"))
+        sensitive_layers = load_sensitive_layer_names(
+            sensitivity_path, sensitive_count
+        )
+        score_project_quantized = env_enabled("PANGU_SCORE_PROJECT_QUANTIZED")
+        score_project_interval = int(
+            os.environ.get("PANGU_SCORE_PROJECT_INTERVAL", "1")
+        )
+        if score_project_interval <= 0:
+            raise ValueError("PANGU_SCORE_PROJECT_INTERVAL must be positive")
+        trainable_names = configure_trainable_stage(
+            student, score_stage, sensitive_layers
+        )
+        logger.info(
+            "Score-aligned stage=%s selected %d trainable tensors; "
+            "sensitive=%s; quantized_projection=%s/%d",
+            score_stage,
+            len(trainable_names),
+            sensitive_layers,
+            score_project_quantized,
+            score_project_interval,
+        )
+
     # Group parameters with Layer-wise Learning Rate Decay (LLRD)
     base_lr = float(cfg.distill_learning_rate)
     param_groups = get_llrd_param_groups(student, base_lr, decay=0.95)
@@ -815,6 +884,8 @@ def main():
             raise ValueError(f"{weight_name} must be non-negative")
     if hint_weight > 0.0 and not hint_layers:
         raise ValueError("distill_hint_weight > 0 requires distill_hint_layers")
+    if score_aligned and hint_weight > 0.0:
+        raise ValueError("Score-aligned mode includes teacher constraints; set hint weight to 0")
 
     teacher_capture = student_capture = None
     teacher_grids = student_grids = None
@@ -895,19 +966,33 @@ def main():
                     teacher_grids,
                     hint_layers,
                 )
-            loss, hard_loss, teacher_loss = distillation_loss(
-                (student_surface, student_upper_air),
-                (target_surface, target_upper_air),
-                (teacher_surface, teacher_upper_air),
-                weights,
-                ground_truth_weight,
-                teacher_weight=teacher_weight,
-                hint_loss=hint_loss,
-                hint_weight=hint_weight,
-            )
+            if score_aligned:
+                loss, score_parts = score_aligned_loss(
+                    (student_surface, student_upper_air),
+                    (target_surface, target_upper_air),
+                    (teacher_surface, teacher_upper_air),
+                    score_rmse_normalizers,
+                )
+                hard_loss = score_parts["rmse"] + score_parts["acc"]
+                teacher_loss = (
+                    score_parts["scored_teacher"] + score_parts["unscored_teacher"]
+                )
+            else:
+                loss, hard_loss, teacher_loss = distillation_loss(
+                    (student_surface, student_upper_air),
+                    (target_surface, target_upper_air),
+                    (teacher_surface, teacher_upper_air),
+                    weights,
+                    ground_truth_weight,
+                    teacher_weight=teacher_weight,
+                    hint_loss=hint_loss,
+                    hint_weight=hint_weight,
+                )
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            if score_project_quantized and step % score_project_interval == 0:
+                project_quantized_linear_weights(student, sensitive_layers)
             scheduler.step()
             train_total += loss.item()
             train_hard += hard_loss.item()
@@ -942,13 +1027,20 @@ def main():
                 )
                 output_surface, output_upper_air = student(model_input)
                 output_upper_air = output_upper_air.reshape(target_upper_air.shape)
-                loss = forecast_loss(
-                    output_surface,
-                    output_upper_air,
-                    target_surface,
-                    target_upper_air,
-                    weights,
-                )
+                if score_aligned:
+                    loss = score_validation_loss(
+                        (output_surface, output_upper_air),
+                        (target_surface, target_upper_air),
+                        score_rmse_normalizers,
+                    )
+                else:
+                    loss = forecast_loss(
+                        output_surface,
+                        output_upper_air,
+                        target_surface,
+                        target_upper_air,
+                        weights,
+                    )
                 valid_loss += loss.item()
                 if world_rank == 0 and val_count % 10 == 0:
                     logger.info(

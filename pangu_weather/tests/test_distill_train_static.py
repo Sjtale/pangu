@@ -88,6 +88,24 @@ class DistillTrainStaticTests(unittest.TestCase):
         self.assertIn("Resuming from best training checkpoint", source)
         self.assertIn("PANGU_DISTILL_RESUME_FROM=best requested", source)
 
+    def test_score_aligned_mode_is_opt_in_and_uses_separate_checkpoints(self):
+        source = SCRIPT_PATH.read_text(encoding="utf-8")
+        launcher = (
+            SCRIPT_PATH.parent / "scripts" / "run_score_aligned_finetune.sh"
+        ).read_text(encoding="utf-8")
+        quantizer = (
+            SCRIPT_PATH.parent / "scripts" / "quantize_mixed_precision.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('env_enabled("PANGU_SCORE_ALIGNED")', source)
+        self.assertIn("score_aligned_loss", source)
+        self.assertIn("score_validation_loss", source)
+        self.assertIn("PANGU_DISTILL_CHECKPOINT_PREFIX", source)
+        self.assertIn("PANGU_SCORE_STAGE=head", launcher)
+        self.assertIn("PANGU_SCORE_STAGE=all", launcher)
+        self.assertIn("official_baseline_rmse.npy", launcher)
+        self.assertIn('parser.add_argument(\n        "--output"', quantizer)
+        self.assertIn("Refusing to overwrite candidate output", quantizer)
+
 
 if __name__ == "__main__":
     unittest.main()

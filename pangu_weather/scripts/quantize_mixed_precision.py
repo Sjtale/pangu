@@ -45,6 +45,12 @@ def main():
     parser.add_argument("--keep-count", type=int, default=5, help="Number of top sensitive layers to keep in FP16")
     parser.add_argument("--keep-ratio", type=float, default=None, help="Ratio of top sensitive layers to keep in FP16 (overrides keep-count)")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to the FP16 checkpoint to quantize")
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Optional separate output path. Refuses to overwrite an existing file.",
+    )
     args = parser.parse_args()
 
     config_path = os.path.join(os.getcwd(), "conf/config.yaml")
@@ -170,7 +176,11 @@ def main():
     if profile["name"] == "pgw_lite_pruned_96":
         out_name = "model_fp16.pth"  # Overwrite model_fp16.pth directly for verification
 
-    out_path = os.path.join(cfg.checkpoint_dir, out_name)
+    out_path = args.output or os.path.join(cfg.checkpoint_dir, out_name)
+    if args.output and os.path.exists(out_path):
+        raise FileExistsError(f"Refusing to overwrite candidate output: {out_path}")
+    output_parent = os.path.dirname(os.path.abspath(out_path))
+    os.makedirs(output_parent, exist_ok=True)
 
     mixed_ckpt = {
         "model_state_dict": mixed_state_dict,
@@ -185,7 +195,7 @@ def main():
     }
 
     # Backup the original quantized pth if overwriting model_fp16.pth
-    if out_name == "model_fp16.pth":
+    if args.output is None and out_name == "model_fp16.pth":
         orig_backup_path = os.path.join(cfg.checkpoint_dir, "model_fp16.pth.orig_quant")
         if not os.path.exists(orig_backup_path):
             import shutil
