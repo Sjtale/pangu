@@ -38,6 +38,10 @@ FOCUSED_GRID = {
 
 BASELINE_GRID = {}
 
+COMPACT_MASK_GRID = {
+    "PANGU_COMPACT_ATTN_MASK": ["1"],
+}
+
 BASE_ENV = {
     "PANGU_AUTO_SCAN_CHECKPOINT": "0",
     "PANGU_DISABLE_CUDA_GRAPH": "1",
@@ -62,6 +66,7 @@ BASE_ENV = {
     "PANGU_LAYERWISE_EMPTY_CACHE": "0",
     "PANGU_USE_ONNX": "0",
     "PANGU_PROFILE_MEMORY": "1",
+    "PANGU_COMPACT_ATTN_MASK": "0",
 }
 
 FORBIDDEN_VALUES = {
@@ -82,6 +87,7 @@ def candidate_label(env):
         f"_empty{env['PANGU_LAYERWISE_EMPTY_CACHE']}"
         f"_inplace{env['PANGU_INPLACE_BLOCK']}"
         f"_clear{env['PANGU_CLEAR_INPUT_REFS']}"
+        f"_mask{env['PANGU_COMPACT_ATTN_MASK']}"
         f"_reset{env.get('PANGU_RESET_PEAK_AFTER_LOAD', '0')}"
     )
 
@@ -103,6 +109,10 @@ def iter_candidates(preset="baseline"):
         include_reset_probe = False
     elif preset == "focused":
         grid = FOCUSED_GRID
+        include_regression = False
+        include_reset_probe = False
+    elif preset == "compact-mask":
+        grid = COMPACT_MASK_GRID
         include_regression = False
         include_reset_probe = False
     elif preset == "full":
@@ -212,6 +222,7 @@ def run_one(candidate, *, args, pangu_dir, output_dir, baseline_dir):
         env["PANGU_FP16_CHECKPOINT"] = args.fp16_checkpoint
 
     latency_runs_ms = []
+    steady_latency_runs_ms = []
     parsed_runs = []
     stdout_tail = ""
     start_wall = time.perf_counter()
@@ -239,6 +250,8 @@ def run_one(candidate, *, args, pangu_dir, output_dir, baseline_dir):
             }
         times = read_time_record(pangu_dir / "result" / "time_record.json")
         latency_runs_ms.extend(value * 1000.0 for value in times)
+        steady_times = times[1:] if len(times) > 1 else times
+        steady_latency_runs_ms.extend(value * 1000.0 for value in steady_times)
         parsed_runs.append(parse_stdout(process.stdout))
 
     output_metrics = compare_outputs(output_dir, baseline_dir)
@@ -256,6 +269,13 @@ def run_one(candidate, *, args, pangu_dir, output_dir, baseline_dir):
         "latency_avg_ms": float(np.mean(latency_runs_ms)) if latency_runs_ms else None,
         "latency_min_ms": float(np.min(latency_runs_ms)) if latency_runs_ms else None,
         "latency_p50_ms": float(np.median(latency_runs_ms)) if latency_runs_ms else None,
+        "steady_latency_ms_values": steady_latency_runs_ms,
+        "steady_latency_avg_ms": (
+            float(np.mean(steady_latency_runs_ms)) if steady_latency_runs_ms else None
+        ),
+        "steady_latency_p50_ms": (
+            float(np.median(steady_latency_runs_ms)) if steady_latency_runs_ms else None
+        ),
         "max_vram_mb": max(max_values) if max_values else None,
         "reserved_mb": max(reserved_values) if reserved_values else None,
         "current_vram_mb": current_values[-1] if current_values else None,
@@ -282,11 +302,12 @@ def main():
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument(
         "--preset",
-        choices=["baseline", "focused", "full"],
+        choices=["baseline", "compact-mask", "focused", "full"],
         default="baseline",
         help=(
-            "baseline measures only the 89.3716 fixed defaults; focused sweeps "
-            "attention chunk size; full is the broad diagnostic grid."
+            "baseline measures only the fixed defaults; compact-mask runs an "
+            "isolated off/on A/B; focused sweeps attention chunk size; full is "
+            "the broad diagnostic grid."
         ),
     )
     parser.add_argument("--dry-run", action="store_true")
@@ -331,6 +352,7 @@ def main():
             print(
                 f"  rc={result.get('returncode')} "
                 f"lat={result.get('latency_avg_ms')} "
+                f"steady={result.get('steady_latency_avg_ms')} "
                 f"vram={result.get('max_vram_mb')} "
                 f"err={result.get('output_max_abs')}"
             )

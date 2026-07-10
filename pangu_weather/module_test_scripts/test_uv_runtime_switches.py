@@ -103,6 +103,24 @@ class UVRuntimeSwitchTests(unittest.TestCase):
         self.assertEqual(env["PANGU_GLOBAL_MEAN_CORRECTION"], "0")
         self.assertEqual(env["PANGU_STREAM_WEIGHTS"], "0")
         self.assertEqual(env["PANGU_USE_ONNX"], "0")
+        self.assertEqual(env["PANGU_COMPACT_ATTN_MASK"], "0")
+
+    def test_compact_mask_preset_is_isolated_off_on_ab(self):
+        candidates = list(probe_uv_runtime_sweep.iter_candidates("compact-mask"))
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(
+            [candidate["env"]["PANGU_COMPACT_ATTN_MASK"] for candidate in candidates],
+            ["0", "1"],
+        )
+        self.assertEqual(len({candidate["label"] for candidate in candidates}), 2)
+        for candidate in candidates:
+            env = candidate["env"]
+            self.assertEqual(env["PANGU_ATTN_CHUNK_SIZE"], "3")
+            self.assertEqual(env["PANGU_CHUNKED_QKV"], "1")
+            self.assertEqual(env["PANGU_CHUNKED_PROJ"], "1")
+            self.assertEqual(env["PANGU_GLOBAL_MEAN_CORRECTION"], "0")
+            self.assertEqual(env["PANGU_STREAM_WEIGHTS"], "0")
+            self.assertEqual(env["PANGU_USE_ONNX"], "0")
 
     def test_focused_uv_grid_only_sweeps_attention_chunk_when_explicit(self):
         candidates = list(probe_uv_runtime_sweep.iter_candidates("focused"))
