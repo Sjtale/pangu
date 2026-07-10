@@ -122,6 +122,21 @@ class UVRuntimeSwitchTests(unittest.TestCase):
             self.assertEqual(env["PANGU_STREAM_WEIGHTS"], "0")
             self.assertEqual(env["PANGU_USE_ONNX"], "0")
 
+    def test_checkpoint_ab_uses_distinct_explicit_files(self):
+        candidates = probe_uv_runtime_sweep.checkpoint_ab_candidates(
+            list(probe_uv_runtime_sweep.iter_candidates("baseline")),
+            "model_fp16.pth",
+            "model_fp16_alias_compact.pth",
+        )
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(candidates[0]["kind"], "baseline")
+        self.assertEqual(candidates[1]["kind"], "checkpoint_candidate")
+        self.assertEqual(
+            [candidate["env"]["PANGU_FP16_CHECKPOINT"] for candidate in candidates],
+            ["model_fp16.pth", "model_fp16_alias_compact.pth"],
+        )
+        self.assertNotEqual(candidates[0]["label"], candidates[1]["label"])
+
     def test_focused_uv_grid_only_sweeps_attention_chunk_when_explicit(self):
         candidates = list(probe_uv_runtime_sweep.iter_candidates("focused"))
         self.assertEqual(len(candidates), 3)

@@ -155,6 +155,22 @@ def iter_candidates(preset="baseline"):
             yield reset_probe
 
 
+def checkpoint_ab_candidates(candidates, baseline_checkpoint, candidate_checkpoint):
+    if len(candidates) != 1:
+        raise ValueError("Checkpoint A/B requires the baseline preset")
+    baseline = dict(candidates[0])
+    baseline["env"] = dict(baseline["env"])
+    baseline["env"]["PANGU_FP16_CHECKPOINT"] = baseline_checkpoint
+    baseline["label"] += "_ckptbaseline"
+
+    candidate = dict(baseline)
+    candidate["kind"] = "checkpoint_candidate"
+    candidate["env"] = dict(baseline["env"])
+    candidate["env"]["PANGU_FP16_CHECKPOINT"] = candidate_checkpoint
+    candidate["label"] = candidates[0]["label"] + "_ckptcandidate"
+    return [baseline, candidate]
+
+
 def reset_output_dir(path):
     if path.exists():
         shutil.rmtree(path)
@@ -218,7 +234,7 @@ def run_one(candidate, *, args, pangu_dir, output_dir, baseline_dir):
     env = os.environ.copy()
     env.update(candidate["env"])
     env["PANGU_MAX_INFERENCE_BATCHES"] = str(args.max_batches)
-    if args.fp16_checkpoint:
+    if args.fp16_checkpoint and "PANGU_FP16_CHECKPOINT" not in candidate["env"]:
         env["PANGU_FP16_CHECKPOINT"] = args.fp16_checkpoint
 
     latency_runs_ms = []
@@ -298,6 +314,14 @@ def main():
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--fp16-checkpoint", default=None)
+    parser.add_argument(
+        "--candidate-fp16-checkpoint",
+        default=None,
+        help=(
+            "Run a two-checkpoint A/B against --fp16-checkpoint or "
+            "model_fp16.pth when using the baseline preset."
+        ),
+    )
     parser.add_argument("--log-file", default=None)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument(
@@ -321,6 +345,12 @@ def main():
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     candidates = list(iter_candidates(args.preset))
+    if args.candidate_fp16_checkpoint:
+        candidates = checkpoint_ab_candidates(
+            candidates,
+            args.fp16_checkpoint or "model_fp16.pth",
+            args.candidate_fp16_checkpoint,
+        )
     if args.limit > 0:
         candidates = candidates[: args.limit]
 
