@@ -42,6 +42,12 @@ COMPACT_MASK_GRID = {
     "PANGU_COMPACT_ATTN_MASK": ["1"],
 }
 
+FULL_RECOVERY_GRID = {
+    # Width 16 is emitted as the baseline. Larger chunks trade a small
+    # temporary for fewer full-channel recovery GEMM launches.
+    "PANGU_DIRECT_RECOVERY_WIDTH_CHUNK": ["24", "32", "48"],
+}
+
 BASE_ENV = {
     "PANGU_AUTO_SCAN_CHECKPOINT": "0",
     "PANGU_DISABLE_CUDA_GRAPH": "1",
@@ -49,7 +55,7 @@ BASE_ENV = {
     "PANGU_RECOMPUTE_SKIP": "0",
     "PANGU_DIRECT_RECOVERY": "1",
     "PANGU_DIRECT_RECOVERY_WIDTH_CHUNK": "16",
-    "PANGU_SCORED_ONLY_RECOVERY": "1",
+    "PANGU_SCORED_ONLY_RECOVERY": "0",
     "PANGU_CHUNKED_ATTENTION": "1",
     "PANGU_ATTN_CHUNK_SIZE": "3",
     "PANGU_CHUNKED_QKV": "1",
@@ -87,6 +93,7 @@ def candidate_label(env):
         f"_empty{env['PANGU_LAYERWISE_EMPTY_CACHE']}"
         f"_inplace{env['PANGU_INPLACE_BLOCK']}"
         f"_clear{env['PANGU_CLEAR_INPUT_REFS']}"
+        f"_scored{env['PANGU_SCORED_ONLY_RECOVERY']}"
         f"_mask{env['PANGU_COMPACT_ATTN_MASK']}"
         f"_reset{env.get('PANGU_RESET_PEAK_AFTER_LOAD', '0')}"
     )
@@ -113,6 +120,10 @@ def iter_candidates(preset="baseline"):
         include_reset_probe = False
     elif preset == "compact-mask":
         grid = COMPACT_MASK_GRID
+        include_regression = False
+        include_reset_probe = False
+    elif preset == "full-recovery":
+        grid = FULL_RECOVERY_GRID
         include_regression = False
         include_reset_probe = False
     elif preset == "full":
@@ -326,12 +337,13 @@ def main():
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument(
         "--preset",
-        choices=["baseline", "compact-mask", "focused", "full"],
+        choices=["baseline", "compact-mask", "full-recovery", "focused", "full"],
         default="baseline",
         help=(
             "baseline measures only the fixed defaults; compact-mask runs an "
-            "isolated off/on A/B; focused sweeps attention chunk size; full is "
-            "the broad diagnostic grid."
+            "isolated off/on A/B; full-recovery sweeps only direct-recovery "
+            "width; focused sweeps attention chunk size; full is the broad "
+            "diagnostic grid."
         ),
     )
     parser.add_argument("--dry-run", action="store_true")

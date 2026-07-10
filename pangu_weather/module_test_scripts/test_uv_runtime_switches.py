@@ -100,6 +100,7 @@ class UVRuntimeSwitchTests(unittest.TestCase):
         self.assertEqual(env["PANGU_LAYERWISE_EMPTY_CACHE"], "0")
         self.assertEqual(env["PANGU_INPLACE_BLOCK"], "1")
         self.assertEqual(env["PANGU_CLEAR_INPUT_REFS"], "1")
+        self.assertEqual(env["PANGU_SCORED_ONLY_RECOVERY"], "0")
         self.assertEqual(env["PANGU_GLOBAL_MEAN_CORRECTION"], "0")
         self.assertEqual(env["PANGU_STREAM_WEIGHTS"], "0")
         self.assertEqual(env["PANGU_USE_ONNX"], "0")
@@ -118,6 +119,25 @@ class UVRuntimeSwitchTests(unittest.TestCase):
             self.assertEqual(env["PANGU_ATTN_CHUNK_SIZE"], "3")
             self.assertEqual(env["PANGU_CHUNKED_QKV"], "1")
             self.assertEqual(env["PANGU_CHUNKED_PROJ"], "1")
+            self.assertEqual(env["PANGU_GLOBAL_MEAN_CORRECTION"], "0")
+            self.assertEqual(env["PANGU_STREAM_WEIGHTS"], "0")
+            self.assertEqual(env["PANGU_USE_ONNX"], "0")
+
+    def test_full_recovery_preset_only_sweeps_width(self):
+        candidates = list(probe_uv_runtime_sweep.iter_candidates("full-recovery"))
+        self.assertEqual(len(candidates), 4)
+        self.assertEqual(
+            [candidate["env"]["PANGU_DIRECT_RECOVERY_WIDTH_CHUNK"]
+             for candidate in candidates],
+            ["16", "24", "32", "48"],
+        )
+        self.assertEqual(len({candidate["label"] for candidate in candidates}), 4)
+        for candidate in candidates:
+            env = candidate["env"]
+            self.assertEqual(env["PANGU_SCORED_ONLY_RECOVERY"], "0")
+            self.assertEqual(env["PANGU_ATTN_CHUNK_SIZE"], "3")
+            self.assertEqual(env["PANGU_MLP_CHUNK_SIZE"], "32768")
+            self.assertEqual(env["PANGU_COMPACT_ATTN_MASK"], "0")
             self.assertEqual(env["PANGU_GLOBAL_MEAN_CORRECTION"], "0")
             self.assertEqual(env["PANGU_STREAM_WEIGHTS"], "0")
             self.assertEqual(env["PANGU_USE_ONNX"], "0")
