@@ -89,7 +89,7 @@ class PGWLiteStaticTests(unittest.TestCase):
         self.assertIn('os.environ.setdefault("PANGU_AUTO_SCAN_CHECKPOINT", "0")', source)
         self.assertIn('os.environ.setdefault("PANGU_DISABLE_CUDA_GRAPH", "1")', source)
         self.assertIn('os.environ.setdefault("PANGU_SCORED_ONLY_RECOVERY", "1")', source)
-        self.assertIn('os.environ.setdefault("PANGU_COMPACT_ATTN_MASK", "1")', source)
+        self.assertIn('os.environ.setdefault("PANGU_COMPACT_ATTN_MASK", "0")', source)
         self.assertIn("_scan_checkpoint_path", source)
         self.assertIn("_detect_architecture_from_state", source)
         self.assertIn("_infer_gqa_group_size", source)
