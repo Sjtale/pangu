@@ -232,6 +232,17 @@ def main():
     print(f"Model params: {total_params:,} ({total_bytes/1024**2:.1f} MB)")
     print(f"Model buffers: {total_buffers/1024**2:.1f} MB")
     print(f"Total model resident: {(total_bytes+total_buffers)/1024**2:.1f} MB")
+    largest_buffers = sorted(
+        (
+            (name, buffer.numel() * buffer.element_size(), tuple(buffer.shape), buffer.dtype)
+            for name, buffer in model.named_buffers()
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:12]
+    print("Largest model buffers:")
+    for name, size_bytes, shape, dtype in largest_buffers:
+        print(f"  {size_bytes/1024**2:8.1f} MB  {str(dtype):14s}  {shape!s:24s}  {name}")
 
     # ---- Load one test sample ----
     datapipe = ERA5Datapipe(params=cfg_data, distributed=False)

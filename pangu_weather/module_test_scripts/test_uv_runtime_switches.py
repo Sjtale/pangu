@@ -163,6 +163,43 @@ class UVRuntimeSwitchTests(unittest.TestCase):
                         self.assertIs(module._cached_earth_position_bias, cached)
                         self.assertTrue(torch.allclose(again, expected, atol=1e-6, rtol=1e-6))
 
+    def test_compact_attention_mask_is_exact_and_smaller(self):
+        torch.manual_seed(20260710)
+        base = TinyAttention().half()
+        compact = TinyAttention()
+        compact.load_state_dict(base.state_dict())
+
+        float_mask = torch.zeros(3, 2, 3, 3, dtype=torch.float16)
+        float_mask[:, :, 0, 2] = -100
+        base.register_buffer("attn_mask", float_mask.clone())
+        compact.register_buffer("attn_mask", float_mask.float())
+
+        compacted, saved_bytes = pangu_profile_model.compact_attention_masks(compact)
+        compact.half()
+
+        self.assertEqual(compacted, 1)
+        self.assertGreater(saved_bytes, 0)
+        self.assertEqual(compact.attn_mask.dtype, torch.int8)
+        self.assertLess(
+            compact.attn_mask.numel() * compact.attn_mask.element_size(),
+            base.attn_mask.numel() * base.attn_mask.element_size(),
+        )
+
+        x = torch.randn(6, 2, 3, 4, dtype=torch.float16)
+        for module in (base, compact):
+            module._pangu_attention_chunk_size = 2
+            module._pangu_cache_earth_bias = False
+            module._pangu_chunked_qkv = True
+            module._pangu_chunked_proj = True
+
+        expected = pangu_profile_model._forward_chunked_earth_attention_3d(
+            base, x, mask=base.attn_mask
+        )
+        actual = pangu_profile_model._forward_chunked_earth_attention_3d(
+            compact, x, mask=compact.attn_mask
+        )
+        self.assertTrue(torch.equal(actual, expected))
+
     def test_ranker_prefers_platform_total_over_local_proxy(self):
         rows = [
             {"label": "fast_local", "returncode": 0, "max_vram_mb": 500.0, "latency_avg_ms": 80.0},

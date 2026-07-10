@@ -1207,6 +1207,24 @@ def enable_chunked_attention(
     return patched
 
 
+def compact_attention_masks(model):
+    """Store fixed 0/-100 shifted-window masks as int8 buffers."""
+
+    compacted = 0
+    saved_bytes = 0
+    for module in model.modules():
+        mask = getattr(module, "attn_mask", None)
+        if mask is None or not torch.is_floating_point(mask):
+            continue
+        if not torch.all((mask == 0) | (mask == -100)).item():
+            continue
+        old_bytes = mask.numel() * mask.element_size()
+        module.attn_mask = mask.to(dtype=torch.int8)
+        saved_bytes += old_bytes - module.attn_mask.numel() * module.attn_mask.element_size()
+        compacted += 1
+    return compacted, saved_bytes
+
+
 def _forward_chunked_mlp_block(self, x: torch.Tensor):
     from onescience.modules.func_utils import crop3d, window_partition, window_reverse
     PressureLevels, Height, Width = self.input_resolution
@@ -1491,6 +1509,15 @@ def build_pangu_model(
                 "🧠  PANGU_CHUNKED_ATTENTION extra: "
                 f"qkv={int(chunked_qkv)} proj={int(chunked_proj)}"
             )
+
+    if _is_enabled("PANGU_COMPACT_ATTN_MASK"):
+        compacted, saved_bytes = compact_attention_masks(model)
+        model._pangu_compact_mask_count = compacted
+        model._pangu_compact_mask_saved_bytes = saved_bytes
+        print(
+            "🗜️  PANGU_COMPACT_ATTN_MASK=1，"
+            f"compacted={compacted}，pre-FP16 saved={saved_bytes / 1024**2:.1f} MB"
+        )
 
     inplace_block = _is_enabled("PANGU_INPLACE_BLOCK")
     if _is_enabled("PANGU_CHUNKED_MLP", default=True):

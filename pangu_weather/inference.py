@@ -40,6 +40,7 @@ os.environ.setdefault("PANGU_SPLIT_RECOVERY", "0")
 os.environ.setdefault("PANGU_CACHE_EARTH_BIAS", "0")
 os.environ.setdefault("PANGU_INPLACE_BLOCK", "1")
 os.environ.setdefault("PANGU_CLEAR_INPUT_REFS", "1")
+os.environ.setdefault("PANGU_COMPACT_ATTN_MASK", "0")
 
 
 
