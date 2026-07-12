@@ -24,3 +24,4 @@ pangu_weather/result/time_record.json
 # Ignore generated experiment and submission artifacts
 pangu_weather/logs/
 pangu_weather/submit_package/
+pangu_weather/guardrails/

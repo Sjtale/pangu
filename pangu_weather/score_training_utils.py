@@ -108,7 +108,7 @@ def validate_training_protocol(checkpoint, expected, require=False):
     protocol_defaults = {
         "gradient_accumulation": 1,
         "attention_only_warmup_epochs": 0,
-        "version": 1,
+        "version": 2,
     }
 
     mismatches = {}

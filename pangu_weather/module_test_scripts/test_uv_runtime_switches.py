@@ -87,6 +87,22 @@ class TinyAttention(nn.Module):
         self.register_buffer("earth_position_index", torch.arange(table_len))
 
 
+class EarthAttention3D(TinyAttention):
+    pass
+
+
+class EarthTransformer3DBlock(nn.Module):
+    def forward(self, x):
+        return x
+
+
+class BufferHolder(nn.Module):
+    def __init__(self, mask):
+        super().__init__()
+        self.register_buffer("attn_mask", mask.clone())
+        self.register_buffer("earth_position_index", torch.arange(9))
+
+
 class UVRuntimeSwitchTests(unittest.TestCase):
     def test_runtime_promotion_gates_enforce_plan_thresholds(self):
         rows = [
@@ -145,6 +161,102 @@ class UVRuntimeSwitchTests(unittest.TestCase):
         self.assertEqual(env["PANGU_DIRECT_MASK_SLICE"], "0")
         self.assertEqual(env["PANGU_GRAPH_DIRECT_INPUT"], "1")
         self.assertEqual(env["PANGU_CPU_RECOVERY_OUTPUT"], "0")
+        self.assertEqual(env["PANGU_HIP_SCHEDULE_SPIN"], "0")
+        self.assertEqual(env["PANGU_HIP_PREFER_L1"], "0")
+        self.assertEqual(env["PANGU_HIP_STREAM_SPIN"], "0")
+        self.assertEqual(env["PANGU_INTERN_IMMUTABLE_BUFFERS"], "0")
+
+    def test_hip_probe_isolates_each_control_and_combination(self):
+        candidates = list(probe_uv_runtime_sweep.iter_candidates("hip"))
+        self.assertEqual(len(candidates), 5)
+        self.assertEqual(candidates[0]["kind"], "baseline")
+        enabled = [
+            tuple(
+                candidate["env"][name]
+                for name in (
+                    "PANGU_HIP_SCHEDULE_SPIN",
+                    "PANGU_HIP_PREFER_L1",
+                    "PANGU_HIP_STREAM_SPIN",
+                )
+            )
+            for candidate in candidates
+        ]
+        self.assertEqual(
+            enabled,
+            [
+                ("0", "0", "0"),
+                ("1", "0", "0"),
+                ("0", "1", "0"),
+                ("0", "0", "1"),
+                ("1", "1", "1"),
+            ],
+        )
+
+    def test_stagewise_probe_keeps_outer_stages_at_guardrail(self):
+        candidates = list(probe_uv_runtime_sweep.iter_candidates("stagewise"))
+        self.assertEqual(len(candidates), 4)
+        for candidate in candidates:
+            env = candidate["env"]
+            for stage in ("LAYER1", "LAYER4"):
+                self.assertEqual(env[f"PANGU_ATTN_CHUNK_SIZE_{stage}"], "3")
+                self.assertEqual(env[f"PANGU_CHUNKED_QKV_{stage}"], "1")
+                self.assertEqual(env[f"PANGU_CHUNKED_PROJ_{stage}"], "1")
+                self.assertEqual(env[f"PANGU_MLP_CHUNK_SIZE_{stage}"], "32768")
+
+    def test_stage_options_apply_only_to_named_stage(self):
+        model = nn.Module()
+        for stage in ("layer1", "layer2", "layer3", "layer4"):
+            container = nn.Module()
+            container.attn = EarthAttention3D()
+            container.block = EarthTransformer3DBlock()
+            setattr(model, stage, container)
+
+        pangu_profile_model.enable_chunked_attention(
+            model,
+            chunk_size=3,
+            chunked_qkv=True,
+            chunked_proj=True,
+            stage_options={
+                "layer2": {
+                    "chunk_size": 0,
+                    "chunked_qkv": False,
+                    "chunked_proj": False,
+                }
+            },
+        )
+        pangu_profile_model.enable_chunked_mlp(
+            model,
+            chunk_size=32768,
+            stage_chunk_sizes={"layer2": 0, "layer3": 65536},
+        )
+        self.assertEqual(model.layer1.attn._pangu_attention_chunk_size, 3)
+        self.assertEqual(model.layer2.attn._pangu_attention_chunk_size, 0)
+        self.assertFalse(model.layer2.attn._pangu_chunked_qkv)
+        self.assertFalse(model.layer2.attn._pangu_chunked_proj)
+        self.assertEqual(model.layer2.block._pangu_mlp_chunk_size, 0)
+        self.assertEqual(model.layer3.block._pangu_mlp_chunk_size, 65536)
+
+    def test_immutable_buffer_interning_shares_only_equal_buffers(self):
+        model = nn.Module()
+        model.layer1 = BufferHolder(torch.tensor([0.0, -100.0]))
+        model.layer2 = BufferHolder(torch.tensor([0.0, -100.0]))
+        model.layer3 = BufferHolder(torch.tensor([0.0, 0.0]))
+        layer3_mask_pointer = model.layer3.attn_mask.data_ptr()
+
+        report = pangu_profile_model.intern_immutable_buffers(model)
+
+        self.assertGreaterEqual(report["replaced"], 2)
+        self.assertEqual(
+            model.layer1.attn_mask.data_ptr(), model.layer2.attn_mask.data_ptr()
+        )
+        self.assertNotEqual(model.layer1.attn_mask.data_ptr(), layer3_mask_pointer)
+        self.assertEqual(
+            model.layer1.earth_position_index.data_ptr(),
+            model.layer3.earth_position_index.data_ptr(),
+        )
+        before = model.layer1.attn_mask.clone()
+        _ = model.layer2.attn_mask + 1
+        self.assertTrue(torch.equal(model.layer1.attn_mask, before))
 
     def test_cpu_recovery_preset_is_isolated_off_on_ab(self):
         candidates = list(probe_uv_runtime_sweep.iter_candidates("cpu-recovery"))
@@ -197,6 +309,17 @@ class UVRuntimeSwitchTests(unittest.TestCase):
         self.assertIn('os.environ.setdefault("PANGU_GRAPH_DIRECT_INPUT", "1")', source)
         self.assertIn('os.environ.setdefault("PANGU_COMPACT_ATTN_MASK", "0")', source)
         self.assertIn('os.environ.setdefault("PANGU_DIRECT_MASK_SLICE", "0")', source)
+        self.assertIn('os.environ.setdefault("PANGU_HIP_SCHEDULE_SPIN", "0")', source)
+        self.assertIn('os.environ.setdefault("PANGU_HIP_PREFER_L1", "0")', source)
+        self.assertIn('os.environ.setdefault("PANGU_HIP_STREAM_SPIN", "0")', source)
+        self.assertIn(
+            'os.environ.setdefault("PANGU_INTERN_IMMUTABLE_BUFFERS", "0")',
+            source,
+        )
+        self.assertLess(
+            source.index("model.eval()"),
+            source.index("intern_report = intern_immutable_buffers(model)"),
+        )
 
     def test_direct_mask_preset_is_isolated_off_on_ab(self):
         candidates = list(probe_uv_runtime_sweep.iter_candidates("direct-mask"))
@@ -348,6 +471,22 @@ class UVRuntimeSwitchTests(unittest.TestCase):
             module._pangu_direct_mask_slice = enabled
         expected = pangu_profile_model._forward_chunked_earth_attention_3d(base, x, mask)
         actual = pangu_profile_model._forward_chunked_earth_attention_3d(direct, x, mask)
+        self.assertTrue(torch.equal(actual, expected))
+
+    def test_zero_attention_chunk_means_one_full_batch_chunk(self):
+        torch.manual_seed(20260713)
+        chunked = TinyAttention()
+        full = TinyAttention()
+        full.load_state_dict(chunked.state_dict())
+        x = torch.randn(7, 2, 3, 4)
+        for module, chunk_size in ((chunked, 3), (full, 0)):
+            module._pangu_attention_chunk_size = chunk_size
+            module._pangu_cache_earth_bias = False
+            module._pangu_chunked_qkv = True
+            module._pangu_chunked_proj = True
+            module._pangu_direct_mask_slice = False
+        expected = pangu_profile_model._forward_chunked_earth_attention_3d(chunked, x)
+        actual = pangu_profile_model._forward_chunked_earth_attention_3d(full, x)
         self.assertTrue(torch.equal(actual, expected))
 
     def test_compact_attention_mask_is_exact_and_smaller(self):

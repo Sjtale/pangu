@@ -27,8 +27,8 @@ cp conf/config.yaml $PANGU_DIR/conf/
 cp inference.py $PANGU_DIR/
 cp result.py $PANGU_DIR/
 cp pangu_profile_model.py $PANGU_DIR/
+cp hip_runtime_controls.py $PANGU_DIR/
 cp calibration_utils.py $PANGU_DIR/
-cp README.md $PANGU_DIR/
 
 
 
@@ -72,6 +72,11 @@ cd ..
 echo "✅ 打包完成！提交包路径：$SUBMIT_DIR/pangu_weather.zip"
 echo "🔍 提交包内部结构预览："
 unzip -l $SUBMIT_DIR/pangu_weather.zip | grep -v "/$"
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum $SUBMIT_DIR/pangu_weather.zip > $SUBMIT_DIR/pangu_weather.zip.sha256
+else
+    shasum -a 256 $SUBMIT_DIR/pangu_weather.zip > $SUBMIT_DIR/pangu_weather.zip.sha256
+fi
 
 echo ""
 echo "🎉 [最终检查清单]"

@@ -12,7 +12,17 @@ import gzip
 import io
 from onescience.utils.YParams import YParams
 from onescience.datapipes.climate import ERA5Datapipe
-from pangu_profile_model import build_pangu_model, enable_streamed_weight_residency
+from pangu_profile_model import (
+    build_pangu_model,
+    enable_streamed_weight_residency,
+    intern_immutable_buffers,
+)
+from hip_runtime_controls import (
+    create_spin_stream,
+    load_hip_runtime,
+    set_prefer_l1,
+    set_schedule_spin,
+)
 from calibration_utils import (
     apply_affine_calibration,
     apply_global_mean_correction,
@@ -47,6 +57,10 @@ os.environ.setdefault("PANGU_COMPACT_ATTN_MASK", "0")
 os.environ.setdefault("PANGU_DIRECT_MASK_SLICE", "0")
 os.environ.setdefault("PANGU_GRAPH_DIRECT_INPUT", "1")
 os.environ.setdefault("PANGU_CPU_RECOVERY_OUTPUT", "0")
+os.environ.setdefault("PANGU_HIP_SCHEDULE_SPIN", "0")
+os.environ.setdefault("PANGU_HIP_PREFER_L1", "0")
+os.environ.setdefault("PANGU_HIP_STREAM_SPIN", "0")
+os.environ.setdefault("PANGU_INTERN_IMMUTABLE_BUFFERS", "0")
 
 
 
@@ -839,25 +853,24 @@ if __name__ == "__main__":
     current_path = os.getcwd()
     sys.path.append(current_path)
 
-    # Load HIP library dynamically and set device schedule flag to Spin
-    import ctypes
-    libhip = None
-    for lib_name in ['libamdhip64.so', 'libhip_hcc.so', 'libamdhip64.so.5', 'libamdhip64.so.6']:
+    hip_schedule_spin = _is_enabled("PANGU_HIP_SCHEDULE_SPIN")
+    hip_prefer_l1 = _is_enabled("PANGU_HIP_PREFER_L1")
+    hip_stream_spin = _is_enabled("PANGU_HIP_STREAM_SPIN")
+    libhip = (
+        load_hip_runtime()
+        if hip_schedule_spin or hip_prefer_l1 or hip_stream_spin
+        else None
+    )
+    if (hip_schedule_spin or hip_prefer_l1 or hip_stream_spin) and libhip is None:
+        print("⚠️ [HIP] Runtime library not found; requested controls are disabled")
+    if libhip is not None and hip_schedule_spin:
         try:
-            libhip = ctypes.CDLL(lib_name)
-            break
-        except Exception:
-            continue
-    if libhip:
-        try:
-            # hipDeviceScheduleSpin = 1
-            status = libhip.hipSetDeviceFlags(1)
-            if status == 0:
-                print("⚡ [HIP] hipSetDeviceFlags(hipDeviceScheduleSpin) successful!")
-            else:
-                print(f"⚠️ [HIP] hipSetDeviceFlags returned status code: {status}")
+            set_schedule_spin(libhip)
+            print("⚡ [HIP] hipDeviceScheduleSpin enabled before context creation")
         except Exception as e:
-            print(f"⚠️ [HIP] Failed to set device flags: {e}")
+            print(f"⚠️ [HIP] Failed to set schedule policy: {e}")
+
+    custom_hip_stream = None
 
 
     ## Model config init
@@ -1081,8 +1094,8 @@ if __name__ == "__main__":
                 kv_group_size=gqa_group_size,
                 share_deep_blocks=share_deep_blocks,
                 chunked_attention=chunked_attention,
-                    attention_chunk_size=attention_chunk_size,
-                )
+                attention_chunk_size=attention_chunk_size,
+            )
             runtime_quant_linear = (
                 _is_enabled("PANGU_RUNTIME_QUANT_LINEAR")
                 and not use_gqa
@@ -1103,39 +1116,19 @@ if __name__ == "__main__":
             if use_fp16:
                 model.half()   # FP16: ensure model storage is half before moving to GPU
             model = model.to('cuda:0')
-            if libhip:
+            if libhip is not None and hip_prefer_l1:
                 try:
-                    # 1. Prefer L1 Cache over Shared Memory for Attention GEMMs (hipFuncCachePreferL1 = 2)
-                    libhip.hipDeviceSetCacheConfig(2)
-                    print("⚡ [HIP] hipDeviceSetCacheConfig(hipFuncCachePreferL1) set successfully!")
+                    set_prefer_l1(libhip)
+                    print("⚡ [HIP] hipFuncCachePreferL1 enabled")
                 except Exception as e:
                     print(f"⚠️ [HIP] Failed to set device cache config: {e}")
-
+            if libhip is not None and hip_stream_spin:
                 try:
-                    # 2. Create custom stream and set as active stream in PyTorch
-                    custom_stream = torch.cuda.Stream()
-                    torch.cuda.set_stream(custom_stream)
-                    print("⚡ [HIP] Created custom stream and set as active stream in PyTorch")
-                    
-                    # 3. Set Stream Synchronization Policy to Spin (hipSyncPolicySpin = 2)
-                    class hipStreamAttrValue(ctypes.Union):
-                        _fields_ = [("syncPolicy", ctypes.c_int)]
-                    
-                    libhip.hipStreamSetAttribute.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
-                    libhip.hipStreamSetAttribute.restype = ctypes.c_int
-                    
-                    stream_ptr = custom_stream.cuda_stream
-                    val = hipStreamAttrValue()
-                    val.syncPolicy = 2  # 2 = hipSyncPolicySpin
-                    status = libhip.hipStreamSetAttribute(
-                        ctypes.c_void_p(stream_ptr), 
-                        3, # hipStreamAttributeSynchronizationPolicy = 3
-                        ctypes.byref(val)
+                    custom_hip_stream = create_spin_stream(libhip, torch)
+                    print(
+                        "⚡ [HIP] Verified hipSyncPolicySpin on ordered custom stream "
+                        f"(ptr={custom_hip_stream.cuda_stream})"
                     )
-                    if status == 0:
-                        print(f"⚡ [HIP] hipStreamSetAttribute(hipSyncPolicySpin) set successfully on custom stream (ptr={stream_ptr})!")
-                    else:
-                        print(f"⚠️ [HIP] hipStreamSetAttribute returned status: {status}")
                 except Exception as e:
                     print(f"⚠️ [HIP] Failed to set stream sync policy: {e}")
             _profile_cuda_memory("after model build/to cuda")
@@ -1168,6 +1161,16 @@ if __name__ == "__main__":
                     "🧠  PANGU_CHUNKED_ATTENTION=1，"
                     f"chunk_size={attention_chunk_size}，patched={patched_attention}"
                 )
+                stage_options = []
+                for stage in ("LAYER1", "LAYER2", "LAYER3", "LAYER4"):
+                    stage_options.append(
+                        f"{stage.lower()}="
+                        f"a{_env_int(f'PANGU_ATTN_CHUNK_SIZE_{stage}', attention_chunk_size)}"
+                        f"/q{int(_is_enabled(f'PANGU_CHUNKED_QKV_{stage}', default=_is_enabled('PANGU_CHUNKED_QKV')))}"
+                        f"/p{int(_is_enabled(f'PANGU_CHUNKED_PROJ_{stage}', default=_is_enabled('PANGU_CHUNKED_PROJ')))}"
+                        f"/m{_env_int(f'PANGU_MLP_CHUNK_SIZE_{stage}', 32768)}"
+                    )
+                print("🧠  Stage-wise chunks: " + " ".join(stage_options))
             incremental_state_load = _is_enabled(
                 "PANGU_INCREMENTAL_STATE_LOAD", default=True
             )
@@ -1205,6 +1208,14 @@ if __name__ == "__main__":
                 ckpt["model_state_dict"] = adapt_qkv_for_gqa(ckpt["model_state_dict"], model)
                 model.load_state_dict(ckpt["model_state_dict"], strict=False)
             model.eval()
+            if _is_enabled("PANGU_INTERN_IMMUTABLE_BUFFERS"):
+                intern_report = intern_immutable_buffers(model)
+                print(
+                    "🧩 Interned immutable buffers after weight load: "
+                    f"replaced={intern_report['replaced']} "
+                    f"groups={intern_report['shared_groups']} "
+                    f"saved={intern_report['saved_bytes'] / 1024**2:.1f} MiB"
+                )
             _profile_cuda_memory("after load_state_dict/model eval")
             if stream_weights:
                 offloaded_count, offloaded_bytes = enable_streamed_weight_residency(

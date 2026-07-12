@@ -61,6 +61,44 @@ FULL_RECOVERY_GRID = {
     "PANGU_DIRECT_RECOVERY_WIDTH_CHUNK": ["24", "32", "48"],
 }
 
+HIP_CANDIDATES = [
+    {"PANGU_HIP_SCHEDULE_SPIN": "1"},
+    {"PANGU_HIP_PREFER_L1": "1"},
+    {"PANGU_HIP_STREAM_SPIN": "1"},
+    {
+        "PANGU_HIP_SCHEDULE_SPIN": "1",
+        "PANGU_HIP_PREFER_L1": "1",
+        "PANGU_HIP_STREAM_SPIN": "1",
+    },
+]
+
+STAGEWISE_CANDIDATES = [
+    {
+        "PANGU_ATTN_CHUNK_SIZE_LAYER2": "4",
+        "PANGU_ATTN_CHUNK_SIZE_LAYER3": "4",
+    },
+    {
+        "PANGU_ATTN_CHUNK_SIZE_LAYER2": "8",
+        "PANGU_ATTN_CHUNK_SIZE_LAYER3": "8",
+        "PANGU_CHUNKED_QKV_LAYER2": "0",
+        "PANGU_CHUNKED_QKV_LAYER3": "0",
+        "PANGU_CHUNKED_PROJ_LAYER2": "0",
+        "PANGU_CHUNKED_PROJ_LAYER3": "0",
+        "PANGU_MLP_CHUNK_SIZE_LAYER2": "65536",
+        "PANGU_MLP_CHUNK_SIZE_LAYER3": "65536",
+    },
+    {
+        "PANGU_ATTN_CHUNK_SIZE_LAYER2": "0",
+        "PANGU_ATTN_CHUNK_SIZE_LAYER3": "0",
+        "PANGU_CHUNKED_QKV_LAYER2": "0",
+        "PANGU_CHUNKED_QKV_LAYER3": "0",
+        "PANGU_CHUNKED_PROJ_LAYER2": "0",
+        "PANGU_CHUNKED_PROJ_LAYER3": "0",
+        "PANGU_MLP_CHUNK_SIZE_LAYER2": "0",
+        "PANGU_MLP_CHUNK_SIZE_LAYER3": "0",
+    },
+]
+
 PANGU_LITE_2D_ENV = {
     # The 2D student has its own forward path. Disable optimizations that patch
     # OneScience's 3D Pangu modules so the probe measures the architecture as-is.
@@ -103,7 +141,17 @@ BASE_ENV = {
     "PANGU_DIRECT_MASK_SLICE": "0",
     "PANGU_GRAPH_DIRECT_INPUT": "1",
     "PANGU_CPU_RECOVERY_OUTPUT": "0",
+    "PANGU_HIP_SCHEDULE_SPIN": "0",
+    "PANGU_HIP_PREFER_L1": "0",
+    "PANGU_HIP_STREAM_SPIN": "0",
+    "PANGU_INTERN_IMMUTABLE_BUFFERS": "0",
 }
+
+for _stage in ("LAYER1", "LAYER2", "LAYER3", "LAYER4"):
+    BASE_ENV[f"PANGU_ATTN_CHUNK_SIZE_{_stage}"] = "3"
+    BASE_ENV[f"PANGU_CHUNKED_QKV_{_stage}"] = "1"
+    BASE_ENV[f"PANGU_CHUNKED_PROJ_{_stage}"] = "1"
+    BASE_ENV[f"PANGU_MLP_CHUNK_SIZE_{_stage}"] = "32768"
 
 FORBIDDEN_VALUES = {
     "PANGU_GLOBAL_MEAN_CORRECTION": "1",
@@ -131,6 +179,14 @@ def candidate_label(env):
         f"_graph{int(env['PANGU_DISABLE_CUDA_GRAPH'] == '0')}"
         f"_graphinput{env['PANGU_GRAPH_DIRECT_INPUT']}"
         f"_cpuout{env['PANGU_CPU_RECOVERY_OUTPUT']}"
+        f"_intern{env['PANGU_INTERN_IMMUTABLE_BUFFERS']}"
+        f"_hip{env['PANGU_HIP_SCHEDULE_SPIN']}"
+        f"{env['PANGU_HIP_PREFER_L1']}"
+        f"{env['PANGU_HIP_STREAM_SPIN']}"
+        f"_l23a{env['PANGU_ATTN_CHUNK_SIZE_LAYER2']}"
+        f"q{env['PANGU_CHUNKED_QKV_LAYER2']}"
+        f"p{env['PANGU_CHUNKED_PROJ_LAYER2']}"
+        f"m{env['PANGU_MLP_CHUNK_SIZE_LAYER2']}"
         f"_reset{env.get('PANGU_RESET_PEAK_AFTER_LOAD', '0')}"
     )
 
@@ -155,6 +211,29 @@ def iter_candidates(preset="baseline"):
             "kind": "architecture",
             "env": merged,
         }
+        return
+
+    if preset in {"hip", "buffer-intern", "stagewise"}:
+        candidate_envs = {
+            "hip": HIP_CANDIDATES,
+            "buffer-intern": [{"PANGU_INTERN_IMMUTABLE_BUFFERS": "1"}],
+            "stagewise": STAGEWISE_CANDIDATES,
+        }[preset]
+        baseline_env = dict(BASE_ENV)
+        yield {
+            "label": candidate_label(baseline_env),
+            "kind": "baseline",
+            "env": baseline_env,
+        }
+        for values in candidate_envs:
+            env = dict(BASE_ENV)
+            env.update(values)
+            validate_env(env)
+            yield {
+                "label": candidate_label(env),
+                "kind": preset,
+                "env": env,
+            }
         return
     if preset == "baseline":
         grid = BASELINE_GRID
@@ -400,7 +479,7 @@ def make_log_path(path):
 
 def main():
     parser = argparse.ArgumentParser(description="Probe U/V runtime candidates.")
-    parser.add_argument("--max-batches", type=int, default=3)
+    parser.add_argument("--max-batches", type=int, default=5)
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--fp16-checkpoint", default=None)
@@ -418,7 +497,8 @@ def main():
         "--preset",
         choices=[
             "baseline", "compact-mask", "direct-mask", "cuda-graph", "cpu-recovery",
-            "full-recovery", "focused", "full", "pangu-lite-2d",
+            "full-recovery", "focused", "full", "pangu-lite-2d", "hip",
+            "buffer-intern", "stagewise",
         ],
         default="baseline",
         help=(
@@ -426,7 +506,9 @@ def main():
             "isolated off/on A/B; direct-mask removes mask index kernels; "
             "cuda-graph isolates graph replay; full-recovery sweeps only direct-recovery "
             "width; pangu-lite-2d measures the 2D positional-embedding student; "
-            "focused sweeps attention chunk size; full is the broad "
+            "hip isolates the three HIP runtime controls; buffer-intern shares "
+            "identical FP16 masks/indexes; stagewise screens three layer2/3 "
+            "chunk schedules; focused sweeps attention chunk size; full is the broad "
             "diagnostic grid."
         ),
     )

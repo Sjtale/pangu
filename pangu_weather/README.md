@@ -112,6 +112,43 @@ peak 显存和输出误差。Graph 只在延迟至少降低 6%、显存增量不
 10 MiB 且输出完全一致时晋级；direct-mask 只在延迟至少降低 3% 且
 输出完全一致时晋级。两个开关均默认关闭，不影响已验证提交包。
 
+当前主线冻结所有新学生结构，只优化完整 `[2,6,6,2]` pruned_96。
+新增候选同样全部默认关闭，按以下顺序在 DCU 上隔离测量：
+
+```bash
+# 三项 HIP 控制分别 off/on，再测试三项组合
+python scripts/probe_uv_runtime_sweep.py --preset hip --repeat 5 --max-batches 5
+
+# FP16 mask/position-index 只读 storage interning
+python scripts/probe_uv_runtime_sweep.py --preset buffer-intern --repeat 5 --max-batches 5
+
+# layer1/4 固定 guardrail，仅筛 layer2/3 的三档分块
+python scripts/probe_uv_runtime_sweep.py --preset stagewise --repeat 5 --max-batches 5
+
+# 只盘点真正的 fused backend；不会重新运行已经失败的 SDPA fallback
+python scripts/probe_fast_attention_capability.py \
+  --output logs/fast_attention_capability.json
+```
+
+`PANGU_ATTN_CHUNK_SIZE_LAYER{1..4}` 和
+`PANGU_MLP_CHUNK_SIZE_LAYER{1..4}` 的值 `0` 表示整 stage；对应的
+`PANGU_CHUNKED_QKV_LAYER{1..4}`、`PANGU_CHUNKED_PROJ_LAYER{1..4}`
+控制 QKV/projection 是否继续分块。未经 DCU 和平台验收不得改变默认值。
+
+冻结已验证 89.6297 guardrail，并审计最小提交包：
+
+```bash
+python scripts/freeze_pruned96_guardrail.py \
+  --submission-zip submit_package/pangu_weather.zip \
+  --checkpoint data/checkpoints/model_fp16_alias_compact.pth \
+  --calibration data/checkpoints/calibration_coeffs.npy
+python scripts/audit_submission_package.py \
+  submit_package/pangu_weather.zip \
+  --model data/checkpoints/model_fp16_alias_compact.pth
+```
+
+冻结脚本拒绝覆盖已有目录；提交包审计只允许运行所需的 7 个文件。
+
 Graph 路径默认使用 `PANGU_GRAPH_DIRECT_INPUT=1`：Graph 捕获直接接管
 example input，推理数据在计时前直接写入 Graph 固定输入。这避免捕获
 和 replay 时各额外保留一整套约 150 MiB 的 GPU 输入。如需回归旧 Graph
@@ -158,6 +195,9 @@ timed forward 内，必须做 U/V A/B：
 ```bash
 python scripts/probe_uv_runtime_sweep.py --preset cpu-recovery --repeat 5
 ```
+
+该路径 DCU 已测得峰值不变、稳态延迟恶化约 35.3%，保留仅用于回归，
+不得重新作为提交候选。
 
 ## 结构化剪枝
 
@@ -215,6 +255,10 @@ PANGU_USE_DISTILLED=1 python inference.py
 `conf/config.yaml` 注释中供本地烟雾测试，不用它评估蒸馏收益。
 
 ### 从官方模型筛选 U/V 学生结构
+
+> 当前战略状态：冻结。只有完整 pruned_96 的 HIP、buffer interning、
+> stage-wise 分块、真实 fast-attention 和无损存储路线均到顶后，才允许
+> 重新设计零随机初始化学生；不得直接恢复旧 S96/A80 训练任务。
 
 `run_official_uv_screen.sh` 支持 `A, S96, B, E, C, D` 六个学生。
 `S96` 从已训练 Width-96 checkpoint 精确选择深度；`A` 从同一

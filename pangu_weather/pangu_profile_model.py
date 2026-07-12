@@ -40,6 +40,13 @@ def _env_int(name, default):
         return default
 
 
+def _module_stage(module_name):
+    for stage in ("layer1", "layer2", "layer3", "layer4"):
+        if module_name == stage or module_name.startswith(stage + "."):
+            return stage
+    return None
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
@@ -1114,7 +1121,12 @@ def _forward_chunked_earth_attention_3d(self, x, mask=None):
         if cache_bias:
             self._cached_earth_position_bias = earth_position_bias
 
-    chunk_size = max(1, int(getattr(self, "_pangu_attention_chunk_size", 3)))
+    configured_chunk_size = int(getattr(self, "_pangu_attention_chunk_size", 3))
+    chunk_size = (
+        BatchTimesWidthWindows
+        if configured_chunk_size <= 0
+        else max(1, configured_chunk_size)
+    )
     chunked_qkv = bool(getattr(self, "_pangu_chunked_qkv", False))
     chunked_proj = bool(getattr(self, "_pangu_chunked_proj", False))
     direct_mask_slice = bool(getattr(self, "_pangu_direct_mask_slice", False))
@@ -1226,17 +1238,26 @@ def enable_chunked_attention(
     chunked_qkv=False,
     chunked_proj=False,
     direct_mask_slice=False,
+    stage_options=None,
 ):
     """Patch model-local EarthAttention3D instances for memory A/B testing."""
 
     patched = 0
-    chunk_size = max(1, int(chunk_size))
-    for module in model.modules():
+    chunk_size = int(chunk_size)
+    stage_options = stage_options or {}
+    for module_name, module in model.named_modules():
         if module.__class__.__name__ == "EarthAttention3D":
-            module._pangu_attention_chunk_size = chunk_size
+            options = stage_options.get(_module_stage(module_name), {})
+            module._pangu_attention_chunk_size = int(
+                options.get("chunk_size", chunk_size)
+            )
             module._pangu_cache_earth_bias = bool(cache_earth_bias)
-            module._pangu_chunked_qkv = bool(chunked_qkv)
-            module._pangu_chunked_proj = bool(chunked_proj)
+            module._pangu_chunked_qkv = bool(
+                options.get("chunked_qkv", chunked_qkv)
+            )
+            module._pangu_chunked_proj = bool(
+                options.get("chunked_proj", chunked_proj)
+            )
             module._pangu_direct_mask_slice = bool(direct_mask_slice)
             module.forward = types.MethodType(_forward_chunked_earth_attention_3d, module)
             patched += 1
@@ -1259,6 +1280,54 @@ def compact_attention_masks(model):
         saved_bytes += old_bytes - module.attn_mask.numel() * module.attn_mask.element_size()
         compacted += 1
     return compacted, saved_bytes
+
+
+def intern_immutable_buffers(
+    model,
+    buffer_names=("attn_mask", "earth_position_index"),
+):
+    """Share storage only for byte-identical, read-only Pangu buffers.
+
+    Run this after ``model.to(device)``. PyTorch applies device conversion to
+    each registered buffer independently, so CPU-side aliasing would otherwise
+    be lost during the move to DCU.
+    """
+
+    canonical_by_metadata = {}
+    replaced = 0
+    saved_bytes = 0
+    shared_groups = set()
+    for module_name, module in model.named_modules():
+        for buffer_name in buffer_names:
+            buffer = module._buffers.get(buffer_name)
+            if not isinstance(buffer, torch.Tensor):
+                continue
+            metadata = (
+                buffer_name,
+                tuple(buffer.shape),
+                buffer.dtype,
+                buffer.device,
+            )
+            candidates = canonical_by_metadata.setdefault(metadata, [])
+            canonical = next(
+                (item for item in candidates if torch.equal(item[1], buffer)),
+                None,
+            )
+            if canonical is None:
+                candidates.append((module_name, buffer))
+                continue
+            canonical_name, canonical_buffer = canonical
+            if canonical_buffer.data_ptr() == buffer.data_ptr():
+                continue
+            module._buffers[buffer_name] = canonical_buffer
+            replaced += 1
+            saved_bytes += buffer.numel() * buffer.element_size()
+            shared_groups.add((buffer_name, canonical_name))
+    return {
+        "replaced": replaced,
+        "saved_bytes": saved_bytes,
+        "shared_groups": len(shared_groups),
+    }
 
 
 def _forward_chunked_mlp_block(self, x: torch.Tensor):
@@ -1343,7 +1412,8 @@ def _forward_chunked_mlp_block(self, x: torch.Tensor):
         x = shortcut + self.drop_path(x)
 
     # Chunked MLP computation to reduce peak dynamic activations VRAM
-    chunk_size = getattr(self, "_pangu_mlp_chunk_size", 32768)
+    configured_chunk_size = int(getattr(self, "_pangu_mlp_chunk_size", 32768))
+    chunk_size = NumTokens if configured_chunk_size <= 0 else configured_chunk_size
 
     if chunk_size >= NumTokens:
         x_mlp = self.mlp(self.norm2(x))
@@ -1360,13 +1430,22 @@ def _forward_chunked_mlp_block(self, x: torch.Tensor):
     return x
 
 
-def enable_chunked_mlp(model, chunk_size=32768, inplace_block=False):
+def enable_chunked_mlp(
+    model,
+    chunk_size=32768,
+    inplace_block=False,
+    stage_chunk_sizes=None,
+):
     """Patch model-local EarthTransformer3DBlock instances to save memory on MLP forward pass."""
     patched = 0
-    chunk_size = max(1, int(chunk_size))
-    for module in model.modules():
+    chunk_size = int(chunk_size)
+    stage_chunk_sizes = stage_chunk_sizes or {}
+    for module_name, module in model.named_modules():
         if module.__class__.__name__ == "EarthTransformer3DBlock":
-            module._pangu_mlp_chunk_size = chunk_size
+            stage = _module_stage(module_name)
+            module._pangu_mlp_chunk_size = int(
+                stage_chunk_sizes.get(stage, chunk_size)
+            )
             module._pangu_inplace_block = bool(inplace_block)
             module.forward = types.MethodType(_forward_chunked_mlp_block, module)
             patched += 1
@@ -1535,12 +1614,27 @@ def build_pangu_model(
     chunked_proj = _is_enabled("PANGU_CHUNKED_PROJ", default=chunked_qkv)
     direct_mask_slice = _is_enabled("PANGU_DIRECT_MASK_SLICE")
     if chunked_attention:
+        attention_stage_options = {}
+        for stage in ("layer1", "layer2", "layer3", "layer4"):
+            suffix = stage.upper()
+            attention_stage_options[stage] = {
+                "chunk_size": _env_int(
+                    f"PANGU_ATTN_CHUNK_SIZE_{suffix}", attention_chunk_size
+                ),
+                "chunked_qkv": _is_enabled(
+                    f"PANGU_CHUNKED_QKV_{suffix}", default=chunked_qkv
+                ),
+                "chunked_proj": _is_enabled(
+                    f"PANGU_CHUNKED_PROJ_{suffix}", default=chunked_proj
+                ),
+            }
         model._pangu_chunked_attention_count = enable_chunked_attention(
             model, chunk_size=attention_chunk_size,
             cache_earth_bias=cache_earth_bias,
             chunked_qkv=chunked_qkv,
             chunked_proj=chunked_proj,
             direct_mask_slice=direct_mask_slice,
+            stage_options=attention_stage_options,
         )
         if chunked_qkv or chunked_proj:
             print(
@@ -1561,9 +1655,15 @@ def build_pangu_model(
     inplace_block = _is_enabled("PANGU_INPLACE_BLOCK")
     if _is_enabled("PANGU_CHUNKED_MLP", default=True):
         mlp_chunk_size = _env_int("PANGU_MLP_CHUNK_SIZE", 32768)
+        mlp_stage_chunk_sizes = {
+            stage: _env_int(f"PANGU_MLP_CHUNK_SIZE_{stage.upper()}", mlp_chunk_size)
+            for stage in ("layer1", "layer2", "layer3", "layer4")
+        }
         model._pangu_chunked_mlp_count = enable_chunked_mlp(
-            model, chunk_size=mlp_chunk_size,
+            model,
+            chunk_size=mlp_chunk_size,
             inplace_block=inplace_block,
+            stage_chunk_sizes=mlp_stage_chunk_sizes,
         )
         print(f"🧠  PANGU_CHUNKED_MLP=1，chunk_size={mlp_chunk_size}，patched={model._pangu_chunked_mlp_count}")
         if inplace_block:
