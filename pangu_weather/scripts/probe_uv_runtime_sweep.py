@@ -42,10 +42,37 @@ COMPACT_MASK_GRID = {
     "PANGU_COMPACT_ATTN_MASK": ["1"],
 }
 
+DIRECT_MASK_GRID = {
+    "PANGU_DIRECT_MASK_SLICE": ["1"],
+}
+
+CUDA_GRAPH_GRID = {
+    "PANGU_DISABLE_CUDA_GRAPH": ["0"],
+    "PANGU_LAYERWISE_CUDA_GRAPH": ["1"],
+}
+
+CPU_RECOVERY_GRID = {
+    "PANGU_CPU_RECOVERY_OUTPUT": ["1"],
+}
+
 FULL_RECOVERY_GRID = {
     # Width 16 is emitted as the baseline. Larger chunks trade a small
     # temporary for fewer full-channel recovery GEMM launches.
     "PANGU_DIRECT_RECOVERY_WIDTH_CHUNK": ["24", "32", "48"],
+}
+
+PANGU_LITE_2D_ENV = {
+    # The 2D student has its own forward path. Disable optimizations that patch
+    # OneScience's 3D Pangu modules so the probe measures the architecture as-is.
+    "PANGU_MODEL_ARCHITECTURE": "PanguLite2DAttentionPosEmbed",
+    "PANGU_LAYERWISE_INFERENCE": "0",
+    "PANGU_DIRECT_RECOVERY": "0",
+    "PANGU_CHUNKED_ATTENTION": "0",
+    "PANGU_CHUNKED_QKV": "0",
+    "PANGU_CHUNKED_PROJ": "0",
+    "PANGU_CHUNKED_MLP": "0",
+    "PANGU_INPLACE_BLOCK": "0",
+    "PANGU_RESET_PEAK_AFTER_LOAD": "1",
 }
 
 BASE_ENV = {
@@ -73,6 +100,9 @@ BASE_ENV = {
     "PANGU_USE_ONNX": "0",
     "PANGU_PROFILE_MEMORY": "1",
     "PANGU_COMPACT_ATTN_MASK": "0",
+    "PANGU_DIRECT_MASK_SLICE": "0",
+    "PANGU_GRAPH_DIRECT_INPUT": "1",
+    "PANGU_CPU_RECOVERY_OUTPUT": "0",
 }
 
 FORBIDDEN_VALUES = {
@@ -84,6 +114,8 @@ FORBIDDEN_VALUES = {
 
 
 def candidate_label(env):
+    if env.get("PANGU_MODEL_ARCHITECTURE") == "PanguLite2DAttentionPosEmbed":
+        return f"pangu_lite_2d_pos288_reset{env.get('PANGU_RESET_PEAK_AFTER_LOAD', '0')}"
     return (
         f"w{env['PANGU_DIRECT_RECOVERY_WIDTH_CHUNK']}"
         f"_a{env['PANGU_ATTN_CHUNK_SIZE']}"
@@ -95,6 +127,10 @@ def candidate_label(env):
         f"_clear{env['PANGU_CLEAR_INPUT_REFS']}"
         f"_scored{env['PANGU_SCORED_ONLY_RECOVERY']}"
         f"_mask{env['PANGU_COMPACT_ATTN_MASK']}"
+        f"_directmask{env['PANGU_DIRECT_MASK_SLICE']}"
+        f"_graph{int(env['PANGU_DISABLE_CUDA_GRAPH'] == '0')}"
+        f"_graphinput{env['PANGU_GRAPH_DIRECT_INPUT']}"
+        f"_cpuout{env['PANGU_CPU_RECOVERY_OUTPUT']}"
         f"_reset{env.get('PANGU_RESET_PEAK_AFTER_LOAD', '0')}"
     )
 
@@ -110,6 +146,16 @@ def validate_env(env):
 
 
 def iter_candidates(preset="baseline"):
+    if preset == "pangu-lite-2d":
+        merged = dict(BASE_ENV)
+        merged.update(PANGU_LITE_2D_ENV)
+        validate_env(merged)
+        yield {
+            "label": candidate_label(merged),
+            "kind": "architecture",
+            "env": merged,
+        }
+        return
     if preset == "baseline":
         grid = BASELINE_GRID
         include_regression = False
@@ -120,6 +166,18 @@ def iter_candidates(preset="baseline"):
         include_reset_probe = False
     elif preset == "compact-mask":
         grid = COMPACT_MASK_GRID
+        include_regression = False
+        include_reset_probe = False
+    elif preset == "direct-mask":
+        grid = DIRECT_MASK_GRID
+        include_regression = False
+        include_reset_probe = False
+    elif preset == "cuda-graph":
+        grid = CUDA_GRAPH_GRID
+        include_regression = False
+        include_reset_probe = False
+    elif preset == "cpu-recovery":
+        grid = CPU_RECOVERY_GRID
         include_regression = False
         include_reset_probe = False
     elif preset == "full-recovery":
@@ -248,6 +306,20 @@ def run_one(candidate, *, args, pangu_dir, output_dir, baseline_dir):
     if args.fp16_checkpoint and "PANGU_FP16_CHECKPOINT" not in candidate["env"]:
         env["PANGU_FP16_CHECKPOINT"] = args.fp16_checkpoint
 
+    if env.get("PANGU_MODEL_ARCHITECTURE") == "PanguLite2DAttentionPosEmbed":
+        checkpoint = Path(env["PANGU_FP16_CHECKPOINT"])
+        if not checkpoint.is_absolute():
+            checkpoint = pangu_dir / "data" / "checkpoints" / checkpoint
+        if not checkpoint.is_file():
+            return {
+                "label": candidate["label"],
+                "kind": candidate["kind"],
+                "env": candidate["env"],
+                "returncode": 2,
+                "error": f"2D architecture checkpoint not found: {checkpoint}",
+                "stdout_tail": "Refusing to fall back to the official 3D teacher.",
+            }
+
     latency_runs_ms = []
     steady_latency_runs_ms = []
     parsed_runs = []
@@ -303,6 +375,13 @@ def run_one(candidate, *, args, pangu_dir, output_dir, baseline_dir):
         "steady_latency_p50_ms": (
             float(np.median(steady_latency_runs_ms)) if steady_latency_runs_ms else None
         ),
+        "steady_latency_p90_ms": (
+            float(np.percentile(steady_latency_runs_ms, 90))
+            if steady_latency_runs_ms else None
+        ),
+        "steady_latency_std_ms": (
+            float(np.std(steady_latency_runs_ms)) if steady_latency_runs_ms else None
+        ),
         "max_vram_mb": max(max_values) if max_values else None,
         "reserved_mb": max(reserved_values) if reserved_values else None,
         "current_vram_mb": current_values[-1] if current_values else None,
@@ -337,18 +416,26 @@ def main():
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument(
         "--preset",
-        choices=["baseline", "compact-mask", "full-recovery", "focused", "full"],
+        choices=[
+            "baseline", "compact-mask", "direct-mask", "cuda-graph", "cpu-recovery",
+            "full-recovery", "focused", "full", "pangu-lite-2d",
+        ],
         default="baseline",
         help=(
             "baseline measures only the fixed defaults; compact-mask runs an "
-            "isolated off/on A/B; full-recovery sweeps only direct-recovery "
-            "width; focused sweeps attention chunk size; full is the broad "
+            "isolated off/on A/B; direct-mask removes mask index kernels; "
+            "cuda-graph isolates graph replay; full-recovery sweeps only direct-recovery "
+            "width; pangu-lite-2d measures the 2D positional-embedding student; "
+            "focused sweeps attention chunk size; full is the broad "
             "diagnostic grid."
         ),
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-output-compare", action="store_true")
     args = parser.parse_args()
+
+    if args.preset == "pangu-lite-2d" and args.fp16_checkpoint is None:
+        args.fp16_checkpoint = "model_pangu_lite_2d_pos288_hybrid.pth"
 
     pangu_dir = Path(__file__).resolve().parents[1]
     log_path = make_log_path(args.log_file)
@@ -357,6 +444,10 @@ def main():
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     candidates = list(iter_candidates(args.preset))
+    if args.preset == "pangu-lite-2d":
+        for candidate in candidates:
+            candidate["env"] = dict(candidate["env"])
+            candidate["env"]["PANGU_FP16_CHECKPOINT"] = args.fp16_checkpoint
     if args.candidate_fp16_checkpoint:
         candidates = checkpoint_ab_candidates(
             candidates,

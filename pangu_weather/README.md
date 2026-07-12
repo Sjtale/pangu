@@ -72,6 +72,93 @@ PANGU_FP16_CHECKPOINT=model_fp16_compact.pth python inference.py
 python result.py
 ```
 
+### 无损别名去重与 U/V 隔离验收
+
+如果先不改结构、不做蒸馏，可对当前完整 `pgw_lite_pruned_96`
+一次性执行存储、CPU 加载、官方计时边界、常驻/峰值显存和逐阶段
+耗时归因：
+
+```bash
+PANGU_DIAG_CHECKPOINT=model_fp16.pth \
+  bash scripts/run_pruned96_uv_diagnosis.sh all
+```
+
+该入口会拒绝 A80、浅层 S96 或其他非 `[2,6,6,2]` 深度的 checkpoint，
+并生成 `logs/pruned96_uv_bottleneck_report.md`。逐阶段计时会在每个阶段后同步
+DCU，只用于归因；V 仍以未插桩的 `inference.py` 官方计时边界为准，
+U 仍以平台结果为准。
+
+先审计并生成只保留 OneFuser 最终写入者的 checkpoint：
+
+```bash
+python scripts/compact_fuser_alias_checkpoint.py \
+  --source data/checkpoints/model_fp16.pth \
+  --output data/checkpoints/model_fp16_alias_compact.pth
+```
+
+脚本会输出源文件和候选文件的 SHA256，并在原子替换前校验所有保留
+tensor 的键顺序、shape、dtype 和数值。不要在候选包中同时放入原 checkpoint。
+
+直接 mask slice 和 CUDA/HIP Graph 必须分别做严格 off/on A/B：
+
+```bash
+python scripts/probe_uv_runtime_sweep.py --preset direct-mask --repeat 5
+python scripts/probe_uv_runtime_sweep.py --preset cuda-graph --repeat 5
+python scripts/rank_uv_candidates.py logs/uv_runtime_sweep_<timestamp>.jsonl
+```
+
+记录包含稳态延迟的均值、P50、P90、标准差，以及 allocated/reserved/
+peak 显存和输出误差。Graph 只在延迟至少降低 6%、显存增量不超过
+10 MiB 且输出完全一致时晋级；direct-mask 只在延迟至少降低 3% 且
+输出完全一致时晋级。两个开关均默认关闭，不影响已验证提交包。
+
+Graph 路径默认使用 `PANGU_GRAPH_DIRECT_INPUT=1`：Graph 捕获直接接管
+example input，推理数据在计时前直接写入 Graph 固定输入。这避免捕获
+和 replay 时各额外保留一整套约 150 MiB 的 GPU 输入。如需回归旧 Graph
+输入路径，显式设置 `PANGU_GRAPH_DIRECT_INPUT=0`。
+
+### 计时前无损解压 checkpoint
+
+可对 alias-compacted checkpoint 再做 gzip 无损压缩。`inference.py` 会在官方
+计时前直接在 CPU 内存中恢复，不生成解压后的磁盘权重：
+
+```bash
+python scripts/compress_checkpoint_gzip.py \
+  --source data/checkpoints/model_fp16_alias_compact.pth \
+  --output data/checkpoints/model_fp16_alias_compact.pth.gz
+PANGU_CHECKPOINT=model_fp16_alias_compact.pth.gz python inference.py
+```
+
+脚本会验证解压后 SHA256 与源文件完全一致。提交前必须确认平台
+按磁盘上的 gzip 字节数计 U，并复核 U/V/W。
+
+### Groupwise INT4 存储、FP16 运行
+
+如果无损 gzip 收益不足，可将当前 INT8 Linear 权重以 groupwise INT4
+存储，并在计时前恢复为 FP16 模型：
+
+```bash
+python scripts/pack_groupwise_int4.py \
+  --source data/checkpoints/model_fp16_alias_compact.pth \
+  --output data/checkpoints/model_int4_group64.pth \
+  --group-size 64
+PANGU_CHECKPOINT=model_int4_group64.pth python inference.py
+python result.py
+```
+
+该方案不改变 timed forward 的计算 dtype，但 INT4 重量化不是无损的。候选
+必须先检查 15 个评分通道，再根据平台 `ΔU+ΔW` 决定是否晋级。
+
+### Recovery 直接流式写入 CPU
+
+`PANGU_CPU_RECOVERY_OUTPUT=1` 使宽度 chunk 恢复结果直接写入 pinned CPU
+输出，避免在 GPU 上构造完整约 143 MiB 的 69 通道输出。该拷贝发生在
+timed forward 内，必须做 U/V A/B：
+
+```bash
+python scripts/probe_uv_runtime_sweep.py --preset cpu-recovery --repeat 5
+```
+
 ## 结构化剪枝
 
 服务器上官方 FP32 权重保存在 `./pangu_backups/model_bak.pth`，不放入
@@ -126,6 +213,58 @@ PANGU_USE_DISTILLED=1 python inference.py
 验证集。由于每个训练样本都增加一次 Teacher 前向，每个 epoch 默认随机使用
 最多 2048 个样本，通过多轮 shuffle 覆盖六年数据。`ERA5_test` 配置仅保留在
 `conf/config.yaml` 注释中供本地烟雾测试，不用它评估蒸馏收益。
+
+### 从官方模型筛选 U/V 学生结构
+
+`run_official_uv_screen.sh` 支持 `A, S96, B, E, C, D` 六个学生。
+`S96` 从已训练 Width-96 checkpoint 精确选择深度；`A` 从同一
+Width-96 checkpoint 做全局一致的通道、完整 attention head 和深度剪枝。
+其他边界候选仍从官方 192 维 `model_bak.pth` 初始化。`S96` 是
+patch `[2,8,8]`、width 96、heads `[3,6,6,3]`、depth `[1,2,2,1]`；
+`A` 是同 patch/depth 的 width-80 候选。两者都要求未量化的
+`model_pgw_lite_pruned_96_fp16.pth` 作为结构初始化源。
+
+```bash
+# 1. 生成未训练 FP16 结构权重
+bash scripts/run_official_uv_screen.sh A prepare
+
+# S96-Shallow 使用同一流程
+bash scripts/run_official_uv_screen.sh S96 prepare
+bash scripts/run_official_uv_screen.sh S96 probe
+bash scripts/run_official_uv_screen.sh S96 train
+
+# 2. 与当前提交基线做 5×4 批次 U/V A/B（至少15个稳态时间点）
+bash scripts/run_official_uv_screen.sh A probe
+
+# 3. 仅当显存下降≥15%、延迟下降≥8%或预估 ΔU+ΔV≥0.6 时执行
+bash scripts/run_official_uv_screen.sh A train
+
+# 可选第三个参数指定完整训练 epoch 数；修复前的 checkpoint 使用新前缀重训
+PANGU_UV_SCREEN_PREFIX=uv_screen_a_lrfixed \
+  bash scripts/run_official_uv_screen.sh A train 8
+
+# 训练完成后做无损 OneFuser 别名去重，再对最终权重做 U/V 对比
+PANGU_UV_SCREEN_PREFIX=uv_screen_a_pgw96 \
+  bash scripts/run_official_uv_screen.sh A pack
+PANGU_UV_SCREEN_PREFIX=uv_screen_a_pgw96 \
+  bash scripts/run_official_uv_screen.sh A probe-packed
+```
+
+`train` 默认运行 1 epoch，也可通过第三个正整数参数指定多个
+epoch；每个 epoch 固定 2048 steps。Warmup 只在完整协议的前 256 steps
+执行一次，cosine 调度跨越全部 `epochs × 2048` steps，不在 epoch 边界
+重启。训练使用
+`0.45 RMSE + 0.20 ACC + 0.25 评分通道教师 + 0.10 非评分通道教师`，
+并明确关闭 hint loss、量化投影和架构升级。训练每 256 个优化 step
+原子更新 `${prefix}_latest.pth`；作业中断后重新执行同一 `train` 命令会恢复
+模型、优化器和 scheduler，并补足当前 epoch 剩余的 step。Fresh run
+拒绝覆盖任何同前缀产物；有 latest checkpoint 的 resume 可在验证改善时
+原子更新 `${prefix}_train.pth` / `${prefix}_fp16.pth`。Checkpoint 会核对 profile、
+epoch/step 计划、warmup、学习率和 loss 权重；修复前无此元数据的候选不允许续训。
+
+年份分块采样仅保留为显式 I/O 诊断开关，正式架构筛选入口不强制启用。
+日志中 `rolling20` 是最近 20 步真实耗时，
+`data_wait` 是其中等待 DataLoader 的时间，`cumulative` 仅供长程参考。
 
 ## 集群训练，提前查看slurm作业提交方式和相关指令
 ```bash

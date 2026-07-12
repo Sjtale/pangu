@@ -10,6 +10,8 @@ Run from ``pangu_weather`` after activating the competition environment:
 """
 
 import argparse
+import hashlib
+import itertools
 import os
 from collections import OrderedDict
 
@@ -19,6 +21,14 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pangu_profile_model import build_pangu_model
 from onescience.utils.YParams import YParams
+
+
+S96_PROFILE = "uv_s96_patch8_w96_shallow"
+S96_SOURCE_PATCH_SIZE = [2, 8, 8]
+S96_SOURCE_EMBED_DIM = 96
+S96_SOURCE_NUM_HEADS = [3, 6, 6, 3]
+S96_SOURCE_DEPTHS = [2, 6, 6, 2]
+S96_TARGET_DEPTHS = [1, 2, 2, 1]
 
 
 def _index(values, dim, indices):
@@ -231,6 +241,51 @@ def _migrate_tensor(
     )
 
 
+def get_depth_block_map(source_depths, target_depths):
+    """Select type-compatible entrance/exit blocks for depth pruning."""
+
+    if len(source_depths) != len(target_depths):
+        raise ValueError("source_depths and target_depths must have equal length")
+    block_map = []
+    for source_depth, target_depth in zip(source_depths, target_depths):
+        source_depth = int(source_depth)
+        target_depth = int(target_depth)
+        if source_depth <= 0 or target_depth <= 0 or target_depth > source_depth:
+            raise ValueError(
+                f"Invalid depth reduction: {source_depth} -> {target_depth}"
+            )
+        if target_depth == source_depth:
+            selected = list(range(source_depth))
+        elif target_depth == 1:
+            # Target block zero is always the non-shifted variant.
+            selected = [0]
+        else:
+            step = (source_depth - 1) / (target_depth - 1)
+            ideals = [index * step for index in range(target_depth)]
+            candidates = [
+                list(candidate)
+                for candidate in itertools.combinations(range(source_depth), target_depth)
+                if all(
+                    (target % 2) == (source % 2)
+                    for target, source in enumerate(candidate)
+                )
+            ]
+            if not candidates:
+                raise ValueError(
+                    "No shift-compatible depth selection exists for "
+                    f"{source_depth} -> {target_depth}"
+                )
+            selected = min(
+                candidates,
+                key=lambda candidate: sum(
+                    (source - ideal) ** 2
+                    for source, ideal in zip(candidate, ideals)
+                ),
+            )
+        block_map.append(selected)
+    return block_map
+
+
 def get_source_key_for_target(key, source_depths, target_depths):
     if ".blocks." not in key:
         return key
@@ -255,25 +310,134 @@ def get_source_key_for_target(key, source_depths, target_depths):
     
     # layer name to index: "layer1" -> 0, "layer2" -> 1, etc.
     layer_idx = int(layer_name[-1]) - 1
-    s_depth = source_depths[layer_idx]
-    t_depth = target_depths[layer_idx]
-    
-    # Map t to s
-    if t_depth == s_depth:
-        s = t
-    elif t_depth == 1:
-        s = s_depth // 2
-    else:
-        step = (s_depth - 1) / (t_depth - 1)
-        s = round(t * step)
+    block_map = get_depth_block_map(source_depths, target_depths)
+    s = block_map[layer_idx][t]
         
     parts[blocks_idx + 1] = str(s)
     return ".".join(parts)
 
 
+def _state_depths(state):
+    depths = []
+    for layer_index in range(1, 5):
+        prefix = f"layer{layer_index}."
+        block_indices = {
+            int(key.split(".blocks.", 1)[1].split(".", 1)[0])
+            for key in state
+            if key.startswith(prefix) and ".blocks." in key
+        }
+        if not block_indices:
+            raise ValueError(f"Source checkpoint has no blocks for layer{layer_index}")
+        expected = set(range(max(block_indices) + 1))
+        if block_indices != expected:
+            raise ValueError(
+                f"Source layer{layer_index} block indices are not contiguous: "
+                f"{sorted(block_indices)}"
+            )
+        depths.append(len(block_indices))
+    return depths
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_s96_source(checkpoint, source_state, cfg):
+    if any(
+        str(key).endswith("_scale")
+        or (isinstance(value, torch.Tensor) and value.dtype == torch.int8)
+        for key, value in source_state.items()
+    ):
+        raise ValueError("S96 initialization source must be unquantized FP16 weights")
+
+    profile = checkpoint.get("model_profile")
+    if profile is not None:
+        actual = {
+            "patch_size": [int(value) for value in profile.get("patch_size", [])],
+            "embed_dim": int(profile.get("embed_dim", -1)),
+            "num_heads": [int(value) for value in profile.get("num_heads", [])],
+            "depth_blocks": [
+                int(value)
+                for value in profile.get("depth_blocks", S96_SOURCE_DEPTHS)
+            ],
+        }
+        expected = {
+            "patch_size": S96_SOURCE_PATCH_SIZE,
+            "embed_dim": S96_SOURCE_EMBED_DIM,
+            "num_heads": S96_SOURCE_NUM_HEADS,
+            "depth_blocks": S96_SOURCE_DEPTHS,
+        }
+        if actual != expected:
+            raise ValueError(
+                f"S96 source model_profile mismatch: actual={actual}, expected={expected}"
+            )
+
+    actual_depths = _state_depths(source_state)
+    if actual_depths != S96_SOURCE_DEPTHS:
+        raise ValueError(
+            f"S96 source depth mismatch: {actual_depths} != {S96_SOURCE_DEPTHS}"
+        )
+
+    expected_source = build_pangu_model(
+        img_size=cfg.img_size if hasattr(cfg, "img_size") else (721, 1440),
+        patch_size=S96_SOURCE_PATCH_SIZE,
+        embed_dim=S96_SOURCE_EMBED_DIM,
+        num_heads=S96_SOURCE_NUM_HEADS,
+        window_size=cfg.window_size,
+    ).state_dict()
+    missing = sorted(set(expected_source) - set(source_state))
+    mismatched = sorted(
+        key
+        for key, expected_tensor in expected_source.items()
+        if key in source_state
+        and tuple(source_state[key].shape) != tuple(expected_tensor.shape)
+    )
+    if missing or mismatched:
+        raise ValueError(
+            "S96 source structure mismatch: "
+            f"missing={missing[:5]}, shape_mismatch={mismatched[:5]}"
+        )
+
+
+def _exact_s96_depth_state(source_state, target_state):
+    block_map = get_depth_block_map(S96_SOURCE_DEPTHS, S96_TARGET_DEPTHS)
+    expected_map = [[0], [0, 5], [0, 5], [0]]
+    if block_map != expected_map:
+        raise AssertionError(f"Unexpected S96 depth map: {block_map}")
+
+    migrated = OrderedDict()
+    source_keys = {}
+    for target_key, target_tensor in target_state.items():
+        source_key = get_source_key_for_target(
+            target_key, S96_SOURCE_DEPTHS, S96_TARGET_DEPTHS
+        )
+        if source_key not in source_state:
+            raise KeyError(f"S96 source is missing {source_key} for {target_key}")
+        source_tensor = source_state[source_key]
+        if tuple(source_tensor.shape) != tuple(target_tensor.shape):
+            raise ValueError(
+                f"S96 exact-load shape mismatch for {target_key}: "
+                f"source {source_key} {tuple(source_tensor.shape)} != "
+                f"target {tuple(target_tensor.shape)}"
+            )
+        migrated[target_key] = source_tensor
+        source_keys[target_key] = source_key
+    if len(migrated) != len(target_state):
+        raise AssertionError("S96 exact initialization did not cover every target tensor")
+    return migrated, source_keys, block_map
+
+
 def prune_checkpoint(args):
     cfg = YParams(args.config, "model")
     source_path = args.source
+    if not os.path.exists(source_path) and args.strict_exact_depth:
+        raise FileNotFoundError(
+            f"Strict S96 initialization source not found: {source_path}"
+        )
     if not os.path.exists(source_path):
         backup_path = os.path.join(cfg.official_checkpoint_dir, "model_bak.pth")
         if not os.path.exists(backup_path):
@@ -284,10 +448,21 @@ def prune_checkpoint(args):
         print(f"FP16 source not found; use official FP32 backup: {source_path}")
     checkpoint = torch.load(source_path, map_location="cpu", weights_only=False)
     source_state = checkpoint["model_state_dict"]
+    if args.require_unquantized_source and any(
+        str(key).endswith("_scale")
+        or (isinstance(value, torch.Tensor) and value.dtype == torch.int8)
+        for key, value in source_state.items()
+    ):
+        raise ValueError("Structured initialization source must be unquantized weights")
 
-    # Inferred source parameters from model_profile metadata if available
+    # Infer normal pruning sources from metadata. Strict S96 is fixed and then
+    # independently audited against a full expected state dict below.
     profile = checkpoint.get("model_profile", None)
-    if profile is not None:
+    if args.strict_exact_depth:
+        source_width = S96_SOURCE_EMBED_DIM
+        source_heads = tuple(S96_SOURCE_NUM_HEADS)
+        patch_size = list(S96_SOURCE_PATCH_SIZE)
+    elif profile is not None:
         source_width = int(profile.get("embed_dim", cfg.embed_dim))
         source_heads = tuple(int(value) for value in profile.get("num_heads", cfg.num_heads))
         patch_size = list(profile.get("patch_size", cfg.patch_size))
@@ -350,49 +525,90 @@ def prune_checkpoint(args):
         depth_blocks=target_depth_blocks,
     )
     target_state = target_model.state_dict()
-    residual = _residual_indices(source_state, source_width, target_width)
-    attention_heads = _attention_heads(
-        source_state, source_width, target_width, source_heads
-    )
-    mlp_hidden = _mlp_indices(source_state, source_width, target_width)
-
-    migrated = OrderedDict()
-    for key, target_tensor in target_state.items():
-        source_key = get_source_key_for_target(key, source_depths, target_depths)
-        if source_key not in source_state:
-            raise KeyError(f"Source checkpoint is missing {source_key} for target {key}")
-        tensor = _migrate_tensor(
-            source_key,
-            source_state[source_key],
-            target_tensor,
-            residual,
-            attention_heads,
-            mlp_hidden,
-            source_width,
-            source_heads,
-        )
-        if tuple(tensor.shape) != tuple(target_tensor.shape):
+    if args.strict_exact_depth:
+        if args.target_profile != S96_PROFILE:
             raise ValueError(
-                f"Shape mismatch for {key}: got {tuple(tensor.shape)}, "
-                f"expected {tuple(target_tensor.shape)}"
+                f"--strict-exact-depth only supports --target-profile {S96_PROFILE}"
             )
-        migrated[key] = tensor
+        if (
+            patch_size != S96_SOURCE_PATCH_SIZE
+            or source_width != S96_SOURCE_EMBED_DIM
+            or list(source_heads) != S96_SOURCE_NUM_HEADS
+            or target_depths != S96_TARGET_DEPTHS
+        ):
+            raise ValueError("Strict S96 initialization received an incompatible profile")
+        _validate_s96_source(checkpoint, source_state, cfg)
+        migrated, source_keys, block_map = _exact_s96_depth_state(
+            source_state, target_state
+        )
+        residual = {
+            "shallow": torch.arange(source_width),
+            "deep": torch.arange(source_width * 2),
+        }
+    else:
+        residual = _residual_indices(source_state, source_width, target_width)
+        attention_heads = _attention_heads(
+            source_state, source_width, target_width, source_heads
+        )
+        mlp_hidden = _mlp_indices(source_state, source_width, target_width)
+
+        migrated = OrderedDict()
+        for key, target_tensor in target_state.items():
+            source_key = get_source_key_for_target(key, source_depths, target_depths)
+            if source_key not in source_state:
+                raise KeyError(f"Source checkpoint is missing {source_key} for target {key}")
+            tensor = _migrate_tensor(
+                source_key,
+                source_state[source_key],
+                target_tensor,
+                residual,
+                attention_heads,
+                mlp_hidden,
+                source_width,
+                source_heads,
+            )
+            if tuple(tensor.shape) != tuple(target_tensor.shape):
+                raise ValueError(
+                    f"Shape mismatch for {key}: got {tuple(tensor.shape)}, "
+                    f"expected {tuple(target_tensor.shape)}"
+                )
+            migrated[key] = tensor
 
     target_model.load_state_dict(migrated, strict=True)
     if args.dtype == "fp16":
         target_model.half()
     output_state = target_model.state_dict()
     metadata = {
-        "method": "structured_head_width_pruning",
+        "method": (
+            "pgw_lite_width96_exact_depth_selection"
+            if args.strict_exact_depth
+            else "structured_head_width_pruning"
+        ),
         "source_embed_dim": source_width,
         "target_embed_dim": target_width,
         "source_num_heads": source_heads,
         "target_num_heads": target_heads,
         "shallow_channels": residual["shallow"].tolist(),
         "deep_channels": residual["deep"].tolist(),
+        "source_file": os.path.basename(source_path),
+        "source_sha256": _sha256(source_path),
     }
     if target_depth_blocks is not None:
         metadata["target_depth_blocks"] = target_depth_blocks
+    if args.strict_exact_depth:
+        metadata.update(
+            {
+                "source_file": os.path.basename(source_path),
+                "source_sha256": _sha256(source_path),
+                "source_depth_blocks": S96_SOURCE_DEPTHS,
+                "block_map": block_map,
+                "loaded_tensors": len(migrated),
+                "target_tensors": len(target_state),
+                "interpolated_tensors": 0,
+                "resized_tensors": 0,
+                "source_key_map": source_keys,
+            }
+        )
         
     model_profile = {
         "name": args.target_profile if args.target_profile else (f"pgw_lite_pruned_{target_width}" if patch_size == [2, 8, 8] else f"student_{target_width}"),
@@ -436,6 +652,16 @@ def parse_args():
     parser.add_argument("--target-embed-dim", type=int, default=160)
     parser.add_argument("--target-profile", default=None)
     parser.add_argument("--dtype", choices=("fp16", "fp32"), default="fp16")
+    parser.add_argument(
+        "--strict-exact-depth",
+        action="store_true",
+        help="Require exact Width-96 S96 depth selection without fallback or resizing",
+    )
+    parser.add_argument(
+        "--require-unquantized-source",
+        action="store_true",
+        help="Reject INT8 tensors and quantization-scale keys in the source",
+    )
     return parser.parse_args()
 
 

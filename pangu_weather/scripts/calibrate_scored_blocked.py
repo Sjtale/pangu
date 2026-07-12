@@ -58,6 +58,44 @@ def _parse_args():
     return parser.parse_args()
 
 
+def _climatology_from_means(
+    means: np.ndarray, channel_indices: list[int], prediction_shape: tuple[int, ...]
+) -> np.ndarray:
+    """Select channel means and expand scalar per-channel means to the output grid."""
+    means = np.asarray(means)
+    if means.ndim == 4 and means.shape[0] == 1:
+        channel_means = means[0, channel_indices]
+    elif means.ndim in (1, 2, 3) and means.shape[0] > max(channel_indices):
+        channel_means = means[channel_indices]
+    elif means.ndim == 2 and means.shape[0] == 1:
+        channel_means = means[0, channel_indices]
+    else:
+        raise ValueError(
+            "Unsupported global_means.npy shape "
+            f"{means.shape}; expected [C], [1,C], [C,H,W], or [1,C,H,W]"
+        )
+
+    channel_means = np.asarray(channel_means).squeeze()
+    channels, height, width = prediction_shape
+    if channel_means.ndim == 1:
+        climatology = np.broadcast_to(
+            channel_means[:, None, None], (channels, height, width)
+        ).copy()
+    elif channel_means.ndim == 3:
+        climatology = channel_means
+    else:
+        raise ValueError(
+            "global_means.npy must yield [channel] or [channel, height, width] "
+            f"after selecting channels; got {channel_means.shape} from {means.shape}"
+        )
+    if climatology.shape != prediction_shape:
+        raise ValueError(
+            "Climatology/prediction spatial shape mismatch: "
+            f"{climatology.shape} != {prediction_shape}"
+        )
+    return climatology
+
+
 def _load_data(config_path: str, predictions_dir: Path):
     import h5py
     from onescience.utils.YParams import YParams
@@ -83,9 +121,19 @@ def _load_data(config_path: str, predictions_dir: Path):
         for path in sorted(glob.glob(pattern)):
             truth_paths[Path(path).stem] = Path(path)
 
-    filenames = sorted(path for path in predictions_dir.glob("*.npy") if path.stem in truth_paths)
+    prediction_paths = sorted(predictions_dir.glob("*.npy"))
+    filenames = sorted(path for path in prediction_paths if path.stem in truth_paths)
     if len(filenames) < 2:
-        raise RuntimeError("Need at least two prediction files matched to truth HDF5 files")
+        prediction_preview = ", ".join(path.stem for path in prediction_paths[:5]) or "(none)"
+        truth_preview = ", ".join(sorted(truth_paths)[:5]) or "(none)"
+        raise RuntimeError(
+            "Need at least two prediction files matched to truth HDF5 files. "
+            f"Configured test years: {list(dataset.test_ratio)}; "
+            f"found {len(prediction_paths)} prediction files and {len(truth_paths)} truth files. "
+            f"Prediction stems: {prediction_preview}; truth stems: {truth_preview}. "
+            "Regenerate predictions with this config, or pass --config for the config "
+            "that produced the selected output directory."
+        )
 
     predictions = []
     targets = []
@@ -101,7 +149,7 @@ def _load_data(config_path: str, predictions_dir: Path):
         targets.append(target)
 
     means = np.load(Path(dataset.stats_dir) / "global_means.npy")
-    climatology = np.asarray(means[0, channel_indices])
+    climatology = _climatology_from_means(means, channel_indices, predictions[0].shape)
     return filenames, channels, np.stack(predictions), np.stack(targets), climatology
 
 

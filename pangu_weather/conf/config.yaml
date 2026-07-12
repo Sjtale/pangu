@@ -6,6 +6,13 @@ model:
     num_heads: [6, 12, 12, 6]
     window_size: [2, 6, 12]
     student_profiles:
+      pangu_lite_2d_pos288:
+        architecture: PanguLite2DAttentionPosEmbed
+        patch_size: [8, 8]
+        embed_dim: 288
+        num_heads: [6, 12, 12, 6]
+        depth_blocks: [2, 6, 6, 2]
+        window_size: [6, 12]
       full_192:
         patch_size: [2, 4, 4]
         embed_dim: 192
@@ -44,6 +51,37 @@ model:
         patch_size: [2, 8, 8]
         embed_dim: 64
         num_heads: [2, 4, 4, 2]
+      uv_a_patch8_w80_shallow:
+        patch_size: [2, 8, 8]
+        embed_dim: 80
+        num_heads: [5, 10, 10, 5]
+        depth_blocks: [1, 2, 2, 1]
+      uv_s96_patch8_w96_shallow:
+        patch_size: [2, 8, 8]
+        embed_dim: 96
+        num_heads: [3, 6, 6, 3]
+        depth_blocks: [1, 2, 2, 1]
+        window_size: [2, 6, 12]
+      uv_b_patch8_w64_shallow:
+        patch_size: [2, 8, 8]
+        embed_dim: 64
+        num_heads: [4, 8, 8, 4]
+        depth_blocks: [1, 2, 2, 1]
+      uv_e_patch8_w80_ultrashallow:
+        patch_size: [2, 8, 8]
+        embed_dim: 80
+        num_heads: [5, 10, 10, 5]
+        depth_blocks: [1, 1, 1, 1]
+      uv_c_patch12_w80_shallow:
+        patch_size: [2, 12, 12]
+        embed_dim: 80
+        num_heads: [5, 10, 10, 5]
+        depth_blocks: [1, 2, 2, 1]
+      uv_d_patch16_w80_shallow:
+        patch_size: [2, 16, 16]
+        embed_dim: 80
+        num_heads: [5, 10, 10, 5]
+        depth_blocks: [1, 2, 2, 1]
     pruned_embed_dim: 160
     pruned_num_heads: [5, 10, 10, 5]
     pruned_checkpoint: "model_pruned_fp16.pth"
@@ -180,7 +218,7 @@ datapipe:
   dataloader:
     mask_dtype: "float32"
     batch_size: 1                     # AI4S，批处理大小推理阶段不可更改
-    num_workers: 4 
+    num_workers: 12
     pin_memory: true 
     drop_last: true
     shuffle: false  # 使用sampler时设为false

@@ -93,6 +93,15 @@ class CompactFuserAliasTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Final alias writer"):
             MODULE.plan_alias_compaction(reversed_state)
 
+    def test_sha256_file_is_stable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "payload.bin"
+            path.write_bytes(b"pangu-alias-candidate")
+            self.assertEqual(
+                MODULE.sha256_file(path),
+                "f1f775c45e334d98de78294f1a0610b290f29b51da79d715366f19a65ca9808d",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

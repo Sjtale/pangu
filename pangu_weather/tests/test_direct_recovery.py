@@ -115,6 +115,22 @@ class DirectRecoveryTests(unittest.TestCase):
         self.assertEqual(tuple(actual.shape), tuple(expected.shape))
         self.assertLessEqual((actual - expected).abs().max().item(), 1e-6)
 
+    def test_direct_recovery_can_stream_output_to_cpu(self):
+        torch.manual_seed(19)
+        recovery = TinyPanguPatchRecovery(
+            img_size=(3, 5, 7),
+            patch_size=(2, 3, 2),
+            in_chans=3,
+            out_chans=4,
+        )
+        x = torch.randn(1, 3, 2, 2, 4)
+        expected = recovery(x)
+        actual = pangu_profile_model._direct_patch_recovery(
+            recovery, x, width_chunk_size=1, output_to_cpu=True
+        )
+        self.assertEqual(actual.device.type, "cpu")
+        self.assertTrue(torch.equal(actual, expected))
+
     def test_scored_only_recovery_matches_subset_channels(self):
         torch.manual_seed(42)
         recovery = TinyPanguPatchRecovery(

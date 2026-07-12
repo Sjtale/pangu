@@ -8,6 +8,8 @@ from tqdm import tqdm
 import time
 import json
 import gc
+import gzip
+import io
 from onescience.utils.YParams import YParams
 from onescience.datapipes.climate import ERA5Datapipe
 from pangu_profile_model import build_pangu_model, enable_streamed_weight_residency
@@ -22,6 +24,7 @@ from calibration_utils import (
 # pass environment variables. Keep these overrideable for server A/B tests.
 os.environ.setdefault("PANGU_AUTO_SCAN_CHECKPOINT", "0")
 os.environ.setdefault("PANGU_DISABLE_CUDA_GRAPH", "1")
+os.environ.setdefault("PANGU_LAYERWISE_CUDA_GRAPH", "0")
 os.environ.setdefault("PANGU_LAYERWISE_INFERENCE", "1")
 os.environ.setdefault("PANGU_RECOMPUTE_SKIP", "0")
 os.environ.setdefault("PANGU_DIRECT_RECOVERY", "1")
@@ -41,6 +44,9 @@ os.environ.setdefault("PANGU_CACHE_EARTH_BIAS", "0")
 os.environ.setdefault("PANGU_INPLACE_BLOCK", "1")
 os.environ.setdefault("PANGU_CLEAR_INPUT_REFS", "1")
 os.environ.setdefault("PANGU_COMPACT_ATTN_MASK", "0")
+os.environ.setdefault("PANGU_DIRECT_MASK_SLICE", "0")
+os.environ.setdefault("PANGU_GRAPH_DIRECT_INPUT", "1")
+os.environ.setdefault("PANGU_CPU_RECOVERY_OUTPUT", "0")
 
 
 
@@ -95,34 +101,75 @@ class CUDAGraphWrapper:
     def __init__(self, model, example_input, warmup_iters=1):
         self.model = model
         if isinstance(example_input, (tuple, list)):
-            self.static_input = tuple(torch.empty_like(t) for t in example_input)
+            # Take ownership of the caller's example buffers. Allocating another
+            # full input here duplicates roughly 150 MiB during graph capture.
+            self.static_input = tuple(example_input)
         else:
-            self.static_input = torch.empty_like(example_input)
+            self.static_input = example_input
 
         # 初始化发生在主推理的 inference_mode 之外，因此必须在这里
         # 显式禁用 autograd，否则 warmup 会保留整个 Pangu 前向图。
-        with torch.inference_mode():
+        self.input_signature = self._signature(self.static_input)
+        current_stream = torch.cuda.current_stream()
+        self.capture_stream = torch.cuda.Stream()
+        self.capture_stream.wait_stream(current_stream)
+        memory_before = torch.cuda.memory_allocated()
+        reserved_before = torch.cuda.memory_reserved()
+
+        with torch.inference_mode(), torch.cuda.stream(self.capture_stream):
             # Warmup: 让 caching allocator 稳定，确保后续捕获时内存地址不变
             warmup_output = None
             for _ in range(warmup_iters):
                 warmup_output = model(self.static_input)
             if warmup_output is not None:
                 del warmup_output
-            torch.cuda.synchronize()
+            self.capture_stream.synchronize()
 
             # Capture: 将整个 forward 录制为 CUDA Graph
             self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph):
+            with torch.cuda.graph(self.graph, stream=self.capture_stream):
                 self.static_out_surface, self.static_out_upper = model(self.static_input)
+        current_stream.wait_stream(self.capture_stream)
+        self.capture_allocated_mb = (
+            torch.cuda.memory_allocated() - memory_before
+        ) / 1024**2
+        self.capture_reserved_mb = (
+            torch.cuda.memory_reserved() - reserved_before
+        ) / 1024**2
+
+    @staticmethod
+    def _signature(value):
+        tensors = value if isinstance(value, (tuple, list)) else (value,)
+        return tuple((tuple(t.shape), t.dtype, t.device) for t in tensors)
 
     def __call__(self, x):
-        if isinstance(x, (tuple, list)):
+        if self._signature(x) != self.input_signature:
+            raise ValueError("CUDA Graph input shape, dtype, or device changed")
+        if x is self.static_input:
+            pass
+        elif isinstance(x, (tuple, list)):
             for src, dst in zip(x, self.static_input):
                 dst.copy_(src)
         else:
             self.static_input.copy_(x)
         self.graph.replay()
         return self.static_out_surface, self.static_out_upper
+
+    def set_surface_mask(self, surface_mask):
+        """Install the constant three-channel mask once in the static input."""
+
+        static_surface = self.static_input[0]
+        static_surface[:, 4:].copy_(surface_mask)
+
+    def prepare_input(self, source):
+        """Copy CPU weather channels directly into graph-owned device buffers."""
+
+        static_surface, static_upper = self.static_input
+        static_surface[:, :4].copy_(source[:, :4], non_blocking=True)
+        static_upper.view(
+            source.shape[0], -1, source.shape[-2], source.shape[-1]
+        ).copy_(source[:, 4:], non_blocking=True)
+        return self.static_input
 
 
 class ONNXModel:
@@ -333,6 +380,10 @@ def _profile_from_config(cfg, profile_name):
     }
     if hasattr(profile, "depth_blocks"):
         res["depth_blocks"] = _cfg_list(profile.depth_blocks)
+    if hasattr(profile, "architecture"):
+        res["architecture"] = str(profile.architecture)
+    if hasattr(profile, "window_size"):
+        res["window_size"] = _cfg_list(profile.window_size)
     return res
 
 
@@ -366,6 +417,8 @@ def _profile_from_metadata(cfg, metadata):
         profile["window_size"] = _cfg_list(metadata["window_size"])
     if "depth_blocks" in metadata:
         profile["depth_blocks"] = _cfg_list(metadata["depth_blocks"])
+    if "architecture" in metadata:
+        profile["architecture"] = str(metadata["architecture"])
     if metadata.get("share_deep_blocks"):
         profile["share_deep_blocks"] = str(metadata["share_deep_blocks"])
     return profile
@@ -548,7 +601,19 @@ def _scan_checkpoint_path(cfg, preferred_profile):
 
 
 def _load_checkpoint(path):
-    ckpt = torch.load(path, map_location="cpu")
+    with open(path, "rb") as stream:
+        magic = stream.read(2)
+    if magic == b"\x1f\x8b":
+        # Lossless disk compression is decoded before the official timing
+        # region. BytesIO avoids repeated gzip seeks while torch.load reads its
+        # internal ZIP container and never creates a decompressed disk file.
+        with gzip.open(path, "rb") as stream:
+            payload = io.BytesIO(stream.read())
+        ckpt = torch.load(payload, map_location="cpu")
+        del payload
+        print(f"📦 已在计时前无损解压 checkpoint: {path}")
+    else:
+        ckpt = torch.load(path, map_location="cpu")
     state_dict = ckpt.get("model_state_dict", ckpt)
     return ckpt, state_dict
 
@@ -556,6 +621,29 @@ def _load_checkpoint(path):
 def _dequantize_tensor_for_model(key, value, state_dict, target_tensor):
     target_device = target_tensor.device
     target_dtype = target_tensor.dtype
+    int4_scale_key = key + ".int4_scale"
+    int4_shape_key = key + ".int4_shape"
+    int4_group_key = key + ".int4_group_size"
+    if value.dtype == torch.uint8 and int4_scale_key in state_dict:
+        if int4_shape_key not in state_dict or int4_group_key not in state_dict:
+            raise KeyError(f"Incomplete INT4 metadata for {key}")
+        shape = tuple(int(v) for v in state_dict[int4_shape_key].tolist())
+        group_size = int(state_dict[int4_group_key].item())
+        if shape != tuple(target_tensor.shape) or len(shape) != 2:
+            raise RuntimeError(
+                f"INT4 shape mismatch for {key}: {shape} vs {tuple(target_tensor.shape)}"
+            )
+        low = (value & 0x0F).to(torch.int8)
+        high = ((value >> 4) & 0x0F).to(torch.int8)
+        quantized = torch.stack((low, high), dim=-1).reshape(value.shape[0], -1)
+        quantized = torch.where(quantized >= 8, quantized - 16, quantized)
+        scales = state_dict[int4_scale_key].to(torch.float32)
+        restored = quantized.to(torch.float32).reshape(
+            shape[0], scales.shape[1], group_size
+        )
+        restored.mul_(scales.unsqueeze(-1))
+        restored = restored.reshape(shape[0], -1)[:, : shape[1]]
+        return restored.to(device=target_device, dtype=target_dtype)
     if key.endswith(".weight") and value.dtype == torch.int8:
         scale_key = key + "_scale"
         if scale_key in state_dict:
@@ -566,6 +654,10 @@ def _dequantize_tensor_for_model(key, value, state_dict, target_tensor):
                 value.to(device=target_device, dtype=torch.float32) * scale
             ).to(target_dtype)
     return value.to(device=target_device, dtype=target_dtype)
+
+
+def _is_int4_metadata_key(key):
+    return key.endswith((".int4_scale", ".int4_shape", ".int4_group_size"))
 
 
 def _quantized_linear_module_names(state_dict):
@@ -634,7 +726,7 @@ def _load_runtime_quant_state_dict(model, state_dict):
 
     with torch.no_grad():
         for key, value in state_dict.items():
-            if key.endswith("_scale"):
+            if key.endswith("_scale") or _is_int4_metadata_key(key):
                 continue
             module_name = key[: -len(".weight")] if key.endswith(".weight") else None
             module = modules.get(module_name) if module_name else None
@@ -662,7 +754,10 @@ def _load_runtime_quant_state_dict(model, state_dict):
             loaded_count += 1
             del loaded_tensor
 
-    source_keys = {key for key in state_dict if not key.endswith("_scale")}
+    source_keys = {
+        key for key in state_dict
+        if not key.endswith("_scale") and not _is_int4_metadata_key(key)
+    }
     for key in model_state:
         if key not in source_keys:
             missing_keys.append(key)
@@ -684,7 +779,7 @@ def _load_dequantized_state_dict_incremental(model, state_dict):
 
     with torch.no_grad():
         for key, value in state_dict.items():
-            if key.endswith("_scale"):
+            if key.endswith("_scale") or _is_int4_metadata_key(key):
                 continue
             if key not in model_state:
                 unexpected_keys.append(key)
@@ -702,7 +797,10 @@ def _load_dequantized_state_dict_incremental(model, state_dict):
             loaded_count += 1
             del loaded_tensor
 
-    source_keys = {key for key in state_dict if not key.endswith("_scale")}
+    source_keys = {
+        key for key in state_dict
+        if not key.endswith("_scale") and not _is_int4_metadata_key(key)
+    }
     for key in model_state:
         if key not in source_keys:
             missing_keys.append(key)
@@ -740,6 +838,27 @@ def _dequantize_state_dict(state_dict, target_dtype):
 if __name__ == "__main__":
     current_path = os.getcwd()
     sys.path.append(current_path)
+
+    # Load HIP library dynamically and set device schedule flag to Spin
+    import ctypes
+    libhip = None
+    for lib_name in ['libamdhip64.so', 'libhip_hcc.so', 'libamdhip64.so.5', 'libamdhip64.so.6']:
+        try:
+            libhip = ctypes.CDLL(lib_name)
+            break
+        except Exception:
+            continue
+    if libhip:
+        try:
+            # hipDeviceScheduleSpin = 1
+            status = libhip.hipSetDeviceFlags(1)
+            if status == 0:
+                print("⚡ [HIP] hipSetDeviceFlags(hipDeviceScheduleSpin) successful!")
+            else:
+                print(f"⚠️ [HIP] hipSetDeviceFlags returned status code: {status}")
+        except Exception as e:
+            print(f"⚠️ [HIP] Failed to set device flags: {e}")
+
 
     ## Model config init
     config_file_path = os.path.join(current_path, "conf/config.yaml")
@@ -938,7 +1057,15 @@ if __name__ == "__main__":
             )
 
 
-            model = build_pangu_model(
+            if model_profile.get("architecture") == "PanguLite2DAttentionPosEmbed":
+                from pangu_lite_2d import PanguLite2DAttentionPosEmbed
+                model = PanguLite2DAttentionPosEmbed(
+                    img_size=tuple(cfg_data.dataset.img_size),
+                    patch_size=tuple(model_profile["patch_size"]),
+                    dim=model_profile["embed_dim"],
+                )
+            else:
+                model = build_pangu_model(
                 img_size=cfg_data.dataset.img_size,
                 patch_size=model_profile["patch_size"],
                 embed_dim=model_profile["embed_dim"],
@@ -954,8 +1081,8 @@ if __name__ == "__main__":
                 kv_group_size=gqa_group_size,
                 share_deep_blocks=share_deep_blocks,
                 chunked_attention=chunked_attention,
-                attention_chunk_size=attention_chunk_size,
-            )
+                    attention_chunk_size=attention_chunk_size,
+                )
             runtime_quant_linear = (
                 _is_enabled("PANGU_RUNTIME_QUANT_LINEAR")
                 and not use_gqa
@@ -976,6 +1103,41 @@ if __name__ == "__main__":
             if use_fp16:
                 model.half()   # FP16: ensure model storage is half before moving to GPU
             model = model.to('cuda:0')
+            if libhip:
+                try:
+                    # 1. Prefer L1 Cache over Shared Memory for Attention GEMMs (hipFuncCachePreferL1 = 2)
+                    libhip.hipDeviceSetCacheConfig(2)
+                    print("⚡ [HIP] hipDeviceSetCacheConfig(hipFuncCachePreferL1) set successfully!")
+                except Exception as e:
+                    print(f"⚠️ [HIP] Failed to set device cache config: {e}")
+
+                try:
+                    # 2. Create custom stream and set as active stream in PyTorch
+                    custom_stream = torch.cuda.Stream()
+                    torch.cuda.set_stream(custom_stream)
+                    print("⚡ [HIP] Created custom stream and set as active stream in PyTorch")
+                    
+                    # 3. Set Stream Synchronization Policy to Spin (hipSyncPolicySpin = 2)
+                    class hipStreamAttrValue(ctypes.Union):
+                        _fields_ = [("syncPolicy", ctypes.c_int)]
+                    
+                    libhip.hipStreamSetAttribute.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+                    libhip.hipStreamSetAttribute.restype = ctypes.c_int
+                    
+                    stream_ptr = custom_stream.cuda_stream
+                    val = hipStreamAttrValue()
+                    val.syncPolicy = 2  # 2 = hipSyncPolicySpin
+                    status = libhip.hipStreamSetAttribute(
+                        ctypes.c_void_p(stream_ptr), 
+                        3, # hipStreamAttributeSynchronizationPolicy = 3
+                        ctypes.byref(val)
+                    )
+                    if status == 0:
+                        print(f"⚡ [HIP] hipStreamSetAttribute(hipSyncPolicySpin) set successfully on custom stream (ptr={stream_ptr})!")
+                    else:
+                        print(f"⚠️ [HIP] hipStreamSetAttribute returned status: {status}")
+                except Exception as e:
+                    print(f"⚠️ [HIP] Failed to set stream sync policy: {e}")
             _profile_cuda_memory("after model build/to cuda")
             if layerwise_inference:
                 print("🧩  PANGU_LAYERWISE_INFERENCE=1，启用逐层推理 forward")
@@ -998,6 +1160,8 @@ if __name__ == "__main__":
                     "🧩  PANGU_DIRECT_RECOVERY=1，使用 direct patch unembedding，"
                     f"width_chunk={_env_int('PANGU_DIRECT_RECOVERY_WIDTH_CHUNK', 16)}"
                 )
+                if _is_enabled("PANGU_CPU_RECOVERY_OUTPUT"):
+                    print("📤 PANGU_CPU_RECOVERY_OUTPUT=1，recovery chunk 直接写入 pinned CPU")
             if chunked_attention:
                 patched_attention = getattr(model, "_pangu_chunked_attention_count", 0)
                 print(
@@ -1100,6 +1264,11 @@ if __name__ == "__main__":
                 del _example_surface, _example_upper, _example
                 torch.cuda.empty_cache()
                 print("✅ CUDA Graph 捕获成功，推理将使用 Graph Replay")
+                print(
+                    "🧠 CUDA Graph private memory delta: "
+                    f"allocated={model.capture_allocated_mb:.1f} MB, "
+                    f"reserved={model.capture_reserved_mb:.1f} MB"
+                )
                 _profile_cuda_memory("after CUDA Graph capture")
             except Exception as e:
                 print(f"⚠️ CUDA Graph 捕获失败 ({e})，使用标准 PyTorch 推理")
@@ -1108,6 +1277,15 @@ if __name__ == "__main__":
                 gc.collect()
                 torch.cuda.empty_cache()
                 _profile_cuda_memory("after CUDA Graph fallback cleanup")
+
+    graph_direct_input = (
+        isinstance(model, CUDAGraphWrapper)
+        and _is_enabled("PANGU_GRAPH_DIRECT_INPUT", default=True)
+    )
+    if graph_direct_input:
+        model.set_surface_mask(surface_mask)
+        del surface_mask
+        print("🧩 PANGU_GRAPH_DIRECT_INPUT=1，输入直接写入 Graph 静态缓冲区")
 
     os.makedirs('result/output/', exist_ok=True)                          # AI4S, 输出路径不可更改
     print(f"📂 samples will be generated to './result/output/'")
@@ -1132,21 +1310,24 @@ if __name__ == "__main__":
                 print(f"  outvar shape: {list(outvar.shape)}  ← [batch, channels, H, W]")
                 print(f"  the first filename: {filename}")
 
-            # FP16: 输入数据直接转为半精度
-            # 方向4.3: non_blocking 异步数据传输，重叠 CPU/GPU 工作
-            invar_surface = invar[:, :4, :, :].to("cuda:0", dtype=target_dtype, non_blocking=True)
-            invar_upper_air = invar[:, 4:, :, :].to("cuda:0", dtype=target_dtype, non_blocking=True)
-            # Avoid GPU concatenation of invar (150 MB saving)
-            invar_surface_with_mask = torch.concat([invar_surface, surface_mask], dim=1)
-            invar_upper_air_reshaped = invar_upper_air.reshape(
-                invar_upper_air.shape[0], 5, 13, invar_upper_air.shape[2], invar_upper_air.shape[3]
-            )
-            upper_air_shape = tuple(invar_upper_air.shape)
-            if _is_enabled("PANGU_CLEAR_INPUT_REFS", default=True):
-                invar = [invar_surface_with_mask, invar_upper_air_reshaped]
-                del invar_surface, invar_upper_air, invar_surface_with_mask, invar_upper_air_reshaped
+            upper_air_shape = tuple(invar[:, 4:].shape)
+            if graph_direct_input:
+                invar = model.prepare_input(invar)
             else:
-                invar = (invar_surface_with_mask, invar_upper_air_reshaped)
+                # FP16: 输入数据直接转为半精度
+                # 方向4.3: non_blocking 异步数据传输，重叠 CPU/GPU 工作
+                invar_surface = invar[:, :4, :, :].to("cuda:0", dtype=target_dtype, non_blocking=True)
+                invar_upper_air = invar[:, 4:, :, :].to("cuda:0", dtype=target_dtype, non_blocking=True)
+                # Avoid GPU concatenation of invar (150 MB saving)
+                invar_surface_with_mask = torch.concat([invar_surface, surface_mask], dim=1)
+                invar_upper_air_reshaped = invar_upper_air.reshape(
+                    invar_upper_air.shape[0], 5, 13, invar_upper_air.shape[2], invar_upper_air.shape[3]
+                )
+                if _is_enabled("PANGU_CLEAR_INPUT_REFS", default=True):
+                    invar = [invar_surface_with_mask, invar_upper_air_reshaped]
+                    del invar_surface, invar_upper_air, invar_surface_with_mask, invar_upper_air_reshaped
+                else:
+                    invar = (invar_surface_with_mask, invar_upper_air_reshaped)
 
             #----------------------AI4S(时间度量不可更改)---------------------------
             start_time = time.perf_counter()      # AI4S(时间度量，位置不可更改)
@@ -1176,7 +1357,10 @@ if __name__ == "__main__":
                 _profile_cuda_memory("after first output postprocess")
 
             # Explicitly clear loop-local GPU tensor references to prevent caching allocator double-buffering peak VRAM
-            if not _is_enabled("PANGU_CLEAR_INPUT_REFS", default=True):
+            if (
+                not graph_direct_input
+                and not _is_enabled("PANGU_CLEAR_INPUT_REFS", default=True)
+            ):
                 del invar_surface, invar_upper_air, invar_surface_with_mask, invar_upper_air_reshaped
             del invar, upper_air_shape
             del out_surface, out_upper_air

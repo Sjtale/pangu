@@ -524,7 +524,9 @@ def _direct_patch_unembed_chunk(recovery, x):
     return output
 
 
-def _direct_patch_recovery(recovery_module, x, width_chunk_size=None):
+def _direct_patch_recovery(
+    recovery_module, x, width_chunk_size=None, output_to_cpu=False
+):
     """Recover non-overlapping patches without ConvTranspose3d workspace."""
 
     recovery = getattr(recovery_module, "recovery", recovery_module)
@@ -571,7 +573,16 @@ def _direct_patch_recovery(recovery_module, x, width_chunk_size=None):
         if width_chunk_size is None or int(width_chunk_size) <= 0
         else min(int(width_chunk_size), x.shape[4])
     )
-    output = x.new_empty((x.shape[0], recovery.out_chans, *tuple(recovery.img_size)))
+    output_shape = (x.shape[0], recovery.out_chans, *tuple(recovery.img_size))
+    if output_to_cpu:
+        output = torch.empty(
+            output_shape,
+            dtype=x.dtype,
+            device="cpu",
+            pin_memory=bool(x.is_cuda),
+        )
+    else:
+        output = x.new_empty(output_shape)
 
     for start in range(0, x.shape[4], width_chunk_size):
         end = min(start + width_chunk_size, x.shape[4])
@@ -596,7 +607,8 @@ def _direct_patch_recovery(recovery_module, x, width_chunk_size=None):
                     crop_pressure_start:crop_pressure_end,
                     crop_height_start:crop_height_end,
                     source_width,
-                ]
+                ],
+                non_blocking=bool(output_to_cpu and x.is_cuda),
             )
         del chunk
 
@@ -725,6 +737,7 @@ def _recover_surface(model, output_surface):
             model.patchrecovery2d,
             output_surface,
             width_chunk_size=_direct_recovery_width_chunk(),
+            output_to_cpu=_is_enabled("PANGU_CPU_RECOVERY_OUTPUT"),
         )
     return model.patchrecovery2d(output_surface)
 
@@ -741,6 +754,7 @@ def _recover_upper_air(model, output_upper_air):
             model.patchrecovery3d,
             output_upper_air,
             width_chunk_size=_direct_recovery_width_chunk(),
+            output_to_cpu=_is_enabled("PANGU_CPU_RECOVERY_OUTPUT"),
         )
     if _is_enabled("PANGU_CHUNKED_RECOVERY"):
         chunk_size = _env_int("PANGU_RECOVERY_CHUNK_SIZE", 1)
@@ -1103,16 +1117,36 @@ def _forward_chunked_earth_attention_3d(self, x, mask=None):
     chunk_size = max(1, int(getattr(self, "_pangu_attention_chunk_size", 3)))
     chunked_qkv = bool(getattr(self, "_pangu_chunked_qkv", False))
     chunked_proj = bool(getattr(self, "_pangu_chunked_proj", False))
+    direct_mask_slice = bool(getattr(self, "_pangu_direct_mask_slice", False))
+
+    def select_mask_chunk(start, end):
+        """Select a repeating mask range without launching arange/remainder kernels."""
+
+        width_windows = mask.shape[0]
+        chunk_length = end - start
+        if chunk_length > width_windows:
+            indices = torch.arange(start, end, device=mask.device) % width_windows
+            return mask.index_select(0, indices)
+        offset = start % width_windows
+        first_length = min(chunk_length, width_windows - offset)
+        first = mask[offset:offset + first_length]
+        if first_length == chunk_length:
+            return first
+        remaining = chunk_length - first_length
+        return torch.cat((first, mask[:remaining]), dim=0)
 
     def run_attention_chunk(start, end, q_chunk, k_chunk, v_chunk):
         attn_chunk = q_chunk @ k_chunk.transpose(-2, -1)
         attn_chunk = attn_chunk + earth_position_bias
         if mask is not None:
-            NumWidthWindows = mask.shape[0]
-            mask_indices = (
-                torch.arange(start, end, device=mask.device) % NumWidthWindows
-            )
-            mask_chunk = mask.index_select(0, mask_indices)
+            if direct_mask_slice:
+                mask_chunk = select_mask_chunk(start, end)
+            else:
+                NumWidthWindows = mask.shape[0]
+                mask_indices = (
+                    torch.arange(start, end, device=mask.device) % NumWidthWindows
+                )
+                mask_chunk = mask.index_select(0, mask_indices)
             attn_chunk = attn_chunk + mask_chunk.unsqueeze(1)
         attn_chunk = self.softmax(attn_chunk)
         attn_chunk = self.attn_drop(attn_chunk)
@@ -1191,6 +1225,7 @@ def enable_chunked_attention(
     cache_earth_bias=False,
     chunked_qkv=False,
     chunked_proj=False,
+    direct_mask_slice=False,
 ):
     """Patch model-local EarthAttention3D instances for memory A/B testing."""
 
@@ -1202,6 +1237,7 @@ def enable_chunked_attention(
             module._pangu_cache_earth_bias = bool(cache_earth_bias)
             module._pangu_chunked_qkv = bool(chunked_qkv)
             module._pangu_chunked_proj = bool(chunked_proj)
+            module._pangu_direct_mask_slice = bool(direct_mask_slice)
             module.forward = types.MethodType(_forward_chunked_earth_attention_3d, module)
             patched += 1
     return patched
@@ -1497,17 +1533,20 @@ def build_pangu_model(
     cache_earth_bias = _is_enabled("PANGU_CACHE_EARTH_BIAS")
     chunked_qkv = _is_enabled("PANGU_CHUNKED_QKV")
     chunked_proj = _is_enabled("PANGU_CHUNKED_PROJ", default=chunked_qkv)
+    direct_mask_slice = _is_enabled("PANGU_DIRECT_MASK_SLICE")
     if chunked_attention:
         model._pangu_chunked_attention_count = enable_chunked_attention(
             model, chunk_size=attention_chunk_size,
             cache_earth_bias=cache_earth_bias,
             chunked_qkv=chunked_qkv,
             chunked_proj=chunked_proj,
+            direct_mask_slice=direct_mask_slice,
         )
         if chunked_qkv or chunked_proj:
             print(
                 "🧠  PANGU_CHUNKED_ATTENTION extra: "
-                f"qkv={int(chunked_qkv)} proj={int(chunked_proj)}"
+                f"qkv={int(chunked_qkv)} proj={int(chunked_proj)} "
+                f"direct_mask={int(direct_mask_slice)}"
             )
 
     if _is_enabled("PANGU_COMPACT_ATTN_MASK"):

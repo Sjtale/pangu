@@ -11,10 +11,12 @@ The script uses the exact same model loading + inference flow as inference.py
 but intercepts each stage to record memory deltas.
 """
 
+import argparse
 import os
 import sys
 import json
 import gc
+import time
 
 # Set defaults BEFORE any torch import to match submission
 os.environ.setdefault("PANGU_AUTO_SCAN_CHECKPOINT", "0")
@@ -22,8 +24,8 @@ os.environ.setdefault("PANGU_DISABLE_CUDA_GRAPH", "1")
 os.environ.setdefault("PANGU_LAYERWISE_INFERENCE", "1")
 os.environ.setdefault("PANGU_RECOMPUTE_SKIP", "0")
 os.environ.setdefault("PANGU_DIRECT_RECOVERY", "1")
-os.environ.setdefault("PANGU_DIRECT_RECOVERY_WIDTH_CHUNK", "24")
-os.environ.setdefault("PANGU_SCORED_ONLY_RECOVERY", "1")
+os.environ.setdefault("PANGU_DIRECT_RECOVERY_WIDTH_CHUNK", "16")
+os.environ.setdefault("PANGU_SCORED_ONLY_RECOVERY", "0")
 os.environ.setdefault("PANGU_CHUNKED_ATTENTION", "1")
 os.environ.setdefault("PANGU_ATTN_CHUNK_SIZE", "3")
 os.environ.setdefault("PANGU_CHUNKED_MLP", "1")
@@ -56,7 +58,7 @@ class VRAMTracker:
         self._last_peak = 0
         self._last_allocated = 0
 
-    def checkpoint(self, tag):
+    def checkpoint(self, tag, started_at=None):
         if not torch.cuda.is_available():
             return
         torch.cuda.synchronize()
@@ -74,6 +76,11 @@ class VRAMTracker:
             "peak_mb": peak / 1024**2,
             "delta_peak_mb": delta_peak / 1024**2,
             "delta_alloc_mb": delta_alloc / 1024**2,
+            "elapsed_ms": (
+                (time.perf_counter() - started_at) * 1000.0
+                if started_at is not None
+                else None
+            ),
         }
         self.records.append(record)
         self._last_peak = peak
@@ -116,7 +123,102 @@ class VRAMTracker:
         print(f"VRAM breakdown saved to: {path}")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Attribute pruned_96 inference VRAM and per-stage latency."
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default="model_fp16.pth",
+        help="Checkpoint basename under checkpoint_dir, or an absolute path.",
+    )
+    parser.add_argument(
+        "--output-json",
+        default="logs/pruned96_vram_breakdown.json",
+    )
+    return parser.parse_args()
+
+
+def _validate_pruned96_profile(model_profile):
+    expected = {
+        "patch_size": [2, 8, 8],
+        "embed_dim": 96,
+        "num_heads": [3, 6, 6, 3],
+    }
+    for key, value in expected.items():
+        if model_profile.get(key) != value:
+            raise ValueError(
+                f"Checkpoint is not full pruned_96: {key}="
+                f"{model_profile.get(key)!r}, expected {value!r}"
+            )
+    depth = model_profile.get("depth_blocks", [2, 6, 6, 2])
+    if depth != [2, 6, 6, 2]:
+        raise ValueError(
+            f"Checkpoint is a depth-pruned variant: depth_blocks={depth!r}; "
+            "expected full pruned_96 [2, 6, 6, 2]"
+        )
+
+
+def _run_profiled_forward(model, model_input, tracker, prefix=""):
+    from pangu_profile_model import (
+        _embed_sequence,
+        _recover_outputs,
+        _run_fuser_layerwise,
+        _run_sample_layerwise,
+    )
+
+    def checkpoint(stage, started_at=None):
+        tracker.checkpoint(f"{prefix}{stage}", started_at)
+
+    with torch.inference_mode():
+        started_at = time.perf_counter()
+        sequence, Batch, PressureLevels, Height, Width = _embed_sequence(
+            model, model_input
+        )
+        checkpoint("embed_sequence", started_at)
+
+        started_at = time.perf_counter()
+        sequence = _run_fuser_layerwise(model, model.layer1, sequence, False, None)
+        checkpoint("layer1_forward", started_at)
+
+        skip_sequence = sequence
+        started_at = time.perf_counter()
+        sequence = _run_sample_layerwise(model, model.downsample, sequence, False, None)
+        checkpoint("downsample", started_at)
+
+        started_at = time.perf_counter()
+        sequence = _run_fuser_layerwise(model, model.layer2, sequence, False, None)
+        checkpoint("layer2_forward", started_at)
+
+        started_at = time.perf_counter()
+        sequence = _run_fuser_layerwise(model, model.layer3, sequence, False, None)
+        checkpoint("layer3_forward", started_at)
+
+        started_at = time.perf_counter()
+        sequence = _run_sample_layerwise(model, model.upsample, sequence, False, None)
+        checkpoint("upsample", started_at)
+
+        started_at = time.perf_counter()
+        sequence = _run_fuser_layerwise(model, model.layer4, sequence, False, None)
+        checkpoint("layer4_forward", started_at)
+
+        started_at = time.perf_counter()
+        sequence = torch.concat([sequence, skip_sequence], dim=-1)
+        del skip_sequence
+        checkpoint("skip_concat", started_at)
+
+        started_at = time.perf_counter()
+        output_surface, output_upper_air = _recover_outputs(
+            model, sequence, Batch, PressureLevels, Height, Width
+        )
+        checkpoint("recovery", started_at)
+        del sequence
+        checkpoint("after_del_sequence")
+    return output_surface, output_upper_air
+
+
 def main():
+    args = parse_args()
     tracker = VRAMTracker()
 
     # ---- Load config ----
@@ -140,7 +242,11 @@ def main():
     tracker.checkpoint("after_static_mask_load")
 
     # ---- Load checkpoint ----
-    fp16_ckpt_path = os.path.join(cfg.checkpoint_dir, "model_fp16.pth")
+    fp16_ckpt_path = (
+        args.checkpoint
+        if os.path.isabs(args.checkpoint)
+        else os.path.join(cfg.checkpoint_dir, args.checkpoint)
+    )
     if not os.path.exists(fp16_ckpt_path):
         print(f"ERROR: checkpoint not found at {fp16_ckpt_path}")
         return
@@ -168,6 +274,8 @@ def main():
         model_profile["window_size"] = [int(v) for v in model_profile.get("window_size", cfg.window_size)]
         if "depth_blocks" in model_profile and model_profile["depth_blocks"] is not None:
             model_profile["depth_blocks"] = [int(v) for v in model_profile["depth_blocks"]]
+
+    _validate_pruned96_profile(model_profile)
 
     print(f"Profile: {model_profile['name']}, embed={model_profile['embed_dim']}, patch={model_profile['patch_size']}")
 
@@ -297,84 +405,68 @@ def main():
     tracker.reset_peak("before_forward")
     tracker.checkpoint("before_model_forward")
 
-    with torch.inference_mode():
-        # Now run the instrumented layerwise forward
-        # We manually replicate _forward_layerwise to get per-stage VRAM
-        from pangu_profile_model import (
-            _embed_sequence,
-            _run_fuser_layerwise,
-            _run_sample_layerwise,
-            _recover_outputs,
-        )
-
-        sequence, Batch, PressureLevels, Height, Width = _embed_sequence(model, model_input)
-        tracker.checkpoint("embed_sequence")
-        print(f"  sequence shape: {list(sequence.shape)} = {sequence.numel()*sequence.element_size()/1024**2:.1f} MB")
-
-        # We can now delete the input tensors to see if it helps
-        # (but don't delete yet - measure first)
-
-        sequence = _run_fuser_layerwise(model, model.layer1, sequence, False, None)
-        tracker.checkpoint("layer1_forward")
-
-        skip_sequence = sequence
-        tracker.checkpoint("skip_sequence_saved")
-
-        sequence = _run_sample_layerwise(model, model.downsample, sequence, False, None)
-        tracker.checkpoint("downsample")
-
-        sequence = _run_fuser_layerwise(model, model.layer2, sequence, False, None)
-        tracker.checkpoint("layer2_forward")
-
-        sequence = _run_fuser_layerwise(model, model.layer3, sequence, False, None)
-        tracker.checkpoint("layer3_forward")
-
-        sequence = _run_sample_layerwise(model, model.upsample, sequence, False, None)
-        tracker.checkpoint("upsample")
-
-        sequence = _run_fuser_layerwise(model, model.layer4, sequence, False, None)
-        tracker.checkpoint("layer4_forward")
-
-        # Skip concat
-        sequence = torch.concat([sequence, skip_sequence], dim=-1)
-        del skip_sequence
-        tracker.checkpoint("skip_concat")
-
-        # Recovery
-        output_surface, output_upper_air = _recover_outputs(
-            model, sequence, Batch, PressureLevels, Height, Width
-        )
-        tracker.checkpoint("recovery")
-
-        # Output reshape
-        del sequence
-        tracker.checkpoint("after_del_sequence")
+    output_surface, output_upper_air = _run_profiled_forward(
+        model, model_input, tracker
+    )
 
     # ---- Post-processing (matches inference.py) ----
+    started_at = time.perf_counter()
     out_upper_air = output_upper_air.reshape(invar.shape[0], 65, invar.shape[2], invar.shape[3])
     pred_tensor = torch.concat(
         [output_surface.detach().cpu(), out_upper_air.detach().cpu()],
         dim=1,
     ).float()
-    tracker.checkpoint("output_postprocess")
+    tracker.checkpoint("output_postprocess", started_at)
+    cold_forward_peak_mb = torch.cuda.max_memory_allocated() / 1024**2
+    del output_surface, output_upper_air, out_upper_air, pred_tensor, model_input
+    gc.collect()
+
+    # The first pass includes lazy DCU kernel initialization. Run the same
+    # stages once more to attribute steady-state latency separately.
+    steady_surface = invar[:, :4].to("cuda:0", dtype=torch.float16)
+    steady_upper_air = invar[:, 4:].to("cuda:0", dtype=torch.float16)
+    steady_surface_with_mask = torch.concat([steady_surface, surface_mask], dim=1)
+    steady_input = [
+        steady_surface_with_mask,
+        steady_upper_air.reshape(
+            steady_upper_air.shape[0], 5, 13,
+            steady_upper_air.shape[2], steady_upper_air.shape[3],
+        ),
+    ]
+    del steady_surface, steady_upper_air, steady_surface_with_mask
+    tracker.reset_peak("before_steady_forward")
+    steady_surface_output, steady_upper_output = _run_profiled_forward(
+        model, steady_input, tracker, prefix="steady."
+    )
+    started_at = time.perf_counter()
+    steady_upper_output = steady_upper_output.reshape(
+        invar.shape[0], 65, invar.shape[2], invar.shape[3]
+    )
+    steady_pred = torch.concat(
+        [steady_surface_output.detach().cpu(), steady_upper_output.detach().cpu()],
+        dim=1,
+    ).float()
+    tracker.checkpoint("steady.output_postprocess", started_at)
+    del steady_surface_output, steady_upper_output, steady_pred, steady_input
 
     # ---- Cleanup ----
-    del output_surface, output_upper_air, out_upper_air, pred_tensor
-    del model_input
     gc.collect()
     torch.cuda.empty_cache()
     tracker.checkpoint("final_cleanup")
 
     # ---- Final report ----
     print(f"\n{'='*60}")
-    print(f"FINAL: Max VRAM = {torch.cuda.max_memory_allocated()/1024**2:.1f} MB")
+    print(f"COLD FORWARD: Max VRAM = {cold_forward_peak_mb:.1f} MB")
+    print(f"STEADY FORWARD: Max VRAM = {torch.cuda.max_memory_allocated()/1024**2:.1f} MB")
     print(f"{'='*60}")
 
     tracker.summary()
 
     # Save results
     os.makedirs("logs", exist_ok=True)
-    tracker.save("logs/vram_breakdown.json")
+    output_json = args.output_json
+    os.makedirs(os.path.dirname(output_json) or ".", exist_ok=True)
+    tracker.save(output_json)
 
     # ---- Optimization opportunity analysis ----
     print("\n" + "=" * 60)

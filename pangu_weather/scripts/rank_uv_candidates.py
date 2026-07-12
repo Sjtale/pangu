@@ -67,7 +67,7 @@ def pareto_flags(rows):
         dominated = False
         row_metrics = (
             _metric(row, "max_vram_mb"),
-            _metric(row, "latency_avg_ms"),
+            _metric(row, "steady_latency_avg_ms"),
             _metric(row, "output_max_abs"),
         )
         for other in ok_rows:
@@ -75,7 +75,7 @@ def pareto_flags(rows):
                 continue
             other_metrics = (
                 _metric(other, "max_vram_mb"),
-                _metric(other, "latency_avg_ms"),
+                _metric(other, "steady_latency_avg_ms"),
                 _metric(other, "output_max_abs"),
             )
             if all(o <= r for o, r in zip(other_metrics, row_metrics)) and any(
@@ -90,13 +90,16 @@ def pareto_flags(rows):
 def sort_key(row):
     platform_total = row.get("platform_total")
     if platform_total is not None:
-        return (0, -float(platform_total), _metric(row, "max_vram_mb"), _metric(row, "latency_avg_ms"))
+        return (
+            0, -float(platform_total), _metric(row, "max_vram_mb"),
+            _metric(row, "steady_latency_avg_ms"),
+        )
     if row.get("returncode") != 0:
         return (2, row.get("label", ""))
     return (
         1,
         _metric(row, "max_vram_mb"),
-        _metric(row, "latency_avg_ms"),
+        _metric(row, "steady_latency_avg_ms"),
         _metric(row, "output_max_abs"),
         row.get("label", ""),
     )
@@ -114,9 +117,49 @@ def format_row(row, is_pareto):
         "max_vram_mb": row.get("max_vram_mb"),
         "reserved_mb": row.get("reserved_mb"),
         "latency_avg_ms": row.get("latency_avg_ms"),
+        "steady_latency_avg_ms": row.get("steady_latency_avg_ms"),
+        "steady_latency_p90_ms": row.get("steady_latency_p90_ms"),
+        "steady_latency_std_ms": row.get("steady_latency_std_ms"),
         "output_max_abs": row.get("output_max_abs"),
+        "latency_delta_pct": row.get("latency_delta_pct"),
+        "vram_delta_mb": row.get("vram_delta_mb"),
+        "promotion_gate": row.get("promotion_gate"),
         "returncode": row.get("returncode"),
     }
+
+
+def add_runtime_gates(rows):
+    baseline = next((row for row in rows if row.get("kind") == "baseline"), None)
+    if baseline is None:
+        return rows
+    baseline_latency = baseline.get("steady_latency_avg_ms")
+    baseline_vram = baseline.get("max_vram_mb")
+    for row in rows:
+        if row is baseline:
+            row["promotion_gate"] = "baseline"
+            continue
+        latency = row.get("steady_latency_avg_ms")
+        vram = row.get("max_vram_mb")
+        if baseline_latency is None or latency is None or row.get("output_max_abs") is None:
+            row["promotion_gate"] = "incomplete"
+            continue
+        latency_delta_pct = 100.0 * (latency / baseline_latency - 1.0)
+        vram_delta_mb = None if baseline_vram is None or vram is None else vram - baseline_vram
+        row["latency_delta_pct"] = latency_delta_pct
+        row["vram_delta_mb"] = vram_delta_mb
+        env = row.get("env", {})
+        if env.get("PANGU_DISABLE_CUDA_GRAPH") == "0":
+            passed = (
+                latency_delta_pct <= -6.0
+                and (vram_delta_mb is None or vram_delta_mb <= 10.0)
+                and row["output_max_abs"] == 0.0
+            )
+        elif env.get("PANGU_DIRECT_MASK_SLICE") == "1":
+            passed = latency_delta_pct <= -3.0 and row["output_max_abs"] == 0.0
+        else:
+            passed = False
+        row["promotion_gate"] = "pass" if passed else "reject"
+    return rows
 
 
 def print_markdown(rows, limit):
@@ -129,8 +172,9 @@ def print_markdown(rows, limit):
         "V",
         "W",
         "max_vram_mb",
-        "latency_avg_ms",
+        "steady_latency_avg_ms",
         "output_max_abs",
+        "promotion_gate",
     ]
     print("| " + " | ".join(headers) + " |")
     print("| " + " | ".join(["---"] * len(headers)) + " |")
@@ -144,8 +188,9 @@ def print_markdown(rows, limit):
             row.get("platform_v"),
             row.get("platform_w"),
             row.get("max_vram_mb"),
-            row.get("latency_avg_ms"),
+            row.get("steady_latency_avg_ms"),
             row.get("output_max_abs"),
+            row.get("promotion_gate"),
         ]
         print("| " + " | ".join("" if value is None else str(value) for value in values) + " |")
 
@@ -167,7 +212,9 @@ def main():
     parser.add_argument("--format", choices=["markdown", "csv"], default="markdown")
     args = parser.parse_args()
 
-    rows = merge_platform(load_jsonl(args.jsonl), load_platform_csv(args.platform_csv))
+    rows = add_runtime_gates(
+        merge_platform(load_jsonl(args.jsonl), load_platform_csv(args.platform_csv))
+    )
     flags = pareto_flags(rows)
     ranked = [format_row(row, flags.get(row.get("label"), False)) for row in sorted(rows, key=sort_key)]
     if args.format == "csv":

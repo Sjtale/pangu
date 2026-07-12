@@ -9,6 +9,7 @@ earlier ``fuser`` tensor plus any orphaned quantization scale.
 """
 
 import argparse
+import hashlib
 import os
 from collections import OrderedDict
 from collections.abc import Mapping
@@ -81,6 +82,14 @@ def tensor_bytes(tensor):
     return tensor.numel() * tensor.element_size()
 
 
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def build_runtime_model(checkpoint, state):
     from pangu_profile_model import build_pangu_model
 
@@ -132,6 +141,7 @@ def print_plan(source_path, state, pairs, drop_keys):
     scale_count = sum(key.endswith("_scale") for key in drop_keys)
     print(f"Source: {os.path.abspath(source_path)}")
     print(f"File size: {os.path.getsize(source_path) / 1024**2:.2f} MiB")
+    print(f"SHA256: {sha256_file(source_path)}")
     print(f"Alias pairs: {len(pairs)}")
     print(f"Dropped tensors: {len(drop_keys)} ({scale_count} scales)")
     print(f"Dropped logical bytes: {dropped_bytes / 1024**2:.2f} MiB")
@@ -176,6 +186,7 @@ def compact_checkpoint(source_path, output_path, audit_only=False):
 
     print(f"Verified output: {output_path}")
     print(f"Output size: {os.path.getsize(output_path) / 1024**2:.2f} MiB")
+    print(f"Output SHA256: {sha256_file(output_path)}")
     return output_path
 
 
