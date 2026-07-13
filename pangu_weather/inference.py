@@ -60,7 +60,7 @@ os.environ.setdefault("PANGU_CPU_RECOVERY_OUTPUT", "0")
 os.environ.setdefault("PANGU_HIP_SCHEDULE_SPIN", "0")
 os.environ.setdefault("PANGU_HIP_PREFER_L1", "0")
 os.environ.setdefault("PANGU_HIP_STREAM_SPIN", "0")
-os.environ.setdefault("PANGU_INTERN_IMMUTABLE_BUFFERS", "0")
+os.environ.setdefault("PANGU_INTERN_IMMUTABLE_BUFFERS", "1")
 
 
 

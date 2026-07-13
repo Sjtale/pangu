@@ -313,7 +313,7 @@ class UVRuntimeSwitchTests(unittest.TestCase):
         self.assertIn('os.environ.setdefault("PANGU_HIP_PREFER_L1", "0")', source)
         self.assertIn('os.environ.setdefault("PANGU_HIP_STREAM_SPIN", "0")', source)
         self.assertIn(
-            'os.environ.setdefault("PANGU_INTERN_IMMUTABLE_BUFFERS", "0")',
+            'os.environ.setdefault("PANGU_INTERN_IMMUTABLE_BUFFERS", "1")',
             source,
         )
         self.assertLess(
