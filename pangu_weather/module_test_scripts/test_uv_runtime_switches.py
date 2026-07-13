@@ -164,12 +164,18 @@ class UVRuntimeSwitchTests(unittest.TestCase):
         self.assertEqual(env["PANGU_HIP_SCHEDULE_SPIN"], "0")
         self.assertEqual(env["PANGU_HIP_PREFER_L1"], "0")
         self.assertEqual(env["PANGU_HIP_STREAM_SPIN"], "0")
-        self.assertEqual(env["PANGU_INTERN_IMMUTABLE_BUFFERS"], "0")
+        self.assertEqual(env["PANGU_INTERN_IMMUTABLE_BUFFERS"], "1")
 
     def test_hip_probe_isolates_each_control_and_combination(self):
         candidates = list(probe_uv_runtime_sweep.iter_candidates("hip"))
         self.assertEqual(len(candidates), 5)
         self.assertEqual(candidates[0]["kind"], "baseline")
+        self.assertTrue(
+            all(
+                candidate["env"]["PANGU_INTERN_IMMUTABLE_BUFFERS"] == "1"
+                for candidate in candidates
+            )
+        )
         enabled = [
             tuple(
                 candidate["env"][name]
@@ -197,11 +203,19 @@ class UVRuntimeSwitchTests(unittest.TestCase):
         self.assertEqual(len(candidates), 4)
         for candidate in candidates:
             env = candidate["env"]
+            self.assertEqual(env["PANGU_INTERN_IMMUTABLE_BUFFERS"], "1")
             for stage in ("LAYER1", "LAYER4"):
                 self.assertEqual(env[f"PANGU_ATTN_CHUNK_SIZE_{stage}"], "3")
                 self.assertEqual(env[f"PANGU_CHUNKED_QKV_{stage}"], "1")
                 self.assertEqual(env[f"PANGU_CHUNKED_PROJ_{stage}"], "1")
                 self.assertEqual(env[f"PANGU_MLP_CHUNK_SIZE_{stage}"], "32768")
+
+    def test_buffer_intern_probe_preserves_historical_off_on_ab(self):
+        candidates = list(probe_uv_runtime_sweep.iter_candidates("buffer-intern"))
+        self.assertEqual(
+            [candidate["env"]["PANGU_INTERN_IMMUTABLE_BUFFERS"] for candidate in candidates],
+            ["0", "1"],
+        )
 
     def test_stage_options_apply_only_to_named_stage(self):
         model = nn.Module()

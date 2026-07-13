@@ -144,7 +144,8 @@ BASE_ENV = {
     "PANGU_HIP_SCHEDULE_SPIN": "0",
     "PANGU_HIP_PREFER_L1": "0",
     "PANGU_HIP_STREAM_SPIN": "0",
-    "PANGU_INTERN_IMMUTABLE_BUFFERS": "0",
+    # Buffer interning is the platform-verified 90.1048 guardrail default.
+    "PANGU_INTERN_IMMUTABLE_BUFFERS": "1",
 }
 
 for _stage in ("LAYER1", "LAYER2", "LAYER3", "LAYER4"):
@@ -220,6 +221,10 @@ def iter_candidates(preset="baseline"):
             "stagewise": STAGEWISE_CANDIDATES,
         }[preset]
         baseline_env = dict(BASE_ENV)
+        if preset == "buffer-intern":
+            # Retain the historical off/on diagnostic without weakening the
+            # HIP and stage-wise guardrail baseline.
+            baseline_env["PANGU_INTERN_IMMUTABLE_BUFFERS"] = "0"
         yield {
             "label": candidate_label(baseline_env),
             "kind": "baseline",
