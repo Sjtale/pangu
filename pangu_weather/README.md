@@ -129,7 +129,17 @@ python scripts/probe_uv_runtime_sweep.py --preset stagewise --repeat 5 --max-bat
 # 只盘点真正的 fused backend；不会重新运行已经失败的 SDPA fallback
 python scripts/probe_fast_attention_capability.py \
   --output logs/fast_attention_capability.json
+
+# 能力盘点发现 Flash 后，强制 Flash backend 验证 learned bias + shifted mask；
+# 不允许回退到 math/memory-efficient SDPA
+python scripts/probe_fast_attention_compatibility.py \
+  --output logs/fast_attention_compatibility.json
 ```
+
+兼容性报告只有在 `adapter_candidate=true` 且
+`decision=PROFILE_FOR_FUSED_KERNEL` 时才进入 `hipprof` 和完整模型 A/B。
+`STOP_PYTORCH_FLASH_AND_TEST_HIP_STAGEWISE` 表示组合 mask 无法使用强制
+Flash 路径，应停止该路线，不得把无 mask 的基础通过误认为 Pangu 兼容。
 
 `PANGU_ATTN_CHUNK_SIZE_LAYER{1..4}` 和
 `PANGU_MLP_CHUNK_SIZE_LAYER{1..4}` 的值 `0` 表示整 stage；对应的
