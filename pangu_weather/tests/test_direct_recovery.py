@@ -131,44 +131,6 @@ class DirectRecoveryTests(unittest.TestCase):
         self.assertEqual(actual.device.type, "cpu")
         self.assertTrue(torch.equal(actual, expected))
 
-    def test_scored_only_recovery_matches_subset_channels(self):
-        torch.manual_seed(42)
-        recovery = TinyPanguPatchRecovery(
-            img_size=(13, 16, 16),
-            patch_size=(2, 8, 8),
-            in_chans=3,
-            out_chans=5,
-        )
-        x = torch.randn(1, 3, 7, 2, 2)
-
-        expected = recovery(x)
-        actual = pangu_profile_model._direct_patch_recovery_scored_only(
-            recovery, x, width_chunk_size=1
-        )
-
-        self.assertEqual(tuple(actual.shape), tuple(expected.shape))
-
-        # Verify the 11 scored channels match expected perfectly
-        # Variables: Z (0), Q (1), T (2) at levels 2, 3, 5
-        for v in [0, 1, 2]:
-            for lvl in [2, 3, 5]:
-                diff = (actual[:, v, lvl] - expected[:, v, lvl]).abs().max().item()
-                self.assertLessEqual(diff, 1e-6)
-
-        # Variables: U (3), V (4) at level 5
-        for v in [3, 4]:
-            diff = (actual[:, v, 5] - expected[:, v, 5]).abs().max().item()
-            self.assertLessEqual(diff, 1e-6)
-
-        # Verify other channels are filled with zeros
-        for v in range(5):
-            for lvl in range(13):
-                if v in [0, 1, 2] and lvl in [2, 3, 5]:
-                    continue
-                if v in [3, 4] and lvl == 5:
-                    continue
-                self.assertEqual(actual[:, v, lvl].abs().max().item(), 0.0)
-
 
 class StreamedWeightResidencyTests(unittest.TestCase):
     def test_run_streamed_module_preserves_output(self):

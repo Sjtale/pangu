@@ -7,6 +7,7 @@ import types
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from unittest import mock
 
 import torch
 import torch.nn as nn
@@ -140,6 +141,73 @@ class UVRuntimeSwitchTests(unittest.TestCase):
         ranked = sorted(rows, key=rank_uv_candidates.sort_key)
         self.assertEqual(ranked[0]["label"], "steady-fast")
 
+    def test_p2_runtime_gates_separate_screen_from_final_promotion(self):
+        rows = [
+            {
+                "kind": "baseline",
+                "steady_latency_avg_ms": 100.0,
+                "steady_latency_p90_ms": 101.0,
+                "steady_latency_ms_values": [100.0, 100.2, 99.8],
+                "max_vram_mb": 500.0,
+                "output_max_abs": 0.0,
+            },
+            {
+                "kind": "p2-runtime",
+                "steady_latency_avg_ms": 99.0,
+                "steady_latency_p90_ms": 101.2,
+                "steady_latency_ms_values": [99.0, 99.2, 98.8],
+                "max_vram_mb": 501.0,
+                "output_max_abs": 0.0,
+                "env": {},
+            },
+            {
+                "kind": "p2-runtime",
+                "steady_latency_avg_ms": 97.0,
+                "steady_latency_p90_ms": 100.0,
+                "steady_latency_ms_values": [97.0, 97.2, 96.8],
+                "max_vram_mb": 501.0,
+                "output_max_abs": 0.0,
+                "env": {},
+            },
+            {
+                "kind": "p2-runtime",
+                "greedy_incremental": True,
+                "steady_latency_avg_ms": 99.7,
+                "steady_latency_p90_ms": 100.3,
+                "steady_latency_ms_values": [99.7, 99.9, 99.5],
+                "max_vram_mb": 501.0,
+                "output_max_abs": 0.0,
+                "env": {},
+            },
+        ]
+        gated = rank_uv_candidates.add_runtime_gates(rows)
+        self.assertEqual(
+            [row["promotion_gate"] for row in gated],
+            ["baseline", "screen-pass", "pass", "pass"],
+        )
+        self.assertLess(gated[2]["paired_bootstrap_ci95_ms"][1], 0.0)
+
+    def test_bias_reclaim_gate_requires_sixteen_mib_recovery(self):
+        rows = [
+            {
+                "kind": "baseline",
+                "steady_latency_avg_ms": 78.0,
+                "steady_latency_p90_ms": 78.5,
+                "max_vram_mb": 504.6,
+                "output_max_abs": 0.0,
+            },
+            {
+                "kind": "p2-bias-reclaim",
+                "steady_latency_avg_ms": 78.2,
+                "steady_latency_p90_ms": 78.6,
+                "max_vram_mb": 485.0,
+                "output_max_abs": 0.0,
+                "env": {},
+            },
+        ]
+        gated = rank_uv_candidates.add_runtime_gates(rows)
+        self.assertEqual(gated[1]["promotion_gate"], "pass")
+
     def test_default_uv_probe_only_measures_baseline(self):
         candidates = list(probe_uv_runtime_sweep.iter_candidates())
         self.assertEqual(len(candidates), 1)
@@ -164,7 +232,11 @@ class UVRuntimeSwitchTests(unittest.TestCase):
         self.assertEqual(env["PANGU_HIP_SCHEDULE_SPIN"], "0")
         self.assertEqual(env["PANGU_HIP_PREFER_L1"], "0")
         self.assertEqual(env["PANGU_HIP_STREAM_SPIN"], "0")
+        self.assertEqual(env["PANGU_HIP_NEAREST_CPU"], "0")
+        self.assertEqual(env["PANGU_HIP_SHARED_MEM_BANK_BYTES"], "0")
+        self.assertEqual(env["PANGU_HIP_STREAM_PRIORITY"], "0")
         self.assertEqual(env["PANGU_INTERN_IMMUTABLE_BUFFERS"], "1")
+        self.assertEqual(env["PANGU_P2_FULL_ROW_SCORE_STRIDE"], "144")
 
     def test_p2_tiled_preset_is_explicit_off_on_ab(self):
         candidates = list(probe_uv_runtime_sweep.iter_candidates("p2-tiled"))
@@ -222,6 +294,176 @@ class UVRuntimeSwitchTests(unittest.TestCase):
                 ("1", "1", "1"),
             ],
         )
+
+    def test_p2_runtime_probe_fixes_reclaim_and_isolates_new_controls(self):
+        candidates = list(probe_uv_runtime_sweep.iter_candidates("p2-runtime"))
+        self.assertEqual(len(candidates), 4)
+        self.assertEqual(
+            [candidate["kind"] for candidate in candidates],
+            ["baseline", "p2-runtime", "p2-runtime", "p2-runtime"],
+        )
+        for candidate in candidates:
+            env = candidate["env"]
+            self.assertEqual(env["PANGU_P2_TILED_ATTENTION"], "1")
+            self.assertEqual(env["PANGU_P2_TILED_MODE"], "full-row-fast")
+            self.assertEqual(env["PANGU_P2_RELEASE_ORIGINAL_BIAS"], "1")
+            self.assertEqual(env["PANGU_P2_RETAIN_CPU_BIAS_BACKUP"], "0")
+        enabled = [
+            (
+                candidate["env"]["PANGU_HIP_NEAREST_CPU"],
+                candidate["env"]["PANGU_HIP_SHARED_MEM_BANK_BYTES"],
+                candidate["env"]["PANGU_HIP_STREAM_PRIORITY"],
+            )
+            for candidate in candidates
+        ]
+        self.assertEqual(
+            enabled,
+            [
+                ("0", "0", "0"),
+                ("1", "0", "0"),
+                ("0", "8", "0"),
+                ("0", "0", "greatest"),
+            ],
+        )
+        self.assertEqual(len({candidate["label"] for candidate in candidates}), 4)
+
+    def test_p2_runtime_greedy_step_compares_base_with_one_added_control(self):
+        candidates = probe_uv_runtime_sweep.p2_runtime_greedy_candidates(
+            "nearest:bank8"
+        )
+        self.assertEqual([candidate["kind"] for candidate in candidates], ["baseline", "p2-runtime"])
+        self.assertEqual(
+            [candidate["env"]["PANGU_HIP_NEAREST_CPU"] for candidate in candidates],
+            ["1", "1"],
+        )
+        self.assertEqual(
+            [candidate["env"]["PANGU_HIP_SHARED_MEM_BANK_BYTES"] for candidate in candidates],
+            ["0", "8"],
+        )
+        self.assertEqual(
+            [candidate["greedy_controls"] for candidate in candidates],
+            [["nearest"], ["nearest", "bank8"]],
+        )
+        with self.assertRaisesRegex(ValueError, "already in the base"):
+            probe_uv_runtime_sweep.p2_runtime_greedy_candidates(
+                "nearest:nearest"
+            )
+
+    def test_p2_bias_reclaim_is_explicit_off_on_ab(self):
+        candidates = list(
+            probe_uv_runtime_sweep.iter_candidates("p2-bias-reclaim")
+        )
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(
+            [candidate["env"]["PANGU_P2_RELEASE_ORIGINAL_BIAS"] for candidate in candidates],
+            ["0", "1"],
+        )
+        for candidate in candidates:
+            self.assertEqual(candidate["env"]["PANGU_P2_TILED_ATTENTION"], "1")
+            self.assertEqual(candidate["env"]["PANGU_P2_TILED_MODE"], "full-row-fast")
+
+    def test_p2_stride_probe_isolates_aligned_lds_layouts(self):
+        candidates = list(probe_uv_runtime_sweep.iter_candidates("p2-stride"))
+        self.assertEqual(len(candidates), 3)
+        self.assertEqual(
+            [candidate["env"]["PANGU_P2_FULL_ROW_SCORE_STRIDE"] for candidate in candidates],
+            ["144", "148", "156"],
+        )
+        self.assertEqual(
+            [candidate["kind"] for candidate in candidates],
+            ["baseline", "p2-stride", "p2-stride"],
+        )
+        for candidate in candidates:
+            self.assertEqual(candidate["env"]["PANGU_P2_TILED_ATTENTION"], "1")
+            self.assertEqual(candidate["env"]["PANGU_P2_RELEASE_ORIGINAL_BIAS"], "1")
+
+    def test_p2_kernel_pipeline_is_explicit_canonical_candidate_ab(self):
+        candidates = list(
+            probe_uv_runtime_sweep.iter_candidates("p2-kernel-pipeline")
+        )
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(
+            [candidate["kind"] for candidate in candidates],
+            ["baseline", "p2-kernel"],
+        )
+        self.assertNotEqual(candidates[0]["label"], candidates[1]["label"])
+        self.assertEqual(
+            candidates[0]["env"]["PANGU_TILED_HIP_EXTRA_FLAGS"], ""
+        )
+        self.assertEqual(
+            candidates[1]["env"]["PANGU_TILED_HIP_EXTRA_FLAGS"],
+            "-DPANGU_FULL_ROW_DIRECT_SCORE_STORE=1 "
+            "-DPANGU_FULL_ROW_PV_DOUBLE_BUFFER=1",
+        )
+        for candidate in candidates:
+            self.assertEqual(candidate["env"]["PANGU_P2_TILED_ATTENTION"], "1")
+            self.assertEqual(candidate["env"]["PANGU_P2_TILED_MODE"], "full-row-fast")
+            self.assertEqual(candidate["env"]["PANGU_P2_RELEASE_ORIGINAL_BIAS"], "1")
+
+    def test_p2_qk32_isolates_qk_tile_on_platform_kernel(self):
+        candidates = list(probe_uv_runtime_sweep.iter_candidates("p2-qk32"))
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(
+            [candidate["kind"] for candidate in candidates],
+            ["baseline", "p2-qk32"],
+        )
+        self.assertEqual(
+            [candidate["env"]["PANGU_P2_FULL_ROW_QK_TILE"] for candidate in candidates],
+            ["16", "32"],
+        )
+        for candidate in candidates:
+            self.assertEqual(
+                candidate["env"]["PANGU_TILED_HIP_EXTRA_FLAGS"],
+                "-DPANGU_FULL_ROW_DIRECT_SCORE_STORE=1 "
+                "-DPANGU_FULL_ROW_PV_DOUBLE_BUFFER=1",
+            )
+            self.assertEqual(candidate["env"]["PANGU_P2_TILED_ATTENTION"], "1")
+            self.assertEqual(candidate["env"]["PANGU_P2_RELEASE_ORIGINAL_BIAS"], "1")
+
+    def test_interleaved_runner_reverses_candidate_order_each_round(self):
+        candidates = [
+            {"label": "base", "kind": "baseline", "env": {}},
+            {"label": "a", "kind": "p2-runtime", "env": {}},
+            {"label": "b", "kind": "p2-runtime", "env": {}},
+        ]
+        calls = []
+
+        def fake_run(candidate, **_kwargs):
+            calls.append(candidate["label"])
+            return {
+                "label": candidate["label"],
+                "kind": candidate["kind"],
+                "env": candidate["env"],
+                "returncode": 0,
+                "latency_ms_values": [101.0, 100.0],
+                "steady_latency_ms_values": [100.0],
+                "steady_latency_avg_ms": 100.0,
+                "steady_latency_p90_ms": 100.0,
+                "max_vram_mb": 500.0,
+                "current_vram_mb": 100.0,
+                "output_max_abs": 0.0,
+                "output_max_rel": 0.0,
+                "output_files": 1,
+            }
+
+        args = Namespace(
+            repeat=2,
+            max_batches=2,
+            python=sys.executable,
+            fp16_checkpoint=None,
+        )
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            probe_uv_runtime_sweep, "run_one", side_effect=fake_run
+        ):
+            root = Path(tmp)
+            results = probe_uv_runtime_sweep.run_interleaved(
+                candidates,
+                args=args,
+                pangu_dir=root,
+                output_dir=root / "output",
+            )
+        self.assertEqual(calls, ["base", "a", "b", "b", "a", "base"])
+        self.assertTrue(all(result["interleaved"] for result in results))
 
     def test_stagewise_probe_keeps_outer_stages_at_guardrail(self):
         candidates = list(probe_uv_runtime_sweep.iter_candidates("stagewise"))
@@ -351,6 +593,24 @@ class UVRuntimeSwitchTests(unittest.TestCase):
         self.assertIn('os.environ.setdefault("PANGU_HIP_SCHEDULE_SPIN", "0")', source)
         self.assertIn('os.environ.setdefault("PANGU_HIP_PREFER_L1", "0")', source)
         self.assertIn('os.environ.setdefault("PANGU_HIP_STREAM_SPIN", "0")', source)
+        self.assertIn('os.environ.setdefault("PANGU_HIP_NEAREST_CPU", "0")', source)
+        self.assertIn(
+            'os.environ.setdefault("PANGU_HIP_SHARED_MEM_BANK_BYTES", "0")',
+            source,
+        )
+        self.assertIn(
+            'os.environ.setdefault("PANGU_HIP_STREAM_PRIORITY", "0")', source
+        )
+        self.assertIn(
+            'os.environ.setdefault("PANGU_P2_RELEASE_ORIGINAL_BIAS", "1")',
+            source,
+        )
+        self.assertIn(
+            'os.environ.setdefault("PANGU_P2_FULL_ROW_SCORE_STRIDE", "144")',
+            source,
+        )
+        self.assertIn('"-DPANGU_FULL_ROW_DIRECT_SCORE_STORE=1 "', source)
+        self.assertIn('"-DPANGU_FULL_ROW_PV_DOUBLE_BUFFER=1"', source)
         self.assertIn(
             'os.environ.setdefault("PANGU_INTERN_IMMUTABLE_BUFFERS", "1")',
             source,

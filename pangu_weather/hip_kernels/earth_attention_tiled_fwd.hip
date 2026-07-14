@@ -5,6 +5,18 @@
 #include <cstddef>
 #include <cstdint>
 
+#ifndef PANGU_FULL_ROW_SCORE_STRIDE
+#define PANGU_FULL_ROW_SCORE_STRIDE 144
+#endif
+
+#ifndef PANGU_FULL_ROW_DIRECT_SCORE_STORE
+#define PANGU_FULL_ROW_DIRECT_SCORE_STORE 0
+#endif
+
+#ifndef PANGU_FULL_ROW_PV_DOUBLE_BUFFER
+#define PANGU_FULL_ROW_PV_DOUBLE_BUFFER 0
+#endif
+
 namespace {
 
 typedef _Float16 my_half4 __attribute__((ext_vector_type(4)));
@@ -15,6 +27,7 @@ constexpr int kKeyTile = 16;
 constexpr int kHeadDim = 32;
 constexpr int kBlockThreads = 256;
 constexpr int kMaxTokens = 144;
+constexpr int kFullRowScoreStride = PANGU_FULL_ROW_SCORE_STRIDE;
 
 constexpr std::size_t kHalfTileElements = kQueryTile * kHeadDim;
 constexpr std::size_t kScoreTileElements = kQueryTile * kKeyTile;
@@ -40,7 +53,8 @@ constexpr std::size_t kParityKVOffset =
     kParityQOffset + kHalfTileElements * sizeof(half);
 constexpr std::size_t kParityScoreOffset =
     kParityKVOffset + kHalfTileElements * sizeof(half);
-constexpr std::size_t kParityScoreElements = kQueryTile * kMaxTokens;
+constexpr std::size_t kParityScoreElements =
+    kQueryTile * kFullRowScoreStride;
 constexpr std::size_t kParityDynamicSharedBytes =
     kParityScoreOffset + kParityScoreElements * sizeof(half);
 
@@ -62,8 +76,24 @@ static_assert(
     kParityScoreOffset % alignof(half2) == 0,
     "parity score LDS must be half2 aligned");
 static_assert(
-    kParityDynamicSharedBytes == 6656,
-    "full-row parity LDS must remain below the 8 KiB occupancy boundary");
+    kFullRowScoreStride == 144 ||
+        kFullRowScoreStride == 148 ||
+        kFullRowScoreStride == 156,
+    "full-row score stride must be 144, 148, or 156");
+static_assert(
+    kFullRowScoreStride % 4 == 0,
+    "full-row score rows must preserve half4 alignment");
+static_assert(
+    PANGU_FULL_ROW_DIRECT_SCORE_STORE == 0 ||
+        PANGU_FULL_ROW_DIRECT_SCORE_STORE == 1,
+    "direct score store must be 0 or 1");
+static_assert(
+    PANGU_FULL_ROW_PV_DOUBLE_BUFFER == 0 ||
+        PANGU_FULL_ROW_PV_DOUBLE_BUFFER == 1,
+    "PV double buffer must be 0 or 1");
+static_assert(
+    kParityDynamicSharedBytes <= 8192,
+    "full-row parity LDS must remain within the 8 KiB occupancy target");
 
 __device__ __forceinline__ std::int64_t qkv_offset(
     int width_index,
@@ -667,8 +697,63 @@ __global__ void earth_attention_tiled_full_row_fwd_fp16_kernel(
             d = __builtin_amdgcn_mmac_f32_16x16x16f16(a_high, b_high, d);
 #endif
         }
+#if PANGU_FULL_ROW_DIRECT_SCORE_STORE
+        if(wave_id == 0)
+        {
+            const int row = lane_id % 16;
+            const int col_base = (lane_id / 16) * 4;
+#pragma unroll
+            for(int item = 0; item < 4; ++item)
+            {
+                const int query_index = query_start + row;
+                const int key_index = key_start + col_base + item;
+                half rounded_score = __float2half_rn(d[item]);
+                const std::int64_t stage_offset = diagnostic_offset(
+                    width_index,
+                    head_index,
+                    pressure_height_index,
+                    query_index,
+                    key_index,
+                    heads,
+                    pressure_height,
+                    tokens);
+                if constexpr (kDiagnostics)
+                {
+                    diagnostic_qk[stage_offset] = rounded_score;
+                }
+                const std::int16_t bias_index = position_index[
+                    static_cast<std::int64_t>(query_index) * tokens + key_index];
+                const std::int64_t bias_offset =
+                    (static_cast<std::int64_t>(head_index) * pressure_height +
+                     pressure_height_index) * bias_rows +
+                    static_cast<int>(bias_index);
+                rounded_score = __float2half_rn(
+                    __half2float(rounded_score) +
+                    __half2float(bias_table[bias_offset]));
+                if constexpr (kShifted)
+                {
+                    const std::int64_t region_base =
+                        (static_cast<std::int64_t>(masked_width_index) *
+                             pressure_height +
+                         pressure_height_index) * tokens;
+                    if(region_id[region_base + query_index] !=
+                       region_id[region_base + key_index])
+                    {
+                        rounded_score = __float2half_rn(
+                            __half2float(rounded_score) - 100.0f);
+                    }
+                }
+                full_scores[row * kFullRowScoreStride + key_index] =
+                    rounded_score;
+                if constexpr (kDiagnostics)
+                {
+                    diagnostic_biased[stage_offset] = rounded_score;
+                }
+            }
+        }
         __syncthreads();
-
+#else
+        __syncthreads();
         if(wave_id == 0)
         {
             const int row = lane_id % 16;
@@ -680,7 +765,6 @@ __global__ void earth_attention_tiled_full_row_fwd_fp16_kernel(
             }
         }
         __syncthreads();
-
         {
             const int row = thread_index / 16;
             const int column = thread_index % 16;
@@ -722,13 +806,14 @@ __global__ void earth_attention_tiled_full_row_fwd_fp16_kernel(
                         __half2float(rounded_score) - 100.0f);
                 }
             }
-            full_scores[row * kMaxTokens + key_index] = rounded_score;
+            full_scores[row * kFullRowScoreStride + key_index] = rounded_score;
             if constexpr (kDiagnostics)
             {
                 diagnostic_biased[stage_offset] = rounded_score;
             }
         }
         __syncthreads();
+#endif
     }
 
     if(tokens == 144)
@@ -737,7 +822,7 @@ __global__ void earth_attention_tiled_full_row_fwd_fp16_kernel(
         {
             const int row = wave_id * 4 + row_group;
             full_row_softmax<kStandardExp, 64, 4>(
-                full_scores + row * kMaxTokens,
+                full_scores + row * kFullRowScoreStride,
                 tokens,
                 lane_id);
         }
@@ -751,7 +836,7 @@ __global__ void earth_attention_tiled_full_row_fwd_fp16_kernel(
         {
             const int row = logical_group * 2 + batch;
             full_row_softmax<kStandardExp, 32, 1>(
-                full_scores + row * kMaxTokens,
+                full_scores + row * kFullRowScoreStride,
                 tokens,
                 logical_lane);
         }
@@ -777,7 +862,7 @@ __global__ void earth_attention_tiled_full_row_fwd_fp16_kernel(
                 pressure_height,
                 tokens);
             diagnostic_probability[stage_offset] =
-                full_scores[row * kMaxTokens + key_index];
+                full_scores[row * kFullRowScoreStride + key_index];
         }
     }
     __syncthreads();
@@ -790,8 +875,45 @@ __global__ void earth_attention_tiled_full_row_fwd_fp16_kernel(
     float pv_acc_1_y = 0.0f;
     float pv_acc_1_z = 0.0f;
     float pv_acc_1_w = 0.0f;
+#if PANGU_FULL_ROW_PV_DOUBLE_BUFFER
+    half* pv_current = kv_shared;
+    half* pv_next = q_shared;
+    for(int item = thread_index * 4;
+        item < static_cast<int>(kHalfTileElements);
+        item += kBlockThreads * 4)
+    {
+        const int key_row = item / kHeadDim;
+        const int dim_index = item % kHeadDim;
+        const std::int64_t offset =
+            plane_base + static_cast<std::int64_t>(key_row) * token_stride +
+            2 * head_stride + dim_index;
+        *reinterpret_cast<my_half4*>(pv_current + item) =
+            *reinterpret_cast<const my_half4*>(qkv + offset);
+    }
+    __syncthreads();
+#endif
     for(int key_start = 0; key_start < tokens; key_start += kKeyTile)
     {
+#if PANGU_FULL_ROW_PV_DOUBLE_BUFFER
+        const int next_key_start = key_start + kKeyTile;
+        if(next_key_start < tokens)
+        {
+            for(int item = thread_index * 4;
+                item < static_cast<int>(kHalfTileElements);
+                item += kBlockThreads * 4)
+            {
+                const int key_row = item / kHeadDim;
+                const int dim_index = item % kHeadDim;
+                const int key_index = next_key_start + key_row;
+                const std::int64_t offset =
+                    plane_base +
+                    static_cast<std::int64_t>(key_index) * token_stride +
+                    2 * head_stride + dim_index;
+                *reinterpret_cast<my_half4*>(pv_next + item) =
+                    *reinterpret_cast<const my_half4*>(qkv + offset);
+            }
+        }
+#else
         for(int item = thread_index * 4;
             item < static_cast<int>(kHalfTileElements);
             item += kBlockThreads * 4)
@@ -806,6 +928,7 @@ __global__ void earth_attention_tiled_full_row_fwd_fp16_kernel(
                 *reinterpret_cast<const my_half4*>(qkv + offset);
         }
         __syncthreads();
+#endif
 
         my_half4 probability = {0.0f, 0.0f, 0.0f, 0.0f};
         my_half4 value = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -815,15 +938,22 @@ __global__ void earth_attention_tiled_full_row_fwd_fp16_kernel(
             const int r_A = lane_id % 16;
             const int c_A_base = (lane_id / 16) * 4;
             probability = *reinterpret_cast<const my_half4*>(
-                full_scores + r_A * kMaxTokens + key_start + c_A_base);
+                full_scores + r_A * kFullRowScoreStride + key_start + c_A_base);
 
             const int c_B = ((lane_id & 3) << 2) | ((lane_id & 12) >> 2);
             const int r_B_base = (lane_id / 16) * 4;
             const int dim_offset = wave_id == 3 ? 16 : 0;
+#if PANGU_FULL_ROW_PV_DOUBLE_BUFFER
+            value.x = pv_current[(r_B_base + 0) * kHeadDim + c_B + dim_offset];
+            value.y = pv_current[(r_B_base + 1) * kHeadDim + c_B + dim_offset];
+            value.z = pv_current[(r_B_base + 2) * kHeadDim + c_B + dim_offset];
+            value.w = pv_current[(r_B_base + 3) * kHeadDim + c_B + dim_offset];
+#else
             value.x = kv_shared[(r_B_base + 0) * kHeadDim + c_B + dim_offset];
             value.y = kv_shared[(r_B_base + 1) * kHeadDim + c_B + dim_offset];
             value.z = kv_shared[(r_B_base + 2) * kHeadDim + c_B + dim_offset];
             value.w = kv_shared[(r_B_base + 3) * kHeadDim + c_B + dim_offset];
+#endif
             if(wave_id == 2)
             {
                 accumulator.x = pv_acc_0_x;
@@ -859,7 +989,17 @@ __global__ void earth_attention_tiled_full_row_fwd_fp16_kernel(
                 pv_acc_1_w = accumulator.w;
             }
         }
+#if PANGU_FULL_ROW_PV_DOUBLE_BUFFER
+        if(next_key_start < tokens)
+        {
+            __syncthreads();
+            half* temporary = pv_current;
+            pv_current = pv_next;
+            pv_next = temporary;
+        }
+#else
         __syncthreads();
+#endif
     }
 
     if(wave_id == 2 || wave_id == 3)

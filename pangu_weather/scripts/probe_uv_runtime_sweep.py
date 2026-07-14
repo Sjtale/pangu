@@ -72,6 +72,19 @@ HIP_CANDIDATES = [
     },
 ]
 
+P2_RUNTIME_CANDIDATES = [
+    {"PANGU_HIP_NEAREST_CPU": "1"},
+    {"PANGU_HIP_SHARED_MEM_BANK_BYTES": "8"},
+    {"PANGU_HIP_STREAM_PRIORITY": "greatest"},
+]
+
+P2_RUNTIME_CONTROL_ENV = {
+    "nearest": {"PANGU_HIP_NEAREST_CPU": "1"},
+    "bank8": {"PANGU_HIP_SHARED_MEM_BANK_BYTES": "8"},
+    "priority": {"PANGU_HIP_STREAM_PRIORITY": "greatest"},
+    "stream-spin": {"PANGU_HIP_STREAM_SPIN": "1"},
+}
+
 STAGEWISE_CANDIDATES = [
     {
         "PANGU_ATTN_CHUNK_SIZE_LAYER2": "4",
@@ -144,11 +157,21 @@ BASE_ENV = {
     "PANGU_HIP_SCHEDULE_SPIN": "0",
     "PANGU_HIP_PREFER_L1": "0",
     "PANGU_HIP_STREAM_SPIN": "0",
+    "PANGU_HIP_NEAREST_CPU": "0",
+    "PANGU_HIP_SHARED_MEM_BANK_BYTES": "0",
+    "PANGU_HIP_STREAM_PRIORITY": "0",
     # P2 is an explicit full-model A/B candidate; keep every other preset
     # production-safe even if the caller's shell exports the flag.
     "PANGU_P2_TILED_ATTENTION": "0",
     "PANGU_P2_TILED_MODE": "online",
     "PANGU_P2_FULL_WIDTH": "1",
+    "PANGU_P2_RELEASE_ORIGINAL_BIAS": "0",
+    "PANGU_P2_RETAIN_CPU_BIAS_BACKUP": "0",
+    "PANGU_P2_FULL_ROW_SCORE_STRIDE": "144",
+    "PANGU_P2_FULL_ROW_QK_TILE": "16",
+    # Every full-model row owns its compiler flags. Never inherit an isolated
+    # kernel experiment from the caller's shell into both sides of an A/B.
+    "PANGU_TILED_HIP_EXTRA_FLAGS": "",
     # Buffer interning is the platform-verified 90.1048 guardrail default.
     "PANGU_INTERN_IMMUTABLE_BUFFERS": "1",
 }
@@ -189,7 +212,13 @@ def candidate_label(env):
         f"_hip{env['PANGU_HIP_SCHEDULE_SPIN']}"
         f"{env['PANGU_HIP_PREFER_L1']}"
         f"{env['PANGU_HIP_STREAM_SPIN']}"
+        f"_near{env['PANGU_HIP_NEAREST_CPU']}"
+        f"_bank{env['PANGU_HIP_SHARED_MEM_BANK_BYTES']}"
+        f"_prio{env['PANGU_HIP_STREAM_PRIORITY']}"
         f"_p2{env.get('PANGU_P2_TILED_ATTENTION', '0')}"
+        f"_bias{env.get('PANGU_P2_RELEASE_ORIGINAL_BIAS', '0')}"
+        f"_stride{env.get('PANGU_P2_FULL_ROW_SCORE_STRIDE', '144')}"
+        f"_qkt{env.get('PANGU_P2_FULL_ROW_QK_TILE', '16')}"
         f"_l23a{env['PANGU_ATTN_CHUNK_SIZE_LAYER2']}"
         f"q{env['PANGU_CHUNKED_QKV_LAYER2']}"
         f"p{env['PANGU_CHUNKED_PROJ_LAYER2']}"
@@ -232,6 +261,127 @@ def iter_candidates(preset="baseline"):
                 "kind": kind,
                 "env": env,
             }
+        return
+
+    if preset == "p2-runtime":
+        baseline_env = dict(BASE_ENV)
+        baseline_env.update(
+            {
+                "PANGU_P2_TILED_ATTENTION": "1",
+                "PANGU_P2_TILED_MODE": "full-row-fast",
+                "PANGU_P2_RELEASE_ORIGINAL_BIAS": "1",
+            }
+        )
+        validate_env(baseline_env)
+        yield {
+            "label": candidate_label(baseline_env),
+            "kind": "baseline",
+            "env": baseline_env,
+        }
+        for values in P2_RUNTIME_CANDIDATES:
+            env = dict(baseline_env)
+            env.update(values)
+            validate_env(env)
+            yield {
+                "label": candidate_label(env),
+                "kind": "p2-runtime",
+                "env": env,
+            }
+        return
+
+    if preset == "p2-bias-reclaim":
+        for release, kind in (("0", "baseline"), ("1", "p2-bias-reclaim")):
+            env = dict(BASE_ENV)
+            env.update(
+                {
+                    "PANGU_P2_TILED_ATTENTION": "1",
+                    "PANGU_P2_TILED_MODE": "full-row-fast",
+                    "PANGU_P2_RELEASE_ORIGINAL_BIAS": release,
+                }
+            )
+            validate_env(env)
+            yield {
+                "label": candidate_label(env),
+                "kind": kind,
+                "env": env,
+            }
+        return
+
+    if preset == "p2-stride":
+        for stride, kind in (("144", "baseline"), ("148", "p2-stride"), ("156", "p2-stride")):
+            env = dict(BASE_ENV)
+            env.update(
+                {
+                    "PANGU_P2_TILED_ATTENTION": "1",
+                    "PANGU_P2_TILED_MODE": "full-row-fast",
+                    "PANGU_P2_RELEASE_ORIGINAL_BIAS": "1",
+                    "PANGU_P2_FULL_ROW_SCORE_STRIDE": stride,
+                }
+            )
+            validate_env(env)
+            yield {
+                "label": candidate_label(env),
+                "kind": kind,
+                "env": env,
+            }
+        return
+
+    if preset == "p2-kernel-pipeline":
+        base_env = dict(BASE_ENV)
+        base_env.update(
+            {
+                "PANGU_P2_TILED_ATTENTION": "1",
+                "PANGU_P2_TILED_MODE": "full-row-fast",
+                "PANGU_P2_RELEASE_ORIGINAL_BIAS": "1",
+            }
+        )
+        candidate_env = dict(base_env)
+        candidate_env["PANGU_TILED_HIP_EXTRA_FLAGS"] = (
+            "-DPANGU_FULL_ROW_DIRECT_SCORE_STORE=1 "
+            "-DPANGU_FULL_ROW_PV_DOUBLE_BUFFER=1"
+        )
+        validate_env(base_env)
+        validate_env(candidate_env)
+        yield {
+            "label": candidate_label(base_env) + "_kpipe0",
+            "kind": "baseline",
+            "env": base_env,
+        }
+        yield {
+            "label": candidate_label(candidate_env) + "_kpipe1",
+            "kind": "p2-kernel",
+            "env": candidate_env,
+        }
+        return
+
+    if preset == "p2-qk32":
+        base_env = dict(BASE_ENV)
+        base_env.update(
+            {
+                "PANGU_P2_TILED_ATTENTION": "1",
+                "PANGU_P2_TILED_MODE": "full-row-fast",
+                "PANGU_P2_RELEASE_ORIGINAL_BIAS": "1",
+                "PANGU_P2_FULL_ROW_QK_TILE": "16",
+                "PANGU_TILED_HIP_EXTRA_FLAGS": (
+                    "-DPANGU_FULL_ROW_DIRECT_SCORE_STORE=1 "
+                    "-DPANGU_FULL_ROW_PV_DOUBLE_BUFFER=1"
+                ),
+            }
+        )
+        candidate_env = dict(base_env)
+        candidate_env["PANGU_P2_FULL_ROW_QK_TILE"] = "32"
+        validate_env(base_env)
+        validate_env(candidate_env)
+        yield {
+            "label": candidate_label(base_env) + "_qk16",
+            "kind": "baseline",
+            "env": base_env,
+        }
+        yield {
+            "label": candidate_label(candidate_env) + "_qk32",
+            "kind": "p2-qk32",
+            "env": candidate_env,
+        }
         return
 
     if preset in {"hip", "buffer-intern", "stagewise"}:
@@ -342,6 +492,48 @@ def checkpoint_ab_candidates(candidates, baseline_checkpoint, candidate_checkpoi
     candidate["env"]["PANGU_FP16_CHECKPOINT"] = candidate_checkpoint
     candidate["label"] = candidates[0]["label"] + "_ckptcandidate"
     return [baseline, candidate]
+
+
+def p2_runtime_greedy_candidates(spec):
+    """Build an incremental A/B such as ``nearest:bank8``."""
+
+    if spec.count(":") != 1:
+        raise ValueError("greedy step must use BASE_CONTROLS:ADDED_CONTROL")
+    raw_base, added = spec.split(":", 1)
+    base_controls = [value for value in raw_base.split(",") if value]
+    if added not in P2_RUNTIME_CONTROL_ENV:
+        raise ValueError(f"unknown added P2 runtime control: {added}")
+    if len(base_controls) != len(set(base_controls)):
+        raise ValueError("greedy base controls must be unique")
+    unknown = [
+        control for control in base_controls if control not in P2_RUNTIME_CONTROL_ENV
+    ]
+    if unknown:
+        raise ValueError(f"unknown base P2 runtime control: {unknown[0]}")
+    if added in base_controls:
+        raise ValueError("added P2 runtime control is already in the base")
+
+    base_env = dict(next(iter(iter_candidates("p2-runtime")))["env"])
+    for control in base_controls:
+        base_env.update(P2_RUNTIME_CONTROL_ENV[control])
+    candidate_env = dict(base_env)
+    candidate_env.update(P2_RUNTIME_CONTROL_ENV[added])
+    return [
+        {
+            "label": candidate_label(base_env),
+            "kind": "baseline",
+            "env": base_env,
+            "greedy_controls": base_controls,
+            "greedy_incremental": False,
+        },
+        {
+            "label": candidate_label(candidate_env),
+            "kind": "p2-runtime",
+            "env": candidate_env,
+            "greedy_controls": [*base_controls, added],
+            "greedy_incremental": True,
+        },
+    ]
 
 
 def reset_output_dir(path):
@@ -465,6 +657,8 @@ def run_one(candidate, *, args, pangu_dir, output_dir, baseline_dir):
         "label": candidate["label"],
         "kind": candidate["kind"],
         "env": candidate["env"],
+        "greedy_controls": candidate.get("greedy_controls"),
+        "greedy_incremental": candidate.get("greedy_incremental", False),
         "returncode": 0,
         "repeat": args.repeat,
         "max_batches": args.max_batches,
@@ -493,6 +687,116 @@ def run_one(candidate, *, args, pangu_dir, output_dir, baseline_dir):
         "stdout_tail": stdout_tail,
         **output_metrics,
     }
+
+
+def _aggregate_interleaved_runs(candidate, runs, repeat, max_batches):
+    failure = next((run for run in runs if run.get("returncode") != 0), None)
+    if failure is not None:
+        return failure
+    latency_values = [
+        value for run in runs for value in run.get("latency_ms_values", [])
+    ]
+    steady_rounds = [run.get("steady_latency_ms_values", []) for run in runs]
+    steady_values = [value for values in steady_rounds for value in values]
+
+    def maximum(key):
+        values = [run.get(key) for run in runs if run.get(key) is not None]
+        return max(values) if values else None
+
+    output_abs = [
+        run.get("output_max_abs")
+        for run in runs
+        if run.get("output_max_abs") is not None
+    ]
+    output_rel = [
+        run.get("output_max_rel")
+        for run in runs
+        if run.get("output_max_rel") is not None
+    ]
+    return {
+        "label": candidate["label"],
+        "kind": candidate["kind"],
+        "env": candidate["env"],
+        "greedy_controls": candidate.get("greedy_controls"),
+        "greedy_incremental": candidate.get("greedy_incremental", False),
+        "returncode": 0,
+        "repeat": repeat,
+        "max_batches": max_batches,
+        "interleaved": True,
+        "latency_ms_values": latency_values,
+        "latency_avg_ms": float(np.mean(latency_values)) if latency_values else None,
+        "latency_min_ms": float(np.min(latency_values)) if latency_values else None,
+        "latency_p50_ms": float(np.median(latency_values)) if latency_values else None,
+        "steady_latency_rounds_ms": steady_rounds,
+        "steady_latency_ms_values": steady_values,
+        "steady_latency_avg_ms": float(np.mean(steady_values)) if steady_values else None,
+        "steady_latency_p50_ms": float(np.median(steady_values)) if steady_values else None,
+        "steady_latency_p90_ms": (
+            float(np.percentile(steady_values, 90)) if steady_values else None
+        ),
+        "steady_latency_std_ms": float(np.std(steady_values)) if steady_values else None,
+        "max_vram_mb": maximum("max_vram_mb"),
+        "reserved_mb": maximum("reserved_mb"),
+        "current_vram_mb": runs[-1].get("current_vram_mb"),
+        "wall_time_s": sum(run.get("wall_time_s", 0.0) for run in runs),
+        "stdout_tail": runs[-1].get("stdout_tail", ""),
+        "output_max_abs": max(output_abs) if output_abs else None,
+        "output_max_rel": max(output_rel) if output_rel else None,
+        "output_files": maximum("output_files"),
+    }
+
+
+def run_interleaved(candidates, *, args, pangu_dir, output_dir):
+    """Alternate candidate order by subprocess round to control drift."""
+
+    single_args = argparse.Namespace(**vars(args))
+    single_args.repeat = 1
+    runs_by_label = {candidate["label"]: [] for candidate in candidates}
+    baseline_dir = None
+    for round_index in range(args.repeat):
+        ordered = candidates if round_index % 2 == 0 else list(reversed(candidates))
+        for candidate in ordered:
+            print(
+                f"[round {round_index + 1}/{args.repeat}] "
+                f"{candidate['label']}"
+            )
+            result = run_one(
+                candidate,
+                args=single_args,
+                pangu_dir=pangu_dir,
+                output_dir=output_dir,
+                baseline_dir=baseline_dir,
+            )
+            runs_by_label[candidate["label"]].append(result)
+            if (
+                baseline_dir is None
+                and candidate["kind"] == "baseline"
+                and result.get("returncode") == 0
+            ):
+                baseline_dir = pangu_dir / "result" / "uv_sweep_baseline"
+                reset_output_dir(baseline_dir)
+                for npy_path in output_dir.glob("*.npy"):
+                    shutil.copy2(npy_path, baseline_dir / npy_path.name)
+            if result.get("returncode") != 0:
+                return [
+                    _aggregate_interleaved_runs(
+                        item,
+                        runs_by_label[item["label"]],
+                        args.repeat,
+                        args.max_batches,
+                    )
+                    for item in candidates
+                    if runs_by_label[item["label"]]
+                ]
+    return [
+        _aggregate_interleaved_runs(
+            candidate,
+            runs_by_label[candidate["label"]],
+            args.repeat,
+            args.max_batches,
+        )
+        for candidate in candidates
+    ]
 
 
 def make_log_path(path):
@@ -525,12 +829,22 @@ def main():
         help="Force immutable-buffer interning off/on for every emitted candidate.",
     )
     parser.add_argument(
+        "--p2-runtime-greedy-step",
+        default=None,
+        help=(
+            "With --preset p2-runtime, compare BASE_CONTROLS:ADDED_CONTROL; "
+            "controls are nearest,bank8,priority,stream-spin. Example: "
+            "nearest:bank8. Use :nearest for the first step."
+        ),
+    )
+    parser.add_argument(
         "--preset",
         choices=[
             "baseline", "compact-mask", "direct-mask", "cuda-graph", "cpu-recovery",
             "full-recovery", "focused", "full", "pangu-lite-2d", "hip",
             "buffer-intern", "stagewise",
-            "p2-tiled",
+            "p2-tiled", "p2-bias-reclaim", "p2-runtime", "p2-stride",
+            "p2-kernel-pipeline", "p2-qk32",
         ],
         default="baseline",
         help=(
@@ -541,7 +855,15 @@ def main():
             "hip isolates the three HIP runtime controls; buffer-intern shares "
             "identical FP16 masks/indexes; stagewise screens three layer2/3 "
             "chunk schedules; p2-tiled runs an explicit off/on full-model A/B "
-            "for pgw_lite_pruned_96; focused sweeps attention chunk size; full "
+            "for pgw_lite_pruned_96; p2-runtime fixes P2 plus bias reclaim and "
+            "p2-bias-reclaim isolates original-bias GPU release; "
+            "isolates NUMA, LDS-bank, and stream-priority controls; focused "
+            "p2-stride compares full-row LDS strides 144/148/156; "
+            "p2-kernel-pipeline compares canonical P2 with the exact direct-score "
+            "store plus PV-double-buffer kernel; "
+            "p2-qk32 compares that platform kernel with a 32-key QK tile while "
+            "retaining the 16-key PV double buffer; "
+            "sweeps attention chunk size; full "
             "is the broad diagnostic grid."
         ),
     )
@@ -559,6 +881,15 @@ def main():
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     candidates = list(iter_candidates(args.preset))
+    if args.p2_runtime_greedy_step is not None:
+        if args.preset != "p2-runtime":
+            parser.error("--p2-runtime-greedy-step requires --preset p2-runtime")
+        try:
+            candidates = p2_runtime_greedy_candidates(
+                args.p2_runtime_greedy_step
+            )
+        except ValueError as error:
+            parser.error(str(error))
     if args.buffer_intern is not None:
         for candidate in candidates:
             candidate["env"] = dict(candidate["env"])
@@ -584,6 +915,30 @@ def main():
         return
 
     output_dir = pangu_dir / "result" / "output"
+    if args.preset in {
+        "p2-bias-reclaim", "p2-runtime", "p2-stride", "p2-kernel-pipeline",
+        "p2-qk32",
+    }:
+        results = run_interleaved(
+            candidates,
+            args=args,
+            pangu_dir=pangu_dir,
+            output_dir=output_dir,
+        )
+        with log_path.open("w", encoding="utf-8") as log_file:
+            for result in results:
+                log_file.write(
+                    json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n"
+                )
+                print(
+                    f"  {result.get('label')} rc={result.get('returncode')} "
+                    f"steady={result.get('steady_latency_avg_ms')} "
+                    f"vram={result.get('max_vram_mb')} "
+                    f"err={result.get('output_max_abs')}"
+                )
+        print(f"wrote {log_path}")
+        return
+
     baseline_dir = None
     with log_path.open("w", encoding="utf-8") as log_file:
         for index, candidate in enumerate(candidates, start=1):

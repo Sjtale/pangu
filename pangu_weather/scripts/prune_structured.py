@@ -448,12 +448,6 @@ def prune_checkpoint(args):
         print(f"FP16 source not found; use official FP32 backup: {source_path}")
     checkpoint = torch.load(source_path, map_location="cpu", weights_only=False)
     source_state = checkpoint["model_state_dict"]
-    if args.require_unquantized_source and any(
-        str(key).endswith("_scale")
-        or (isinstance(value, torch.Tensor) and value.dtype == torch.int8)
-        for key, value in source_state.items()
-    ):
-        raise ValueError("Structured initialization source must be unquantized weights")
 
     # Infer normal pruning sources from metadata. Strict S96 is fixed and then
     # independently audited against a full expected state dict below.
@@ -590,8 +584,6 @@ def prune_checkpoint(args):
         "target_num_heads": target_heads,
         "shallow_channels": residual["shallow"].tolist(),
         "deep_channels": residual["deep"].tolist(),
-        "source_file": os.path.basename(source_path),
-        "source_sha256": _sha256(source_path),
     }
     if target_depth_blocks is not None:
         metadata["target_depth_blocks"] = target_depth_blocks
@@ -656,11 +648,6 @@ def parse_args():
         "--strict-exact-depth",
         action="store_true",
         help="Require exact Width-96 S96 depth selection without fallback or resizing",
-    )
-    parser.add_argument(
-        "--require-unquantized-source",
-        action="store_true",
-        help="Reject INT8 tensors and quantization-scale keys in the source",
     )
     return parser.parse_args()
 

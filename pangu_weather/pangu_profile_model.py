@@ -652,85 +652,6 @@ def _direct_patch_recovery(
     return output
 
 
-def _direct_patch_recovery_scored_only(recovery_module, x, width_chunk_size=None):
-    """Recover ONLY the 15 scored channels of Pangu-Weather to maximize speed and minimize memory."""
-    recovery = getattr(recovery_module, "recovery", recovery_module)
-
-    if x.ndim != 5:
-        return _direct_patch_recovery(recovery_module, x, width_chunk_size)
-
-    proj = recovery.proj
-    patch_pressure, patch_height, patch_width = tuple(proj.kernel_size)
-    Batch, Channels, PressureLevels, Height, Width = x.shape
-
-    if PressureLevels != 7 or recovery.out_chans != 5:
-        return _direct_patch_recovery(recovery_module, x, width_chunk_size)
-
-    output = x.new_zeros((Batch, 5, 13, *tuple(recovery.img_size[1:])))
-
-    weight = proj.weight.reshape(Channels, 5, patch_pressure, patch_height, patch_width)
-    bias = proj.bias if proj.bias is not None else None
-
-    width_chunk_size = (
-        Width
-        if width_chunk_size is None or int(width_chunk_size) <= 0
-        else min(int(width_chunk_size), Width)
-    )
-
-    (
-        crop_pressure_start,
-        crop_pressure_end,
-        crop_height_start,
-        crop_height_end,
-        crop_width_start,
-        crop_width_end,
-    ) = _recovery_crop_bounds(recovery, (14, Height * patch_height, Width * patch_width))
-
-    for start in range(0, Width, width_chunk_size):
-        end = min(start + width_chunk_size, Width)
-        chunk_w = end - start
-
-        # 1. p_idx = 1 (contributes to output levels 2 and 3)
-        # variables 0:3 (Z, Q, T)
-        w_sub1 = weight[:, 0:3, :, :, :].reshape(Channels, 3 * 2 * patch_height * patch_width)
-        x_sub1 = x[:, :, 1:2, :, start:end]
-
-        blocks1 = x_sub1.permute(0, 2, 3, 4, 1).reshape(-1, Channels).matmul(w_sub1)
-        blocks1 = blocks1.reshape(Batch, 1, Height, chunk_w, 3, 2, patch_height, patch_width)
-        chunk1 = blocks1.permute(0, 4, 1, 5, 2, 6, 3, 7).reshape(Batch, 3, 2, Height * patch_height, chunk_w * patch_width)
-        if bias is not None:
-            chunk1 = chunk1 + bias[0:3].view(1, 3, 1, 1, 1)
-
-        # 2. p_idx = 2 (contributes to output level 5)
-        # variables 0:5 (Z, Q, T, U, V) at p_offset = 1
-        w_sub2 = weight[:, :, 1:2, :, :].reshape(Channels, 5 * 1 * patch_height * patch_width)
-        x_sub2 = x[:, :, 2:3, :, start:end]
-
-        blocks2 = x_sub2.permute(0, 2, 3, 4, 1).reshape(-1, Channels).matmul(w_sub2)
-        blocks2 = blocks2.reshape(Batch, 1, Height, chunk_w, 5, 1, patch_height, patch_width)
-        chunk2 = blocks2.permute(0, 4, 1, 5, 2, 6, 3, 7).reshape(Batch, 5, 1, Height * patch_height, chunk_w * patch_width)
-        if bias is not None:
-            chunk2 = chunk2 + bias.view(1, 5, 1, 1, 1)
-
-        chunk_width_start = start * patch_width
-        chunk_width_end = end * patch_width
-        overlap_start = max(chunk_width_start, crop_width_start)
-        overlap_end = min(chunk_width_end, crop_width_end)
-
-        if overlap_start < overlap_end:
-            source_width = slice(overlap_start - chunk_width_start, overlap_end - chunk_width_start)
-            dest_width = slice(overlap_start - crop_width_start, overlap_end - crop_width_start)
-            h_slice_src = slice(crop_height_start, crop_height_end)
-
-            output[:, 0:3, 2, :, dest_width].copy_(chunk1[:, :, 0, h_slice_src, source_width])
-            output[:, 0:3, 3, :, dest_width].copy_(chunk1[:, :, 1, h_slice_src, source_width])
-            output[:, 0:5, 5, :, dest_width].copy_(chunk2[:, :, 0, h_slice_src, source_width])
-
-        del chunk1, chunk2
-
-    return output
-
-
 def _chunked_patchrecovery3d(recovery_module, x, chunk_size):
     """Recover upper-air variables in output-channel chunks to lower peak VRAM."""
 
@@ -779,12 +700,6 @@ def _recover_surface(model, output_surface):
 
 def _recover_upper_air(model, output_upper_air):
     if _is_enabled("PANGU_DIRECT_RECOVERY"):
-        if _is_enabled("PANGU_SCORED_ONLY_RECOVERY"):
-            return _direct_patch_recovery_scored_only(
-                model.patchrecovery3d,
-                output_upper_air,
-                width_chunk_size=_direct_recovery_width_chunk(),
-            )
         return _direct_patch_recovery(
             model.patchrecovery3d,
             output_upper_air,

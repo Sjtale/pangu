@@ -4,6 +4,7 @@
 import argparse
 import csv
 import json
+import random
 from pathlib import Path
 
 
@@ -123,9 +124,33 @@ def format_row(row, is_pareto):
         "output_max_abs": row.get("output_max_abs"),
         "latency_delta_pct": row.get("latency_delta_pct"),
         "vram_delta_mb": row.get("vram_delta_mb"),
+        "p90_delta_pct": row.get("p90_delta_pct"),
+        "paired_delta_mean_ms": row.get("paired_delta_mean_ms"),
+        "paired_bootstrap_ci95_ms": row.get("paired_bootstrap_ci95_ms"),
+        "greedy_controls": row.get("greedy_controls"),
         "promotion_gate": row.get("promotion_gate"),
         "returncode": row.get("returncode"),
     }
+
+
+def _paired_bootstrap(baseline_values, candidate_values, samples=10000):
+    if not baseline_values or len(baseline_values) != len(candidate_values):
+        return None
+    deltas = [
+        float(candidate) - float(baseline)
+        for baseline, candidate in zip(baseline_values, candidate_values)
+    ]
+    generator = random.Random(17)
+    means = []
+    for _ in range(samples):
+        means.append(
+            sum(deltas[generator.randrange(len(deltas))] for _ in deltas)
+            / len(deltas)
+        )
+    means.sort()
+    lower = means[int(0.025 * (len(means) - 1))]
+    upper = means[int(0.975 * (len(means) - 1))]
+    return sum(deltas) / len(deltas), [lower, upper]
 
 
 def add_runtime_gates(rows):
@@ -133,6 +158,7 @@ def add_runtime_gates(rows):
     if baseline is None:
         return rows
     baseline_latency = baseline.get("steady_latency_avg_ms")
+    baseline_p90 = baseline.get("steady_latency_p90_ms")
     baseline_vram = baseline.get("max_vram_mb")
     for row in rows:
         if row is baseline:
@@ -145,8 +171,22 @@ def add_runtime_gates(rows):
             continue
         latency_delta_pct = 100.0 * (latency / baseline_latency - 1.0)
         vram_delta_mb = None if baseline_vram is None or vram is None else vram - baseline_vram
+        p90 = row.get("steady_latency_p90_ms")
+        p90_delta_pct = (
+            None
+            if baseline_p90 is None or p90 is None
+            else 100.0 * (p90 / baseline_p90 - 1.0)
+        )
         row["latency_delta_pct"] = latency_delta_pct
         row["vram_delta_mb"] = vram_delta_mb
+        row["p90_delta_pct"] = p90_delta_pct
+        paired = _paired_bootstrap(
+            baseline.get("steady_latency_ms_values", []),
+            row.get("steady_latency_ms_values", []),
+        )
+        if paired is not None:
+            row["paired_delta_mean_ms"] = paired[0]
+            row["paired_bootstrap_ci95_ms"] = paired[1]
         env = row.get("env", {})
         if env.get("PANGU_DISABLE_CUDA_GRAPH") == "0":
             passed = (
@@ -156,6 +196,50 @@ def add_runtime_gates(rows):
             )
         elif env.get("PANGU_DIRECT_MASK_SLICE") == "1":
             passed = latency_delta_pct <= -3.0 and row["output_max_abs"] == 0.0
+        elif row.get("kind") == "p2-bias-reclaim":
+            passed = (
+                latency_delta_pct <= 1.0
+                and p90_delta_pct is not None
+                and p90_delta_pct <= 0.5
+                and vram_delta_mb is not None
+                and vram_delta_mb <= -16.0
+                and row["output_max_abs"] == 0.0
+            )
+        elif row.get("kind") in {"p2-runtime", "p2-stride", "p2-kernel"}:
+            exact = row["output_max_abs"] == 0.0
+            memory_ok = vram_delta_mb is None or vram_delta_mb <= 2.0
+            tail_screen_ok = p90_delta_pct is not None and p90_delta_pct <= 0.5
+            screen = (
+                latency_delta_pct <= -0.5
+                and tail_screen_ok
+                and memory_ok
+                and exact
+            )
+            ci = row.get("paired_bootstrap_ci95_ms")
+            if row.get("greedy_incremental", False):
+                passed = (
+                    latency_delta_pct <= -0.25
+                    and tail_screen_ok
+                    and ci is not None
+                    and ci[1] < 0.0
+                    and memory_ok
+                    and exact
+                )
+                row["promotion_gate"] = "pass" if passed else "reject"
+                continue
+            final = (
+                latency_delta_pct <= -2.5
+                and p90_delta_pct is not None
+                and p90_delta_pct <= 0.0
+                and ci is not None
+                and ci[1] < 0.0
+                and memory_ok
+                and exact
+            )
+            row["promotion_gate"] = (
+                "pass" if final else "screen-pass" if screen else "reject"
+            )
+            continue
         else:
             passed = False
         row["promotion_gate"] = "pass" if passed else "reject"
@@ -173,7 +257,11 @@ def print_markdown(rows, limit):
         "W",
         "max_vram_mb",
         "steady_latency_avg_ms",
+        "latency_delta_pct",
+        "p90_delta_pct",
         "output_max_abs",
+        "vram_delta_mb",
+        "paired_ci95_ms",
         "promotion_gate",
     ]
     print("| " + " | ".join(headers) + " |")
@@ -189,7 +277,11 @@ def print_markdown(rows, limit):
             row.get("platform_w"),
             row.get("max_vram_mb"),
             row.get("steady_latency_avg_ms"),
+            row.get("latency_delta_pct"),
+            row.get("p90_delta_pct"),
             row.get("output_max_abs"),
+            row.get("vram_delta_mb"),
+            row.get("paired_bootstrap_ci95_ms"),
             row.get("promotion_gate"),
         ]
         print("| " + " | ".join("" if value is None else str(value) for value in values) + " |")

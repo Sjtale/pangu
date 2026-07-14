@@ -62,12 +62,39 @@ def _compiler_configuration():
 
     raw_arch = os.environ.get("PANGU_TILED_HIP_ARCH")
     arch = raw_arch.strip() if raw_arch and raw_arch.strip() else None
+    raw_score_stride = os.environ.get("PANGU_P2_FULL_ROW_SCORE_STRIDE", "144")
+    try:
+        score_stride = int(raw_score_stride)
+    except ValueError as error:
+        raise ValueError(
+            "PANGU_P2_FULL_ROW_SCORE_STRIDE must be 144, 148, or 156"
+        ) from error
+    if score_stride not in {144, 148, 156}:
+        raise ValueError(
+            "PANGU_P2_FULL_ROW_SCORE_STRIDE must be 144, 148, or 156"
+        )
+    raw_qk_tile = os.environ.get("PANGU_P2_FULL_ROW_QK_TILE", "16")
+    try:
+        qk_tile = int(raw_qk_tile)
+    except ValueError as error:
+        raise ValueError(
+            "PANGU_P2_FULL_ROW_QK_TILE must be 16 or 32"
+        ) from error
+    if qk_tile not in {16, 32}:
+        raise ValueError("PANGU_P2_FULL_ROW_QK_TILE must be 16 or 32")
+    variant_flags = [
+        f"-DPANGU_FULL_ROW_SCORE_STRIDE={score_stride}",
+        f"-DPANGU_FULL_ROW_QK_TILE={qk_tile}",
+    ]
     source_bytes = _SOURCE.read_bytes()
     fingerprint_payload = {
         "hipcc_path": str(hipcc),
         "hipcc_version": version_bytes.decode("utf-8", errors="replace"),
         "fixed_flags": list(_FIXED_COMPILE_FLAGS),
         "extra_flags": extra_flags,
+        "variant_flags": variant_flags,
+        "full_row_score_stride": score_stride,
+        "full_row_qk_tile": qk_tile,
         "arch": arch,
     }
     digest = hashlib.sha256()
@@ -81,13 +108,22 @@ def _compiler_configuration():
             separators=(",", ":"),
         ).encode("utf-8")
     )
-    return hipcc, extra_flags, arch, digest.hexdigest(), fingerprint_payload
+    return (
+        hipcc,
+        extra_flags,
+        variant_flags,
+        arch,
+        digest.hexdigest(),
+        fingerprint_payload,
+    )
 
 
 def build_hip_earth_attention_tiled(force=False):
     """Build and cache the tiled HIP shared library without installing it."""
 
-    hipcc, extra_flags, arch, fingerprint, metadata = _compiler_configuration()
+    hipcc, extra_flags, variant_flags, arch, fingerprint, metadata = (
+        _compiler_configuration()
+    )
     build_dir = Path(
         os.environ.get("PANGU_TILED_HIP_BUILD_DIR", _DEFAULT_BUILD_DIR)
     ).expanduser()
@@ -108,6 +144,7 @@ def build_hip_earth_attention_tiled(force=False):
     command = [str(hipcc), *_FIXED_COMPILE_FLAGS[:4]]
     if arch is not None:
         command.append(f"--offload-arch={arch}")
+    command.extend(variant_flags)
     command.extend(extra_flags)
     command.extend(
         [

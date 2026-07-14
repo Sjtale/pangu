@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 import zipfile
+import io
 from pathlib import Path
 
 
@@ -34,10 +35,7 @@ class GuardrailPackageTests(unittest.TestCase):
         source_root = Path(__file__).parents[1]
         (root / "scripts").mkdir(parents=True)
         shutil.copy2(source_root / "scripts/build_submission.sh", root / "scripts")
-        shutil.copy2(
-            source_root / "scripts/audit_submission_package.py",
-            root / "scripts",
-        )
+        shutil.copy2(source_root / "COMPLIANCE_README.md", root)
         for member in AUDIT.REQUIRED_PATHS:
             relative = Path(member).relative_to("pangu_weather")
             target = root / relative
@@ -62,6 +60,10 @@ class GuardrailPackageTests(unittest.TestCase):
                 )
             else:
                 target.write_text(relative.as_posix(), encoding="utf-8")
+        shutil.copy2(
+            source_root / "scripts/audit_submission_package.py",
+            root / "scripts",
+        )
 
     def test_freeze_copies_artifacts_hashes_and_refuses_overwrite(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -94,9 +96,103 @@ class GuardrailPackageTests(unittest.TestCase):
             invalid = Path(directory) / "invalid.zip"
             self._write_valid_package(invalid)
             with zipfile.ZipFile(invalid, "a") as archive:
-                archive.writestr("pangu_weather/README.md", "unexpected")
+                archive.writestr("pangu_weather/unexpected.py", "unexpected")
             with self.assertRaisesRegex(ValueError, "unexpected"):
                 AUDIT.audit_zip(invalid)
+
+    def test_package_audit_rejects_forbidden_compliance_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "submission.zip"
+            with zipfile.ZipFile(path, "w") as archive:
+                for member in sorted(AUDIT.REQUIRED_PATHS):
+                    content = member
+                    if member == "pangu_weather/inference.py":
+                        content = "name = 'calibration_coeffs.npy'\n"
+                    archive.writestr(member, content)
+            with self.assertRaisesRegex(ValueError, "Forbidden compliance paths"):
+                AUDIT.audit_zip(path)
+
+    def test_package_audit_allows_fail_closed_scored_only_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "submission.zip"
+            with zipfile.ZipFile(path, "w") as archive:
+                for member in sorted(AUDIT.REQUIRED_PATHS):
+                    content = member
+                    if member == "pangu_weather/distill_train.py":
+                        content = (
+                            'if env_enabled("PANGU_SCORED_ONLY_RECOVERY"):\n'
+                            '    raise ValueError("scored-only is forbidden")\n'
+                        )
+                    archive.writestr(member, content)
+            report = AUDIT.audit_zip(path)
+            self.assertEqual(set(report["files"]), AUDIT.REQUIRED_PATHS)
+
+    def test_model_archive_must_contain_only_root_checkpoint(self):
+        import torch
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "submission.zip"
+            self._write_valid_package(package)
+            model = root / "model.zip"
+            with zipfile.ZipFile(model, "w") as archive:
+                archive.writestr("nested/model_fp16.pth", b"checkpoint")
+            with self.assertRaisesRegex(ValueError, "exactly model_fp16.pth"):
+                AUDIT.audit_zip(package, model)
+
+            buffer = io.BytesIO()
+            torch.save(
+                {
+                    "model_state_dict": {},
+                    "model_profile": {"name": "pgw_lite_pruned_96"},
+                    "distillation": {
+                        "teacher_source": "organizer_pangu_full_model",
+                        "ground_truth_weight": 0.3,
+                        "teacher_weight": 0.5,
+                        "hint_weight": 0.2,
+                        "all_69_channels": True,
+                        "predict_residual": False,
+                    },
+                    "quantization": {
+                        "fp16_keep_count": 5,
+                        "quantized_keys_count": 62,
+                    },
+                    "alias_compaction": {"alias_pair_count": 224},
+                },
+                buffer,
+            )
+            with zipfile.ZipFile(model, "w") as archive:
+                archive.writestr("model_fp16.pth", buffer.getvalue())
+            report = AUDIT.audit_zip(package, model)
+            self.assertEqual(report["model_members"], ["model_fp16.pth"])
+            self.assertEqual(
+                report["model_provenance"]["teacher_source"],
+                "organizer_pangu_full_model",
+            )
+
+    def test_checkpoint_metadata_rejects_residual_or_truth_dominance(self):
+        base = {
+            "model_profile": {"name": "pgw_lite_pruned_96"},
+            "distillation": {
+                "teacher_source": "organizer_pangu_full_model",
+                "ground_truth_weight": 0.3,
+                "teacher_weight": 0.5,
+                "hint_weight": 0.2,
+                "all_69_channels": True,
+                "predict_residual": True,
+            },
+            "quantization": {
+                "fp16_keep_count": 5,
+                "quantized_keys_count": 62,
+            },
+            "alias_compaction": {"alias_pair_count": 224},
+        }
+        with self.assertRaisesRegex(ValueError, "Residual-target"):
+            AUDIT.audit_checkpoint_metadata(base)
+        base["distillation"]["predict_residual"] = False
+        base["distillation"]["ground_truth_weight"] = 0.8
+        with self.assertRaisesRegex(ValueError, "must dominate"):
+            AUDIT.audit_checkpoint_metadata(base)
 
     def test_package_audit_rejects_wrong_path_and_allows_empty_url(self):
         with tempfile.TemporaryDirectory() as directory:

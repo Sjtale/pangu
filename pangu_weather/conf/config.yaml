@@ -122,9 +122,9 @@ model:
     distill_hint_weight: 0.2
     distill_hint_layers: ["layer1", "layer2"]
     distill_steps_per_epoch: 2048
-    official_checkpoint_dir: "./pangu_backups"
+    official_checkpoint_dir: "./data/checkpoints"
     patience: 50
-    checkpoint_dir: "./data/checkpoints"         # AI4S，路径不可更改
+    checkpoint_dir: "./data/checkpoints"
     val_stride: 10
 
 datapipe:
@@ -136,21 +136,25 @@ datapipe:
     type: "hdf5"
     
     # 官方外部 ERA5 用于正式训练；ERA5_test 只用于本地流程烟雾测试。
-    stats_dir: "/public/SothisAI/sharingCenter/xiaodao2026/ERA5/old-data/stats"
-    static_dir: "/public/SothisAI/sharingCenter/xiaodao2026/ERA5/old-data/static"
-    data_dir: "/public/SothisAI/sharingCenter/xiaodao2026/ERA5/old-data"
+    # stats_dir: "../onedatasets/ERA5_test/stats/"     # AI4S，路径不可更改, 拉取本地ERA5数据
+    # static_dir: "../onedatasets/ERA5_test/static/"   # AI4S，路径不可更改, 拉取本地本地ERA5数据
+    # data_dir: "../onedatasets/ERA5_test/"            # AI4S，路径不可更改 , 拉取本地本地ERA5数据
 
-    train_ratio: [1980, 1981, 1982, 1983, 1984, 1985, 1986, 1987, 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998]
-    val_ratio: [2000]
-    test_ratio: [2000]
-
-    # 本地烟雾测试配置，不应用于正式微调/蒸馏：
-    # stats_dir: "../onedatasets/ERA5_test/stats/"
-    # static_dir: "../onedatasets/ERA5_test/static/"
-    # data_dir: "../onedatasets/ERA5_test/"
+    # # train_ratio: [1977]
     # train_ratio: [1977]
     # val_ratio: [2005]
-    # test_ratio: [2012]
+    # test_ratio: [2050, 2052, 2054, 2056, 2058]
+
+    # 本地烟雾测试配置，不应用于正式微调/蒸馏：
+    # stats_dir: "../onedatasets/ERA5_test/stats/"     # AI4S，路径不可更改, 拉取本地ERA5数据
+    # static_dir: "../onedatasets/ERA5_test/static/"   # AI4S，路径不可更改, 拉取本地本地ERA5数据
+    # data_dir: "../onedatasets/ERA5_test/"            # AI4S，路径不可更改 , 拉取本地本地ERA5数据
+    stats_dir: "../onedatasets/ERA5_test/stats/"     # AI4S，路径不可更改, 拉取本地ERA5数据
+    static_dir: "../onedatasets/ERA5_test/static/"   # AI4S，路径不可更改, 拉取本地本地ERA5数据
+    data_dir: "../onedatasets/ERA5_test/"            # AI4S，路径不可更改 , 拉取本地本地ERA5数据
+    train_ratio: [1977]
+    val_ratio: [2005]
+    test_ratio: [2050, 2052, 2054, 2056, 2058]
 
     img_size: [721, 1440]    # AI4S，测试集空间分辨率为该大小，更改报错
     verbose: true
@@ -236,7 +240,7 @@ datapipe:
   # DataLoader配置
   dataloader:
     mask_dtype: "float32"
-    batch_size: 1                     # AI4S，批处理大小推理阶段不可更改
+    batch_size: 1
     num_workers: 12
     pin_memory: true 
     drop_last: true
@@ -248,7 +252,7 @@ datapipe:
     enabled: false
     sampler: "DistributedSampler"
     rank: 0
-    world_size: 1                     # AI4S，不可更改
+    world_size: 1
     shuffle: true
     seed: 42
     drop_last: true

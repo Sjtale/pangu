@@ -20,23 +20,35 @@ MODEL_URL_FILE="$PROJECT_DIR/data/download_model_url.txt"
 ZIP_FILE="$SUBMIT_DIR/pangu_weather.zip"
 
 ROOT_FILES=(
-    calibration_utils.py
     compliant_inference_wrapper.py
+    distill_train.py
     hip_earth_attention_tiled.py
     hip_runtime_controls.py
     inference.py
     p2_tiled_attention.py
     pangu_profile_model.py
     result.py
+    score_training_utils.py
     selective_mlp96.py
+    train.py
+)
+
+REPRO_SCRIPTS=(
+    scripts/audit_submission_package.py
+    scripts/compact_fuser_alias_checkpoint.py
+    scripts/convert_fp16.py
+    scripts/prune_structured.py
+    scripts/quantize_mixed_precision.py
 )
 
 # 在删除上一个提交包前检查全部输入，避免因配置错误损失已验证包。
 for relative_path in \
     conf/config.yaml \
+    COMPLIANCE_README.md \
     data/download_model_url.txt \
     hip_kernels/earth_attention_tiled_fwd.hip \
     scripts/audit_submission_package.py \
+    "${REPRO_SCRIPTS[@]}" \
     "${ROOT_FILES[@]}"; do
     if [[ ! -f "$PROJECT_DIR/$relative_path" ]]; then
         echo "❌ 缺少打包必需文件：$PROJECT_DIR/$relative_path" >&2
@@ -50,6 +62,7 @@ mkdir -p "$PANGU_DIR/conf"
 mkdir -p "$PANGU_DIR/data"
 mkdir -p "$PANGU_DIR/hip_kernels"
 mkdir -p "$PANGU_DIR/result/output"
+mkdir -p "$PANGU_DIR/scripts"
 
 # 2. 复制官方入口、P2 运行时及在线 HIP 编译源码
 echo "📋 正在复制必要文件..."
@@ -59,6 +72,10 @@ for filename in "${ROOT_FILES[@]}"; do
     cp "$PROJECT_DIR/$filename" "$PANGU_DIR/"
 done
 cp "$MODEL_URL_FILE" "$PANGU_DIR/data/"
+cp "$PROJECT_DIR/COMPLIANCE_README.md" "$PANGU_DIR/README.md"
+for relative_path in "${REPRO_SCRIPTS[@]}"; do
+    cp "$PROJECT_DIR/$relative_path" "$PANGU_DIR/$relative_path"
+done
 
 # 3. 修改 config.yaml 满足官方后台测试参数
 echo "🔧 正在注入官方评测专用的配置参数..."

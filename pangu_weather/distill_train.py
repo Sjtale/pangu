@@ -593,6 +593,7 @@ def save_student(
         }
     else:
         inference_state["distillation"] = {
+            "teacher_source": "organizer_pangu_full_model",
             "teacher_embed_dim": int(cfg.embed_dim),
             "student_profile": student_profile["name"],
             "student_embed_dim": int(student_profile["embed_dim"]),
@@ -606,6 +607,8 @@ def save_student(
             ),
             "hint_weight": cfg_float(cfg, "distill_hint_weight", 0.0),
             "hint_layers": cfg_hint_layers(cfg),
+            "all_69_channels": True,
+            "predict_residual": False,
             "score_aligned": env_enabled("PANGU_SCORE_ALIGNED"),
             "score_stage": os.environ.get("PANGU_SCORE_STAGE", "all"),
             "score_project_quantized": env_enabled(

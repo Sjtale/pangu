@@ -511,6 +511,10 @@ def _run_isolated_case(case_name, args):
         str(args.seed),
         "--kernel-mode",
         args.kernel_mode,
+        "--score-stride",
+        str(args.score_stride),
+        "--qk-tile",
+        str(args.qk_tile),
     ]
     if args.allow_extra_flags:
         command.append("--allow-extra-flags")
@@ -598,10 +602,16 @@ def main():
     parser.add_argument("--force-rebuild", action="store_true")
     parser.add_argument("--allow-extra-flags", action="store_true")
     parser.add_argument("--kernel-mode", choices=KERNEL_MODES, default="online")
+    parser.add_argument(
+        "--score-stride", type=int, choices=(144, 148, 156), default=144
+    )
+    parser.add_argument("--qk-tile", type=int, choices=(16, 32), default=16)
     parser.add_argument("--diagnostic-stages", action="store_true")
     parser.add_argument("--worker-case", choices=tuple(CASES))
     args = parser.parse_args()
     _validate_args(parser, args)
+    os.environ["PANGU_P2_FULL_ROW_SCORE_STRIDE"] = str(args.score_stride)
+    os.environ["PANGU_P2_FULL_ROW_QK_TILE"] = str(args.qk_tile)
 
     if not torch.cuda.is_available():
         raise RuntimeError("HIP device is unavailable")
@@ -651,6 +661,7 @@ def main():
             {
                 "profile": PROFILE,
                 "kernel_mode": args.kernel_mode,
+                "full_row_score_stride": args.score_stride,
                 "acceptance": "The isolated tiled HIP kernel must compile first",
                 "device": torch.cuda.get_device_name(device),
                 "torch_version": torch.__version__,
@@ -689,7 +700,7 @@ def main():
     required_occupancy = 8 if args.kernel_mode != "online" else 1
     kernel_ok = (
         kernel_config.get("q_tile") == 16
-        and kernel_config.get("k_tile") == 16
+        and kernel_config.get("k_tile") == args.qk_tile
         and kernel_config.get("head_dim") == 32
         and kernel_config.get("block_threads") == 256
         and kernel_config.get("dynamic_smem_bytes", 0) > 0
@@ -701,6 +712,8 @@ def main():
     report = {
         "profile": PROFILE,
         "kernel_mode": args.kernel_mode,
+        "full_row_score_stride": args.score_stride,
+        "full_row_qk_tile": args.qk_tile,
         "scope": "isolated prototype; production forward remains unchanged",
         "acceptance": {
             "numerical": (

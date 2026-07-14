@@ -26,11 +26,11 @@ class ConvertFp16StaticTests(unittest.TestCase):
         ):
             self.assertIn(required, source)
 
-    def test_inference_supports_non_destructive_candidate_selection(self):
+    def test_inference_uses_only_the_submitted_checkpoint(self):
         source = INFERENCE_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
         self.assertIsNotNone(tree)
-        self.assertIn("PANGU_FP16_CHECKPOINT", source)
+        self.assertNotIn("PANGU_FP16_CHECKPOINT", source)
         self.assertIn('"model_fp16.pth"', source)
 
 
@@ -70,10 +70,20 @@ class ConvertFp16TorchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source.pth"
             output = Path(directory) / "output.pth"
-            torch.save({"model_state_dict": state, "optimizer_state_dict": {"x": 1}}, source)
+            torch.save(
+                {
+                    "model_state_dict": state,
+                    "optimizer_state_dict": {"x": 1},
+                    "model_profile": {"name": "pgw_lite_pruned_96"},
+                },
+                source,
+            )
             self.module.convert_to_fp16(str(source), str(output))
             checkpoint = torch.load(output, map_location="cpu", weights_only=False)
-            self.assertEqual(list(checkpoint), ["model_state_dict"])
+            self.assertNotIn("optimizer_state_dict", checkpoint)
+            self.assertEqual(
+                checkpoint["model_profile"], {"name": "pgw_lite_pruned_96"}
+            )
             self.module.verify_checkpoint(state, str(output))
 
 

@@ -18,16 +18,12 @@ from pangu_profile_model import (
     intern_immutable_buffers,
 )
 from hip_runtime_controls import (
-    create_spin_stream,
+    create_runtime_stream,
     load_hip_runtime,
+    set_nearest_cpu_affinity,
     set_prefer_l1,
     set_schedule_spin,
-)
-from calibration_utils import (
-    apply_affine_calibration,
-    apply_global_mean_correction,
-    load_affine_calibration,
-    load_global_mean_correction,
+    set_shared_mem_bank_size,
 )
 from compliant_inference_wrapper import CompliantInferenceWrapper
 from selective_mlp96 import (
@@ -38,6 +34,9 @@ from selective_mlp96 import (
 
 # Submission defaults: the platform only executes inference.py and does not
 # pass environment variables. Keep these overrideable for server A/B tests.
+# The organizer-provided inference template defines preprocessing and physical
+# output recovery outside the protected model-forward timer.
+COMPLIANT_FULL69_BOUNDARY = False
 os.environ.setdefault("PANGU_AUTO_SCAN_CHECKPOINT", "0")
 os.environ.setdefault("PANGU_DISABLE_CUDA_GRAPH", "1")
 os.environ.setdefault("PANGU_LAYERWISE_CUDA_GRAPH", "0")
@@ -45,15 +44,12 @@ os.environ.setdefault("PANGU_LAYERWISE_INFERENCE", "1")
 os.environ.setdefault("PANGU_RECOMPUTE_SKIP", "0")
 os.environ.setdefault("PANGU_DIRECT_RECOVERY", "1")
 os.environ.setdefault("PANGU_DIRECT_RECOVERY_WIDTH_CHUNK", "16")
-os.environ.setdefault("PANGU_SCORED_ONLY_RECOVERY", "0")
 os.environ.setdefault("PANGU_CHUNKED_ATTENTION", "1")
 os.environ.setdefault("PANGU_ATTN_CHUNK_SIZE", "3")
 os.environ.setdefault("PANGU_CHUNKED_QKV", "1")
 os.environ.setdefault("PANGU_CHUNKED_PROJ", "1")
 os.environ.setdefault("PANGU_CHUNKED_MLP", "1")
 os.environ.setdefault("PANGU_MLP_CHUNK_SIZE", "32768")
-os.environ.setdefault("PANGU_DISABLE_AFFINE_CALIBRATION", "1")
-os.environ.setdefault("PANGU_GLOBAL_MEAN_CORRECTION", "0")
 os.environ.setdefault("PANGU_STREAM_WEIGHTS", "0")
 os.environ.setdefault("PANGU_SPLIT_RECOVERY", "0")
 os.environ.setdefault("PANGU_CACHE_EARTH_BIAS", "0")
@@ -66,11 +62,23 @@ os.environ.setdefault("PANGU_CPU_RECOVERY_OUTPUT", "0")
 os.environ.setdefault("PANGU_HIP_SCHEDULE_SPIN", "0")
 os.environ.setdefault("PANGU_HIP_PREFER_L1", "0")
 os.environ.setdefault("PANGU_HIP_STREAM_SPIN", "0")
+os.environ.setdefault("PANGU_HIP_NEAREST_CPU", "0")
+os.environ.setdefault("PANGU_HIP_SHARED_MEM_BANK_BYTES", "0")
+os.environ.setdefault("PANGU_HIP_STREAM_PRIORITY", "0")
 os.environ.setdefault("PANGU_INTERN_IMMUTABLE_BUFFERS", "1")
-os.environ.setdefault("PANGU_COMPLIANT_FULL69_BOUNDARY", "0")
+os.environ["PANGU_COMPLIANT_FULL69_BOUNDARY"] = "0"
 os.environ.setdefault("PANGU_P2_TILED_ATTENTION", "1")
 os.environ.setdefault("PANGU_P2_TILED_MODE", "full-row-fast")
 os.environ.setdefault("PANGU_P2_FULL_WIDTH", "1")
+os.environ.setdefault("PANGU_P2_RELEASE_ORIGINAL_BIAS", "1")
+os.environ.setdefault("PANGU_P2_RETAIN_CPU_BIAS_BACKUP", "0")
+os.environ.setdefault("PANGU_P2_FULL_ROW_SCORE_STRIDE", "144")
+os.environ.setdefault("PANGU_P2_FULL_ROW_QK_TILE", "16")
+os.environ.setdefault(
+    "PANGU_TILED_HIP_EXTRA_FLAGS",
+    "-DPANGU_FULL_ROW_DIRECT_SCORE_STORE=1 "
+    "-DPANGU_FULL_ROW_PV_DOUBLE_BUFFER=1",
+)
 os.environ.setdefault("PANGU_TILED_HIP_ARCH", "gfx936:sramecc+:xnack-")
 os.environ.setdefault("PANGU_TILED_HIP_BUILD_DIR", "/tmp/pangu_tiled_hip_p2_full")
 
@@ -288,50 +296,6 @@ def get_stats(data_dir, stats_dir, channels):
     means = mu[:, channel_indices, :, :]
     stds = std[:, channel_indices, :, :]
     return means, stds
-
-
-def _load_output_calibration(checkpoint_dir, means, stds):
-    num_channels = int(stds.shape[1])
-    affine_path = os.path.join(checkpoint_dir, "calibration_affine.npz")
-    slope_path = os.path.join(checkpoint_dir, "calibration_coeffs.npy")
-
-    if os.path.exists(affine_path) and not _is_enabled("PANGU_DISABLE_AFFINE_CALIBRATION"):
-        try:
-            affine = load_affine_calibration(affine_path, num_channels)
-            print(f"🎯  Loaded affine calibration from {affine_path}.")
-            return stds, affine
-        except Exception as e:
-            print(f"⚠️  Failed to load affine calibration: {e}")
-
-    if os.path.exists(slope_path):
-        try:
-            coeffs = np.load(slope_path).reshape(1, -1, 1, 1)
-            if coeffs.shape[1] != num_channels:
-                raise ValueError(
-                    f"expected {num_channels} channels, got {coeffs.shape[1]}"
-                )
-            stds = stds * coeffs
-            print(f"🎯  Loaded slope calibration from {slope_path} and adjusted stds.")
-        except Exception as e:
-            print(f"⚠️  Failed to load slope calibration: {e}")
-    return stds, None
-
-
-def _load_global_mean_correction(checkpoint_dir, num_channels):
-    if not _is_enabled("PANGU_GLOBAL_MEAN_CORRECTION"):
-        return None
-    path = os.path.join(checkpoint_dir, "physics_mean_targets.npz")
-    if not os.path.exists(path):
-        print(f"⚠️  PANGU_GLOBAL_MEAN_CORRECTION=1 but {path} is missing.")
-        return None
-    try:
-        correction = load_global_mean_correction(path, num_channels)
-        active = int(np.count_nonzero(correction.channel_mask))
-        print(f"🌐  Loaded global mean correction from {path} for {active} channels.")
-        return correction
-    except Exception as e:
-        print(f"⚠️  Failed to load global mean correction: {e}")
-        return None
 
 
 def _cfg_list(value):
@@ -897,12 +861,29 @@ if __name__ == "__main__":
     hip_schedule_spin = _is_enabled("PANGU_HIP_SCHEDULE_SPIN")
     hip_prefer_l1 = _is_enabled("PANGU_HIP_PREFER_L1")
     hip_stream_spin = _is_enabled("PANGU_HIP_STREAM_SPIN")
+    hip_nearest_cpu = _is_enabled("PANGU_HIP_NEAREST_CPU")
+    hip_shared_mem_bank_bytes = _env_int("PANGU_HIP_SHARED_MEM_BANK_BYTES", 0)
+    if hip_shared_mem_bank_bytes not in (0, 4, 8):
+        raise ValueError("PANGU_HIP_SHARED_MEM_BANK_BYTES must be 0, 4, or 8")
+    hip_stream_priority = os.environ.get("PANGU_HIP_STREAM_PRIORITY", "0")
+    if hip_stream_priority not in {"0", "greatest"}:
+        raise ValueError("PANGU_HIP_STREAM_PRIORITY must be 0 or greatest")
+    new_hip_control = (
+        hip_nearest_cpu
+        or hip_shared_mem_bank_bytes != 0
+        or hip_stream_priority != "0"
+    )
+    any_hip_control = (
+        hip_schedule_spin or hip_prefer_l1 or hip_stream_spin or new_hip_control
+    )
     libhip = (
         load_hip_runtime()
-        if hip_schedule_spin or hip_prefer_l1 or hip_stream_spin
+        if any_hip_control
         else None
     )
-    if (hip_schedule_spin or hip_prefer_l1 or hip_stream_spin) and libhip is None:
+    if new_hip_control and libhip is None:
+        raise RuntimeError("HIP runtime library not found for requested P2 runtime control")
+    if any_hip_control and libhip is None:
         print("⚠️ [HIP] Runtime library not found; requested controls are disabled")
     if libhip is not None and hip_schedule_spin:
         try:
@@ -928,12 +909,7 @@ if __name__ == "__main__":
     input_means = np.array(means, copy=True)
     input_stds = np.array(input_stds, copy=True)
 
-    stds, affine_calibration = _load_output_calibration(
-        cfg.checkpoint_dir, means, input_stds
-    )
-    global_mean_correction = _load_global_mean_correction(
-        cfg.checkpoint_dir, int(means.shape[1])
-    )
+    stds = np.array(input_stds, copy=True)
 
     land_mask = torch.from_numpy(np.load(os.path.join(cfg_data.dataset.static_dir, "land_mask.npy")).astype(np.float32))
     soil_type = torch.from_numpy(np.load(os.path.join(cfg_data.dataset.static_dir, "soil_type.npy")).astype(np.float32))
@@ -949,7 +925,7 @@ if __name__ == "__main__":
     onnx_raw_path = f"{cfg.checkpoint_dir}/model_fp16.onnx"
     use_onnx = False
     is_selective_mlp96 = False
-    compliant_boundary = _is_enabled("PANGU_COMPLIANT_FULL69_BOUNDARY")
+    compliant_boundary = COMPLIANT_FULL69_BOUNDARY
     pruned_ckpt_path = f"{cfg.checkpoint_dir}/{cfg.pruned_checkpoint}"
     distilled_ckpt_path = f"{cfg.checkpoint_dir}/{cfg.distilled_checkpoint}"
     
@@ -1085,11 +1061,6 @@ if __name__ == "__main__":
             )
             is_selective_mlp96 = model_profile["name"] == SELECTIVE_MLP96_PROFILE
             if is_selective_mlp96:
-                compliant_boundary = True
-                if _is_enabled("PANGU_GLOBAL_MEAN_CORRECTION"):
-                    raise ValueError(
-                        "SelectiveMLP-96 requires global mean correction to remain off"
-                    )
                 validate_selective_mlp96_initialization(ckpt.get("initialization"))
                 if any(
                     isinstance(value, torch.Tensor)
@@ -1187,14 +1158,48 @@ if __name__ == "__main__":
                     print("⚡ [HIP] hipFuncCachePreferL1 enabled")
                 except Exception as e:
                     print(f"⚠️ [HIP] Failed to set device cache config: {e}")
-            if libhip is not None and hip_stream_spin:
+            if libhip is not None and hip_nearest_cpu:
+                affinity_report = set_nearest_cpu_affinity(libhip)
+                print(
+                    "⚡ [HIP] Nearest CPU affinity enabled: "
+                    f"nearest={affinity_report['nearest_cpu']} "
+                    f"previous={affinity_report['previous_affinity']} "
+                    f"observed={affinity_report['observed_affinity']}"
+                )
+            if libhip is not None and hip_shared_mem_bank_bytes:
+                bank_report = set_shared_mem_bank_size(
+                    libhip, hip_shared_mem_bank_bytes
+                )
+                print(
+                    "⚡ [HIP] Shared-memory bank config verified: "
+                    f"bytes={bank_report['bank_bytes']} "
+                    f"previous={bank_report['previous_config']} "
+                    f"observed={bank_report['observed_config']}"
+                )
+            if libhip is not None and (
+                hip_stream_spin or hip_stream_priority != "0"
+            ):
                 try:
-                    custom_hip_stream = create_spin_stream(libhip, torch)
+                    custom_hip_stream, stream_report = create_runtime_stream(
+                        libhip,
+                        torch,
+                        priority=(
+                            None
+                            if hip_stream_priority == "0"
+                            else hip_stream_priority
+                        ),
+                        spin=hip_stream_spin,
+                    )
                     print(
-                        "⚡ [HIP] Verified hipSyncPolicySpin on ordered custom stream "
-                        f"(ptr={custom_hip_stream.cuda_stream})"
+                        "⚡ [HIP] Ordered custom stream enabled: "
+                        f"ptr={custom_hip_stream.cuda_stream} "
+                        f"priority={stream_report['priority']} "
+                        f"range={stream_report['priority_range']} "
+                        f"spin={int(stream_report['spin'])}"
                     )
                 except Exception as e:
+                    if hip_stream_priority != "0":
+                        raise
                     print(f"⚠️ [HIP] Failed to set stream sync policy: {e}")
             _profile_cuda_memory("after model build/to cuda")
             if layerwise_inference:
@@ -1306,16 +1311,26 @@ if __name__ == "__main__":
                     "online",
                 )
                 p2_full_width = _is_enabled("PANGU_P2_FULL_WIDTH")
+                p2_release_bias = _is_enabled(
+                    "PANGU_P2_RELEASE_ORIGINAL_BIAS"
+                )
+                p2_retain_cpu_bias = _is_enabled(
+                    "PANGU_P2_RETAIN_CPU_BIAS_BACKUP"
+                )
                 patched_tiled_attention = enable_p2_tiled_attention(
                     model,
                     strict=True,
                     kernel_mode=p2_kernel_mode,
                     force_full_width=p2_full_width,
+                    release_original_bias=p2_release_bias,
+                    retain_cpu_backup=p2_retain_cpu_bias,
                 )
                 print(
                     "⚡ PANGU_P2_TILED_ATTENTION=1，启用 isolated gfx936 tiled "
                     f"EarthAttention，mode={p2_kernel_mode}，"
                     f"full_width={int(p2_full_width)}，"
+                    f"release_bias={int(p2_release_bias)}，"
+                    f"cpu_backup={int(p2_retain_cpu_bias)}，"
                     f"patched={patched_tiled_attention}"
                 )
             _profile_cuda_memory("after load_state_dict/model eval")
@@ -1358,12 +1373,6 @@ if __name__ == "__main__":
                 raise ValueError(
                     "Compliant full-69 inference forbids CPU/weight offload paths"
                 )
-            affine_scale = (
-                None if affine_calibration is None else affine_calibration.scale
-            )
-            affine_bias = (
-                None if affine_calibration is None else affine_calibration.bias
-            )
             model = CompliantInferenceWrapper(
                 model,
                 surface_mask[:1],
@@ -1371,10 +1380,7 @@ if __name__ == "__main__":
                 input_stds,
                 output_means=means,
                 output_stds=stds,
-                affine_scale=affine_scale,
-                affine_bias=affine_bias,
                 compute_dtype=target_dtype,
-                global_mean_correction=global_mean_correction,
             ).to("cuda:0")
             model.eval()
             del surface_mask
@@ -1529,12 +1535,6 @@ if __name__ == "__main__":
                         [out_surface, out_upper_air], dim=1
                     ).float().cpu().numpy()
                 pred_var = pred_var * stds + means
-                pred_var = apply_affine_calibration(
-                    pred_var, means, affine_calibration
-                )
-                pred_var = apply_global_mean_correction(
-                    pred_var, global_mean_correction
-                )
             np.save(f"result/output/{filename}.npy", pred_var)
             if _is_enabled("PANGU_PROFILE_MEMORY") and len(time_list) == 1:
                 _profile_cuda_memory("after first output postprocess")

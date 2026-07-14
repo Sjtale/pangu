@@ -29,47 +29,12 @@ def _channel_buffer(name: str, value) -> torch.Tensor:
     return tensor.reshape(1, NUM_CHANNELS, 1, 1).contiguous()
 
 
-def fold_output_recovery_affine(
-    means,
-    stds,
-    *,
-    slope_coefficients=None,
-    affine_scale=None,
-    affine_bias=None,
+def build_standard_output_recovery(
+    means, stds
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fold accepted output recovery into one deterministic scale and bias.
+    """Return only the organizer-provided physical-unit recovery statistics."""
 
-    For normalized model output ``z``, the legacy recovery is::
-
-        physical = means + stds * slope * z
-        physical = means + affine_scale * (physical - means) + affine_bias
-
-    Therefore the equivalent pointwise operation is
-    ``physical = folded_scale * z + folded_bias``.  The caller should pass only
-    calibration values that have already passed the project's acceptance gate.
-    """
-
-    if (affine_scale is None) != (affine_bias is None):
-        raise ValueError("affine_scale and affine_bias must be provided together")
-
-    mean = _channel_buffer("means", means)
-    std = _channel_buffer("stds", stds)
-    slope = (
-        torch.ones_like(std)
-        if slope_coefficients is None
-        else _channel_buffer("slope_coefficients", slope_coefficients)
-    )
-    scale = (
-        torch.ones_like(std)
-        if affine_scale is None
-        else _channel_buffer("affine_scale", affine_scale)
-    )
-    bias = (
-        torch.zeros_like(mean)
-        if affine_bias is None
-        else _channel_buffer("affine_bias", affine_bias)
-    )
-    return (std * slope * scale).contiguous(), (mean + bias).contiguous()
+    return _channel_buffer("stds", stds), _channel_buffer("means", means)
 
 
 class CompliantInferenceWrapper(nn.Module):
@@ -90,18 +55,11 @@ class CompliantInferenceWrapper(nn.Module):
         *,
         output_means=None,
         output_stds=None,
-        slope_coefficients=None,
-        affine_scale=None,
-        affine_bias=None,
         compute_dtype: torch.dtype = torch.float16,
-        global_mean_correction=None,
     ) -> None:
         super().__init__()
         if compute_dtype not in (torch.float16, torch.float32):
             raise ValueError("compute_dtype must be torch.float16 or torch.float32")
-        if global_mean_correction is not None:
-            raise ValueError("global mean correction is forbidden in submission inference")
-
         mask = torch.as_tensor(static_surface_mask, dtype=compute_dtype)
         if mask.ndim == 3:
             mask = mask.unsqueeze(0)
@@ -120,12 +78,8 @@ class CompliantInferenceWrapper(nn.Module):
             raise ValueError("input_stds must be non-zero")
         output_mean_values = input_means if output_means is None else output_means
         output_std_values = input_stds if output_stds is None else output_stds
-        output_scale, output_bias = fold_output_recovery_affine(
-            output_mean_values,
-            output_std_values,
-            slope_coefficients=slope_coefficients,
-            affine_scale=affine_scale,
-            affine_bias=affine_bias,
+        output_scale, output_bias = build_standard_output_recovery(
+            output_mean_values, output_std_values
         )
         self.core_model = core_model
         self.compute_dtype = compute_dtype
