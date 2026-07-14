@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
-"""Audit the minimal pruned_96 code package and optional external model file."""
+"""Audit the P2 full-row code package and optional external model file."""
 
 import argparse
 import hashlib
 import json
 import zipfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 
-REQUIRED_BASENAMES = {
-    "calibration_utils.py",
-    "config.yaml",
-    "download_model_url.txt",
-    "hip_runtime_controls.py",
-    "inference.py",
-    "pangu_profile_model.py",
-    "result.py",
+REQUIRED_PATHS = {
+    "pangu_weather/calibration_utils.py",
+    "pangu_weather/compliant_inference_wrapper.py",
+    "pangu_weather/conf/config.yaml",
+    "pangu_weather/data/download_model_url.txt",
+    "pangu_weather/hip_earth_attention_tiled.py",
+    "pangu_weather/hip_kernels/earth_attention_tiled_fwd.hip",
+    "pangu_weather/hip_runtime_controls.py",
+    "pangu_weather/inference.py",
+    "pangu_weather/p2_tiled_attention.py",
+    "pangu_weather/pangu_profile_model.py",
+    "pangu_weather/result.py",
+    "pangu_weather/selective_mlp96.py",
 }
-ALLOWED_BASENAMES = set(REQUIRED_BASENAMES)
+ALLOWED_PATHS = set(REQUIRED_PATHS)
+MODEL_URL_PATH = "pangu_weather/data/download_model_url.txt"
 
 
 def sha256_file(path):
@@ -32,25 +38,40 @@ def audit_zip(path, model_path=None):
     path = Path(path)
     with zipfile.ZipFile(path) as archive:
         files = [item for item in archive.infolist() if not item.is_dir()]
-    basename_list = [PurePosixPath(item.filename).name for item in files]
-    basenames = set(basename_list)
-    missing = sorted(REQUIRED_BASENAMES - basenames)
-    unexpected = sorted(basenames - ALLOWED_BASENAMES)
-    duplicates = sorted(
-        basename for basename in basenames if basename_list.count(basename) > 1
-    )
-    if missing or unexpected or duplicates:
-        raise ValueError(
-            "Submission package mismatch: "
-            f"missing={missing}, unexpected={unexpected}, duplicates={duplicates}"
-        )
-    report = {
-        "package": str(path.resolve()),
-        "package_bytes": path.stat().st_size,
-        "package_sha256": sha256_file(path),
-        "uncompressed_code_bytes": sum(item.file_size for item in files),
-        "files": sorted(item.filename for item in files),
-    }
+        path_list = [item.filename for item in files]
+        paths = set(path_list)
+        missing = sorted(REQUIRED_PATHS - paths)
+        unexpected = sorted(paths - ALLOWED_PATHS)
+        duplicates = sorted(name for name in paths if path_list.count(name) > 1)
+        if missing or unexpected or duplicates:
+            raise ValueError(
+                "Submission package mismatch: "
+                f"missing={missing}, unexpected={unexpected}, duplicates={duplicates}"
+            )
+
+        try:
+            model_url = archive.read(MODEL_URL_PATH).decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("download_model_url.txt must be valid UTF-8") from error
+        lines = model_url.splitlines()
+        if (
+            len(lines) != 1
+            or not lines[0]
+            or any(character.isspace() for character in lines[0])
+            or not lines[0].startswith(("http://", "https://"))
+        ):
+            raise ValueError(
+                "download_model_url.txt must contain exactly one whitespace-free "
+                "HTTP(S) URL"
+            )
+
+        report = {
+            "package": str(path.resolve()),
+            "package_bytes": path.stat().st_size,
+            "package_sha256": sha256_file(path),
+            "uncompressed_code_bytes": sum(item.file_size for item in files),
+            "files": sorted(item.filename for item in files),
+        }
     if model_path is not None:
         model_path = Path(model_path)
         report["model"] = str(model_path.resolve())
