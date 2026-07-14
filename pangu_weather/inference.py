@@ -827,6 +827,138 @@ def _tensor_sha256(tensor):
     return hashlib.sha256(value.numpy().tobytes(order="C")).hexdigest()
 
 
+_PRUNED96_GENERATED_MASK_LAYOUT = (
+    (
+        "layer1",
+        (1,),
+        (15, 64, 144, 144),
+        "39ee00633b54a104ae928d7724a72afd84490b9067d05f878b0664baa5de1b07",
+    ),
+    (
+        "layer2",
+        (1, 3, 5),
+        (8, 32, 144, 144),
+        "7064b0fd983ea8966be281f089673fe86ee57bdee4ae9e8587f064887ae2f36c",
+    ),
+    (
+        "layer3",
+        (1, 3, 5),
+        (8, 32, 144, 144),
+        "7064b0fd983ea8966be281f089673fe86ee57bdee4ae9e8587f064887ae2f36c",
+    ),
+    (
+        "layer4",
+        (1,),
+        (15, 64, 144, 144),
+        "39ee00633b54a104ae928d7724a72afd84490b9067d05f878b0664baa5de1b07",
+    ),
+)
+
+
+def _verified_pruned96_generated_mask_keys(model_state, source_state):
+    """Verify the exact constructor masks omitted by the scored checkpoint."""
+
+    expected = set()
+    owners = []
+    for stage, block_indices, shape, digest in _PRUNED96_GENERATED_MASK_LAYOUT:
+        for block_index in block_indices:
+            prefix = f"{stage}.{{alias}}.blocks.{block_index}.transformer.attn_mask"
+            upper_key = prefix.format(alias="Fuser")
+            lower_key = prefix.format(alias="fuser")
+            expected.update((upper_key, lower_key))
+            owners.append((upper_key, lower_key, tuple(shape), digest))
+
+    runtime_keys = {key for key in model_state if key.endswith("attn_mask")}
+    if runtime_keys != expected:
+        raise ValueError(
+            "pruned96 constructor-mask topology mismatch: "
+            f"missing={sorted(expected - runtime_keys)}, "
+            f"extra={sorted(runtime_keys - expected)}"
+        )
+    source_keys = {key for key in source_state if key.endswith("attn_mask")}
+    if source_keys:
+        raise ValueError(
+            "The exact scored pruned96 checkpoint must omit constructor masks: "
+            f"{sorted(source_keys)}"
+        )
+
+    canonical_by_digest = {}
+    owner_storages = set()
+    owner_bytes = 0
+    devices = set()
+    for upper_key, lower_key, expected_shape, expected_digest in owners:
+        upper = model_state[upper_key]
+        lower = model_state[lower_key]
+        for key, value in ((upper_key, upper), (lower_key, lower)):
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(f"pruned96 constructor mask is not a tensor: {key}")
+            if tuple(value.shape) != expected_shape:
+                raise ValueError(
+                    f"pruned96 constructor-mask shape mismatch: {key} "
+                    f"expected={expected_shape}, actual={tuple(value.shape)}"
+                )
+            if value.dtype != torch.float16:
+                raise ValueError(
+                    f"pruned96 constructor-mask dtype mismatch: {key} "
+                    f"expected=torch.float16, actual={value.dtype}"
+                )
+            if not value.is_contiguous() or value.storage_offset() != 0:
+                raise ValueError(f"pruned96 constructor mask must be base-contiguous: {key}")
+            expected_bytes = value.numel() * value.element_size()
+            if value.untyped_storage().nbytes() != expected_bytes:
+                raise ValueError(f"pruned96 constructor-mask storage mismatch: {key}")
+            if value.requires_grad:
+                raise ValueError(f"pruned96 constructor mask requires gradients: {key}")
+            devices.add(value.device)
+
+        upper_storage = upper.untyped_storage()._cdata
+        if upper_storage != lower.untyped_storage()._cdata:
+            raise ValueError(
+                "pruned96 constructor-mask Fuser alias does not share storage: "
+                f"{upper_key}"
+            )
+        if upper_storage in owner_storages:
+            raise ValueError(
+                "pruned96 constructor masks share storage before interning: "
+                f"{upper_key}"
+            )
+        owner_storages.add(upper_storage)
+        owner_bytes += upper.numel() * upper.element_size()
+
+        canonical = canonical_by_digest.get(expected_digest)
+        if canonical is None:
+            actual_digest = _tensor_sha256(upper)
+            if actual_digest != expected_digest:
+                raise ValueError(
+                    f"pruned96 constructor-mask SHA256 mismatch: {upper_key} "
+                    f"expected={expected_digest}, actual={actual_digest}"
+                )
+            canonical_by_digest[expected_digest] = upper
+        elif not torch.equal(upper, canonical):
+            raise ValueError(
+                f"pruned96 constructor-mask value mismatch: {upper_key}"
+            )
+
+    if len(devices) != 1:
+        raise ValueError(f"pruned96 constructor masks span devices: {sorted(map(str, devices))}")
+    if len(owner_storages) != 8:
+        raise ValueError(
+            f"pruned96 constructor-mask owner count mismatch: {len(owner_storages)}"
+        )
+    unique_value_bytes = sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in canonical_by_digest.values()
+    )
+    return expected, {
+        "constructor_mask_missing_keys": sorted(expected),
+        "constructor_mask_missing_key_count": len(expected),
+        "constructor_mask_owner_count": len(owner_storages),
+        "constructor_mask_physical_bytes": owner_bytes,
+        "constructor_mask_unique_value_count": len(canonical_by_digest),
+        "constructor_mask_unique_value_bytes": unique_value_bytes,
+    }
+
+
 def _runtime_alias_keys(model_state, source_state):
     allowed = set()
     for lower_key, lower_tensor in model_state.items():
@@ -868,23 +1000,27 @@ def _resolve_pruned96_state_load_contract(model, checkpoint, state_dict):
         )
 
     model_state = model.state_dict()
+    generated_masks, mask_report = _verified_pruned96_generated_mask_keys(
+        model_state,
+        state_dict,
+    )
     allowed_aliases = _runtime_alias_keys(model_state, state_dict)
+    baseline_allowed = allowed_aliases | generated_masks
+    baseline_report = {
+        "alias_missing_keys": sorted(allowed_aliases),
+        "elided_index_keys": [],
+        **mask_report,
+    }
     storage = checkpoint.get("storage_optimization")
     if storage is None:
-        return allowed_aliases, {
-            "alias_missing_keys": sorted(allowed_aliases),
-            "elided_index_keys": [],
-        }
+        return baseline_allowed, baseline_report
     if not isinstance(storage, dict):
         raise ValueError("storage_optimization metadata must be a mapping")
     if "deterministic_index_elision" in storage:
         raise ValueError("Legacy deterministic_index_elision metadata is forbidden")
     elision = storage.get("deterministic_buffer_elision")
     if elision is None:
-        return allowed_aliases, {
-            "alias_missing_keys": sorted(allowed_aliases),
-            "elided_index_keys": [],
-        }
+        return baseline_allowed, baseline_report
     if storage.get("schema_version") != 1 or not isinstance(elision, dict):
         raise ValueError("Unsupported deterministic_buffer_elision metadata")
     if elision.get("method") != "constructor-earth-position-index-v1":
@@ -953,10 +1089,11 @@ def _resolve_pruned96_state_load_contract(model, checkpoint, state_dict):
     if declared_bytes != removed_bytes:
         raise ValueError("removed_logical_bytes differs from generated indices")
 
-    return allowed_aliases | expected_missing, {
+    return baseline_allowed | expected_missing, {
         "alias_missing_keys": sorted(allowed_aliases),
         "elided_index_keys": sorted(expected_missing),
         "removed_logical_bytes": removed_bytes,
+        **mask_report,
     }
 
 
@@ -1425,6 +1562,8 @@ if __name__ == "__main__":
                     "🔒 pruned96 state-load contract: "
                     f"allowed_missing={len(pruned96_allowed_missing)} "
                     f"aliases={len(pruned96_contract['alias_missing_keys'])} "
+                    "constructor_masks="
+                    f"{len(pruned96_contract['constructor_mask_missing_keys'])} "
                     f"elided_indices={len(pruned96_contract['elided_index_keys'])} "
                     f"elided_bytes={pruned96_contract.get('removed_logical_bytes', 0)}"
                 )

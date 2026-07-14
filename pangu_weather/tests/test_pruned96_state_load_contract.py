@@ -13,10 +13,12 @@ import torch.nn as nn
 INFERENCE = Path(__file__).parents[1] / "inference.py"
 HELPERS = {
     "_tensor_sha256",
+    "_verified_pruned96_generated_mask_keys",
     "_runtime_alias_keys",
     "_resolve_pruned96_state_load_contract",
     "_validate_pruned96_state_load",
 }
+HELPER_GLOBALS = {"_PRUNED96_GENERATED_MASK_LAYOUT"}
 TIMER_SHA256 = "fa7d46a8ea3a3da93f5348bbb6b237409da16a68b20708331d4d9b0f4adb61ad"
 
 
@@ -26,7 +28,17 @@ def load_helpers():
     nodes = [
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in HELPERS
+        if (
+            isinstance(node, ast.FunctionDef)
+            and node.name in HELPERS
+        )
+        or (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id in HELPER_GLOBALS
+                for target in node.targets
+            )
+        )
     ]
     namespace = {"hashlib": hashlib, "torch": torch}
     exec(compile(ast.Module(nodes, type_ignores=[]), str(INFERENCE), "exec"), namespace)
@@ -57,34 +69,114 @@ class AliasModel(nn.Module):
         self.layer = AliasOwner()
 
 
+class StaticStateModel:
+    def __init__(self, state):
+        self._state = state
+
+    def state_dict(self):
+        return self._state
+
+
 class Pruned96LoadContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.helpers = load_helpers()
+        cls.production_layout = cls.helpers["_PRUNED96_GENERATED_MASK_LAYOUT"]
+        outer = torch.tensor(
+            [[[[0.0, -100.0], [-100.0, 0.0]]]],
+            dtype=torch.float16,
+        )
+        inner = torch.tensor(
+            [[[[0.0, -100.0, 0.0], [-100.0, 0.0, -100.0]]]],
+            dtype=torch.float16,
+        )
+        tensor_sha256 = cls.helpers["_tensor_sha256"]
+        outer_digest = tensor_sha256(outer)
+        inner_digest = tensor_sha256(inner)
+        cls.test_masks = {
+            outer_digest: outer,
+            inner_digest: inner,
+        }
+        cls.helpers["_PRUNED96_GENERATED_MASK_LAYOUT"] = (
+            ("layer1", (1,), tuple(outer.shape), outer_digest),
+            ("layer2", (1, 3, 5), tuple(inner.shape), inner_digest),
+            ("layer3", (1, 3, 5), tuple(inner.shape), inner_digest),
+            ("layer4", (1,), tuple(outer.shape), outer_digest),
+        )
 
     def setUp(self):
-        self.model = AliasModel()
-        self.model_state = self.model.state_dict()
+        self.model_state = OrderedDict(AliasModel().state_dict())
+        self.mask_keys = set()
+        for stage, block_indices, _shape, digest in self.helpers[
+            "_PRUNED96_GENERATED_MASK_LAYOUT"
+        ]:
+            for block_index in block_indices:
+                value = self.test_masks[digest].clone()
+                for alias in ("Fuser", "fuser"):
+                    key = (
+                        f"{stage}.{alias}.blocks.{block_index}."
+                        "transformer.attn_mask"
+                    )
+                    self.model_state[key] = value
+                    self.mask_keys.add(key)
+        self.model = StaticStateModel(self.model_state)
         self.upper_weight = "layer.Fuser.weight"
         self.upper_index = "layer.Fuser.earth_position_index"
         self.lower_weight = "layer.fuser.weight"
         self.lower_index = "layer.fuser.earth_position_index"
 
-    def test_alias_compacted_baseline_allows_only_proven_runtime_aliases(self):
-        state = OrderedDict(
+    def baseline_state(self):
+        return OrderedDict(
             (key, value.clone())
             for key, value in self.model_state.items()
-            if ".Fuser." in key
+            if ".Fuser." in key and not key.endswith("attn_mask")
         )
+
+    def test_production_constructor_mask_layout_is_frozen(self):
+        self.assertEqual(
+            self.production_layout,
+            (
+                (
+                    "layer1",
+                    (1,),
+                    (15, 64, 144, 144),
+                    "39ee00633b54a104ae928d7724a72afd84490b9067d05f878b0664baa5de1b07",
+                ),
+                (
+                    "layer2",
+                    (1, 3, 5),
+                    (8, 32, 144, 144),
+                    "7064b0fd983ea8966be281f089673fe86ee57bdee4ae9e8587f064887ae2f36c",
+                ),
+                (
+                    "layer3",
+                    (1, 3, 5),
+                    (8, 32, 144, 144),
+                    "7064b0fd983ea8966be281f089673fe86ee57bdee4ae9e8587f064887ae2f36c",
+                ),
+                (
+                    "layer4",
+                    (1,),
+                    (15, 64, 144, 144),
+                    "39ee00633b54a104ae928d7724a72afd84490b9067d05f878b0664baa5de1b07",
+                ),
+            ),
+        )
+
+    def test_alias_compacted_baseline_allows_only_proven_runtime_aliases(self):
+        state = self.baseline_state()
         allowed, report = self.helpers["_resolve_pruned96_state_load_contract"](
             self.model,
             {},
             state,
         )
-        self.assertEqual(allowed, {self.lower_weight, self.lower_index})
+        expected = {self.lower_weight, self.lower_index} | self.mask_keys
+        self.assertEqual(allowed, expected)
         self.assertEqual(report["elided_index_keys"], [])
+        self.assertEqual(set(report["constructor_mask_missing_keys"]), self.mask_keys)
+        self.assertEqual(report["constructor_mask_owner_count"], 8)
         self.helpers["_validate_pruned96_state_load"](
-            [self.lower_weight, self.lower_index],
+            expected,
             [],
             allowed,
         )
@@ -135,9 +227,16 @@ class Pruned96LoadContractTests(unittest.TestCase):
             checkpoint,
             state,
         )
-        expected = {self.lower_weight, self.lower_index, self.upper_index}
+        expected = {
+            self.lower_weight,
+            self.lower_index,
+            self.upper_index,
+        } | self.mask_keys
         self.assertEqual(allowed, expected)
-        self.assertEqual(set(report["elided_index_keys"]), expected - {self.lower_weight})
+        self.assertEqual(
+            set(report["elided_index_keys"]),
+            {self.lower_index, self.upper_index},
+        )
         self.helpers["_validate_pruned96_state_load"](expected, [], allowed)
 
     def test_wrong_generated_digest_is_rejected(self):
@@ -161,11 +260,7 @@ class Pruned96LoadContractTests(unittest.TestCase):
             ("layer.Fuser.weight", torch.ones(2, 3, dtype=torch.int8)),
             ("layer.Fuser.weight.int4_group_size", torch.tensor(32)),
         ):
-            state = OrderedDict(
-                (name, tensor.clone())
-                for name, tensor in self.model_state.items()
-                if ".Fuser." in name
-            )
+            state = self.baseline_state()
             state[key] = value
             with self.subTest(key=key), self.assertRaisesRegex(
                 ValueError,
@@ -176,6 +271,43 @@ class Pruned96LoadContractTests(unittest.TestCase):
                     {},
                     state,
                 )
+
+    def test_constructor_masks_reject_source_topology_shape_alias_and_values(self):
+        resolve = self.helpers["_resolve_pruned96_state_load_contract"]
+        source = self.baseline_state()
+        mask_key = sorted(self.mask_keys)[0]
+
+        source_with_mask = OrderedDict(source)
+        source_with_mask[mask_key] = self.model_state[mask_key].clone()
+        with self.assertRaisesRegex(ValueError, "must omit constructor masks"):
+            resolve(self.model, {}, source_with_mask)
+
+        missing_state = OrderedDict(self.model_state)
+        missing_state.pop(mask_key)
+        with self.assertRaisesRegex(ValueError, "topology mismatch"):
+            resolve(StaticStateModel(missing_state), {}, source)
+
+        upper_key = mask_key.replace(".fuser.", ".Fuser.")
+        lower_key = upper_key.replace(".Fuser.", ".fuser.")
+        wrong_shape_state = OrderedDict(self.model_state)
+        wrong_shape = torch.zeros(1, dtype=torch.float16)
+        wrong_shape_state[upper_key] = wrong_shape
+        wrong_shape_state[lower_key] = wrong_shape
+        with self.assertRaisesRegex(ValueError, "shape mismatch"):
+            resolve(StaticStateModel(wrong_shape_state), {}, source)
+
+        broken_alias_state = OrderedDict(self.model_state)
+        broken_alias_state[lower_key] = broken_alias_state[upper_key].clone()
+        with self.assertRaisesRegex(ValueError, "does not share storage"):
+            resolve(StaticStateModel(broken_alias_state), {}, source)
+
+        wrong_value_state = OrderedDict(self.model_state)
+        wrong_value = wrong_value_state[upper_key].clone()
+        wrong_value.view(-1)[0] = 1.0
+        wrong_value_state[upper_key] = wrong_value
+        wrong_value_state[lower_key] = wrong_value
+        with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
+            resolve(StaticStateModel(wrong_value_state), {}, source)
 
     def test_missing_and_unexpected_keys_must_match_exactly(self):
         validate = self.helpers["_validate_pruned96_state_load"]
