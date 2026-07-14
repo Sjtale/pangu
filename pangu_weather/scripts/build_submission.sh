@@ -14,7 +14,38 @@ echo "🚀 开始构建比赛提交包..."
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-SUBMIT_DIR="$PROJECT_DIR/submit_package"
+# Use an alternate directory for candidate builds so the verified baseline ZIP
+# remains byte-for-byte available for rollback.
+SUBMIT_DIR="${PANGU_SUBMIT_DIR:-$PROJECT_DIR/submit_package}"
+# The script clears its output tree. Resolve and restrict custom destinations
+# before any deletion: the normal in-project submit_package is allowed, while
+# alternate candidate builds must be explicitly named pangu_* under a system
+# temporary directory.
+SUBMIT_DIR="$(python - "$PROJECT_DIR" "$SUBMIT_DIR" <<'PY'
+from pathlib import Path
+import sys
+import tempfile
+
+project_dir = Path(sys.argv[1]).resolve()
+candidate = Path(sys.argv[2]).expanduser().resolve()
+default = (project_dir / "submit_package").resolve()
+temporary_roots = {
+    Path(tempfile.gettempdir()).resolve(),
+    Path("/tmp").resolve(),
+    Path("/private/tmp").resolve(),
+}
+temporary_candidate = candidate.name.startswith("pangu_") and any(
+    candidate != root and candidate.is_relative_to(root)
+    for root in temporary_roots
+)
+if candidate != default and not temporary_candidate:
+    raise SystemExit(
+        "Refusing unsafe PANGU_SUBMIT_DIR; use the default submit_package or "
+        "a pangu_* directory under the system temporary directory"
+    )
+print(candidate)
+PY
+)"
 PANGU_DIR="$SUBMIT_DIR/pangu_weather"
 MODEL_URL_FILE="$PROJECT_DIR/data/download_model_url.txt"
 ZIP_FILE="$SUBMIT_DIR/pangu_weather.zip"
@@ -38,7 +69,9 @@ ROOT_FILES=(
 REPRO_SCRIPTS=(
     scripts/audit_submission_package.py
     scripts/compact_fuser_alias_checkpoint.py
+    scripts/compress_checkpoint_gzip.py
     scripts/convert_fp16.py
+    scripts/elide_deterministic_indices.py
     scripts/prune_structured.py
     scripts/quantize_mixed_precision.py
 )

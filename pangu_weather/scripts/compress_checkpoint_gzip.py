@@ -15,7 +15,22 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def _write_deterministic_gzip(source, output):
+    with open(source, "rb") as source_stream, open(output, "wb") as compressed_stream:
+        with gzip.GzipFile(
+            filename="",
+            mode="wb",
+            compresslevel=9,
+            fileobj=compressed_stream,
+            mtime=0,
+        ) as output_stream:
+            for chunk in iter(lambda: source_stream.read(1024 * 1024), b""):
+                output_stream.write(chunk)
+
+
 def compress_checkpoint(source, output, level=9):
+    if level != 9:
+        raise ValueError("Deterministic submission compression requires gzip level 9")
     source = os.path.abspath(source)
     output = os.path.abspath(output)
     if source == output:
@@ -25,14 +40,14 @@ def compress_checkpoint(source, output, level=9):
 
     os.makedirs(os.path.dirname(output), exist_ok=True)
     temporary = output + ".tmp"
+    verification = output + ".verify.tmp"
     source_hash = sha256_file(source)
     restored_hash = hashlib.sha256()
     try:
-        with open(source, "rb") as source_stream, gzip.open(
-            temporary, "wb", compresslevel=level
-        ) as output_stream:
-            for chunk in iter(lambda: source_stream.read(1024 * 1024), b""):
-                output_stream.write(chunk)
+        _write_deterministic_gzip(source, temporary)
+        _write_deterministic_gzip(source, verification)
+        if sha256_file(temporary) != sha256_file(verification):
+            raise RuntimeError("Repeated deterministic gzip outputs differ")
         with gzip.open(temporary, "rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 restored_hash.update(chunk)
@@ -40,8 +55,9 @@ def compress_checkpoint(source, output, level=9):
             raise RuntimeError("Decompressed SHA256 differs from source")
         os.replace(temporary, output)
     finally:
-        if os.path.exists(temporary):
-            os.remove(temporary)
+        for transient in (temporary, verification):
+            if os.path.exists(transient):
+                os.remove(transient)
 
     source_size = os.path.getsize(source)
     output_size = os.path.getsize(output)
@@ -61,7 +77,7 @@ def main():
     parser.add_argument(
         "--output", default="data/checkpoints/model_fp16_alias_compact.pth.gz"
     )
-    parser.add_argument("--level", type=int, choices=range(1, 10), default=9)
+    parser.add_argument("--level", type=int, choices=(9,), default=9)
     args = parser.parse_args()
     compress_checkpoint(args.source, args.output, args.level)
 

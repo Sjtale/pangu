@@ -9,6 +9,7 @@ import time
 import json
 import gc
 import gzip
+import hashlib
 import io
 from onescience.utils.YParams import YParams
 from onescience.datapipes.climate import ERA5Datapipe
@@ -72,6 +73,8 @@ os.environ.setdefault("PANGU_P2_TILED_MODE", "full-row-fast")
 os.environ.setdefault("PANGU_P2_FULL_WIDTH", "1")
 os.environ.setdefault("PANGU_P2_RELEASE_ORIGINAL_BIAS", "1")
 os.environ.setdefault("PANGU_P2_RETAIN_CPU_BIAS_BACKUP", "0")
+os.environ.setdefault("PANGU_P2_REGION_RELEASE", "0")
+os.environ.setdefault("PANGU_P2_PREBUILD_HIP", "0")
 os.environ.setdefault("PANGU_P2_FULL_ROW_SCORE_STRIDE", "144")
 os.environ.setdefault("PANGU_P2_FULL_ROW_QK_TILE", "16")
 os.environ.setdefault(
@@ -819,6 +822,165 @@ def _load_dequantized_state_dict_incremental(model, state_dict):
     return missing_keys, unexpected_keys, loaded_count
 
 
+def _tensor_sha256(tensor):
+    value = tensor.detach().to(device="cpu").contiguous()
+    return hashlib.sha256(value.numpy().tobytes(order="C")).hexdigest()
+
+
+def _runtime_alias_keys(model_state, source_state):
+    allowed = set()
+    for lower_key, lower_tensor in model_state.items():
+        if lower_key in source_state or ".fuser." not in lower_key:
+            continue
+        upper_key = lower_key.replace(".fuser.", ".Fuser.", 1)
+        upper_tensor = model_state.get(upper_key)
+        if upper_key not in source_state or upper_tensor is None:
+            continue
+        if lower_tensor.shape != upper_tensor.shape or lower_tensor.dtype != upper_tensor.dtype:
+            raise RuntimeError(f"Runtime alias metadata differs: {lower_key}")
+        if (
+            lower_tensor.untyped_storage()._cdata
+            != upper_tensor.untyped_storage()._cdata
+        ):
+            raise RuntimeError(f"Runtime aliases do not share storage: {lower_key}")
+        allowed.add(lower_key)
+    return allowed
+
+
+def _resolve_pruned96_state_load_contract(model, checkpoint, state_dict):
+    """Resolve the exact missing-key allowlist for the scored pruned96 model."""
+
+    quantized_state_keys = sorted(
+        key
+        for key, value in state_dict.items()
+        if key.endswith(
+            ("_scale", ".int4_scale", ".int4_shape", ".int4_group_size")
+        )
+        or (
+            isinstance(value, torch.Tensor)
+            and value.dtype in {torch.int8, torch.uint8}
+        )
+    )
+    if quantized_state_keys:
+        raise ValueError(
+            "Stage-1 pgw_lite_pruned_96 forbids undeclared quantized state: "
+            f"{quantized_state_keys}"
+        )
+
+    model_state = model.state_dict()
+    allowed_aliases = _runtime_alias_keys(model_state, state_dict)
+    storage = checkpoint.get("storage_optimization")
+    if storage is None:
+        return allowed_aliases, {
+            "alias_missing_keys": sorted(allowed_aliases),
+            "elided_index_keys": [],
+        }
+    if not isinstance(storage, dict):
+        raise ValueError("storage_optimization metadata must be a mapping")
+    if "deterministic_index_elision" in storage:
+        raise ValueError("Legacy deterministic_index_elision metadata is forbidden")
+    elision = storage.get("deterministic_buffer_elision")
+    if elision is None:
+        return allowed_aliases, {
+            "alias_missing_keys": sorted(allowed_aliases),
+            "elided_index_keys": [],
+        }
+    if storage.get("schema_version") != 1 or not isinstance(elision, dict):
+        raise ValueError("Unsupported deterministic_buffer_elision metadata")
+    if elision.get("method") != "constructor-earth-position-index-v1":
+        raise ValueError("Unsupported deterministic buffer elision method")
+
+    removed_keys = elision.get("removed_checkpoint_keys")
+    expected_missing = elision.get("expected_runtime_missing_keys")
+    generated = elision.get("generated_indices")
+    if not isinstance(removed_keys, list) or not removed_keys:
+        raise ValueError("removed_checkpoint_keys must be a non-empty list")
+    if not isinstance(expected_missing, list) or not expected_missing:
+        raise ValueError("expected_runtime_missing_keys must be a non-empty list")
+    if not isinstance(generated, dict):
+        raise ValueError("generated_indices must be a mapping")
+    if len(removed_keys) != len(set(removed_keys)):
+        raise ValueError("removed_checkpoint_keys contains duplicates")
+    if len(expected_missing) != len(set(expected_missing)):
+        raise ValueError("expected_runtime_missing_keys contains duplicates")
+
+    removed_keys = set(removed_keys)
+    expected_missing = set(expected_missing)
+    runtime_index_keys = {
+        key for key in model_state if key.endswith("earth_position_index")
+    }
+    source_index_keys = {
+        key for key in state_dict if key.endswith("earth_position_index")
+    }
+    if source_index_keys:
+        raise ValueError(
+            "Index-elided checkpoint still contains earth_position_index buffers"
+        )
+    if expected_missing != runtime_index_keys:
+        raise ValueError(
+            "expected_runtime_missing_keys must equal every runtime "
+            "earth_position_index key"
+        )
+    if not removed_keys.issubset(expected_missing):
+        raise ValueError("Removed checkpoint keys are absent from the runtime allowlist")
+    if set(generated) != expected_missing:
+        raise ValueError("generated_indices keys must equal expected_runtime_missing_keys")
+    if any(not key.endswith("earth_position_index") for key in expected_missing):
+        raise ValueError("Only earth_position_index buffers may be elided")
+    if any(key in state_dict for key in expected_missing):
+        raise ValueError("Elided index key is still present in the checkpoint")
+
+    removed_bytes = 0
+    for key in sorted(expected_missing):
+        target = model_state.get(key)
+        metadata = generated.get(key)
+        if target is None:
+            raise ValueError(f"Runtime model is missing generated index: {key}")
+        if not isinstance(metadata, dict):
+            raise ValueError(f"Invalid generated index metadata: {key}")
+        if list(target.shape) != metadata.get("shape"):
+            raise ValueError(f"Generated index shape mismatch: {key}")
+        if str(target.dtype) != metadata.get("dtype"):
+            raise ValueError(f"Generated index dtype mismatch: {key}")
+        if _tensor_sha256(target) != metadata.get("sha256"):
+            raise ValueError(f"Generated index SHA256 mismatch: {key}")
+        if key in removed_keys:
+            removed_bytes += target.numel() * target.element_size()
+
+    declared_bytes = elision.get("removed_logical_bytes")
+    if isinstance(declared_bytes, bool) or not isinstance(declared_bytes, int):
+        raise ValueError("removed_logical_bytes must be an integer")
+    if declared_bytes != removed_bytes:
+        raise ValueError("removed_logical_bytes differs from generated indices")
+
+    return allowed_aliases | expected_missing, {
+        "alias_missing_keys": sorted(allowed_aliases),
+        "elided_index_keys": sorted(expected_missing),
+        "removed_logical_bytes": removed_bytes,
+    }
+
+
+def _validate_pruned96_state_load(
+    missing_keys,
+    unexpected_keys,
+    allowed_missing_keys,
+):
+    actual_missing = set(missing_keys)
+    allowed_missing = set(allowed_missing_keys)
+    if actual_missing != allowed_missing:
+        missing = sorted(allowed_missing - actual_missing)
+        extra = sorted(actual_missing - allowed_missing)
+        raise RuntimeError(
+            "pruned96 missing-key contract failed: "
+            f"not_missing={missing}, unexpected_missing={extra}"
+        )
+    if unexpected_keys:
+        raise RuntimeError(
+            "pruned96 checkpoint contains unexpected keys: "
+            f"{sorted(set(unexpected_keys))}"
+        )
+
+
 def _validate_selective_mlp96_state_load(
     model, state_dict, missing_keys, unexpected_keys
 ):
@@ -1059,6 +1221,7 @@ if __name__ == "__main__":
                 f"ℹ️  模型结构 profile={model_profile['name']} "
                 f"patch={model_profile['patch_size']} embed={model_profile['embed_dim']}"
             )
+            is_pruned96 = model_profile["name"] == "pgw_lite_pruned_96"
             is_selective_mlp96 = model_profile["name"] == SELECTIVE_MLP96_PROFILE
             if is_selective_mlp96:
                 validate_selective_mlp96_initialization(ckpt.get("initialization"))
@@ -1244,6 +1407,27 @@ if __name__ == "__main__":
             incremental_state_load = _is_enabled(
                 "PANGU_INCREMENTAL_STATE_LOAD", default=True
             )
+            pruned96_allowed_missing = None
+            if is_pruned96:
+                if runtime_quant_linear or use_gqa or not incremental_state_load:
+                    raise ValueError(
+                        "pgw_lite_pruned_96 requires the fail-closed incremental "
+                        "state loader"
+                    )
+                pruned96_allowed_missing, pruned96_contract = (
+                    _resolve_pruned96_state_load_contract(
+                        model,
+                        ckpt,
+                        state_dict,
+                    )
+                )
+                print(
+                    "🔒 pruned96 state-load contract: "
+                    f"allowed_missing={len(pruned96_allowed_missing)} "
+                    f"aliases={len(pruned96_contract['alias_missing_keys'])} "
+                    f"elided_indices={len(pruned96_contract['elided_index_keys'])} "
+                    f"elided_bytes={pruned96_contract.get('removed_logical_bytes', 0)}"
+                )
             if is_selective_mlp96 and not incremental_state_load:
                 raise ValueError(
                     "SelectiveMLP-96 requires fail-closed incremental state loading"
@@ -1281,6 +1465,12 @@ if __name__ == "__main__":
                 from pangu_profile_model import adapt_qkv_for_gqa
                 ckpt["model_state_dict"] = adapt_qkv_for_gqa(ckpt["model_state_dict"], model)
                 model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            if is_pruned96:
+                _validate_pruned96_state_load(
+                    missing_keys,
+                    unexpected_keys,
+                    pruned96_allowed_missing,
+                )
             if is_selective_mlp96:
                 _validate_selective_mlp96_state_load(
                     model, state_dict, missing_keys, unexpected_keys
@@ -1317,6 +1507,21 @@ if __name__ == "__main__":
                 p2_retain_cpu_bias = _is_enabled(
                     "PANGU_P2_RETAIN_CPU_BIAS_BACKUP"
                 )
+                p2_region_release = _is_enabled("PANGU_P2_REGION_RELEASE")
+                p2_prebuild_hip = _is_enabled("PANGU_P2_PREBUILD_HIP")
+                if p2_prebuild_hip:
+                    from hip_earth_attention_tiled import (
+                        prepare_hip_earth_attention_tiled,
+                    )
+
+                    hip_prepare_report = prepare_hip_earth_attention_tiled(
+                        device="cuda:0",
+                        mode=p2_kernel_mode,
+                    )
+                    print(
+                        "⚡ PANGU_P2_PREBUILD_HIP=1, prepared HIP library: "
+                        + json.dumps(hip_prepare_report, sort_keys=True)
+                    )
                 patched_tiled_attention = enable_p2_tiled_attention(
                     model,
                     strict=True,
@@ -1324,13 +1529,20 @@ if __name__ == "__main__":
                     force_full_width=p2_full_width,
                     release_original_bias=p2_release_bias,
                     retain_cpu_backup=p2_retain_cpu_bias,
+                    precompute_region_ids=p2_region_release,
+                    release_original_masks=p2_region_release,
+                    retain_cpu_mask_backup=False,
                 )
+                if p2_region_release or p2_prebuild_hip:
+                    torch.cuda.synchronize()
                 print(
                     "⚡ PANGU_P2_TILED_ATTENTION=1，启用 isolated gfx936 tiled "
                     f"EarthAttention，mode={p2_kernel_mode}，"
                     f"full_width={int(p2_full_width)}，"
                     f"release_bias={int(p2_release_bias)}，"
                     f"cpu_backup={int(p2_retain_cpu_bias)}，"
+                    f"region_release={int(p2_region_release)}，"
+                    f"prebuild_hip={int(p2_prebuild_hip)}，"
                     f"patched={patched_tiled_attention}"
                 )
             _profile_cuda_memory("after load_state_dict/model eval")

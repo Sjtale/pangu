@@ -749,3 +749,34 @@ def get_hip_earth_attention_tiled_info(device=None, mode="online"):
         },
         "build": dict(build_info),
     }
+
+
+def prepare_hip_earth_attention_tiled(device=None, mode="online"):
+    """Build, load, and inspect the HIP library without launching attention."""
+
+    info = get_hip_earth_attention_tiled_info(device=device, mode=mode)
+    expected = {
+        "q_tile": 16,
+        "k_tile": 16,
+        "head_dim": 32,
+        "block_threads": 256,
+    }
+    mismatches = {
+        key: {"expected": value, "actual": info.get("config", {}).get(key)}
+        for key, value in expected.items()
+        if info.get("config", {}).get(key) != value
+    }
+    if mismatches:
+        raise RuntimeError(f"Unexpected tiled HIP configuration: {mismatches}")
+    active_blocks = info.get("occupancy", {}).get(
+        "active_blocks_per_multiprocessor"
+    )
+    if not isinstance(active_blocks, int) or active_blocks < 1:
+        raise RuntimeError(f"Invalid tiled HIP occupancy: {active_blocks}")
+    fingerprint = info.get("build", {}).get("fingerprint")
+    if not fingerprint:
+        raise RuntimeError("Tiled HIP build fingerprint is missing")
+    return {
+        "fingerprint": fingerprint,
+        **info,
+    }

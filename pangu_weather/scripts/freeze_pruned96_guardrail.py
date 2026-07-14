@@ -8,7 +8,17 @@ import shutil
 from pathlib import Path
 
 
-VERIFIED_SCORE = {"total": 89.6297, "u": 36.0095, "v": 17.4002, "w": 36.2200}
+VERIFIED_SCORE = {
+    "total": 90.7763,
+    "lightweight": 36.6011,
+    "inference_time": 17.9950,
+    "prediction": 36.1803,
+    "metric_mapping": {
+        "U": "lightweight",
+        "V": "inference_time",
+        "W": "prediction",
+    },
+}
 
 
 def sha256_file(path):
@@ -69,17 +79,24 @@ def freeze_guardrail(output_dir, artifacts):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--submission-zip", required=True)
+    parser.add_argument("--code-zip", required=True)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--calibration", required=True)
-    parser.add_argument("--output-dir", default="guardrails/pruned96_89_6297")
+    parser.add_argument("--inference", default="inference.py")
+    parser.add_argument("--result", default="result.py")
+    parser.add_argument(
+        "--static-audit",
+        default="logs/pruned96_static_90_7763.json",
+    )
+    parser.add_argument("--output-dir", default="guardrails/pruned96_90_7763")
     args = parser.parse_args()
     manifest = freeze_guardrail(
         args.output_dir,
         [
-            ("submission_zip", args.submission_zip),
+            ("code_zip", args.code_zip),
             ("checkpoint", args.checkpoint),
-            ("calibration", args.calibration),
+            ("inference", args.inference),
+            ("result", args.result),
+            ("static_audit", args.static_audit),
         ],
     )
     print(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True))

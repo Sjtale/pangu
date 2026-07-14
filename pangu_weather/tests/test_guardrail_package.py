@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -78,7 +79,7 @@ class GuardrailPackageTests(unittest.TestCase):
             for label, filename in (
                 ("submission_zip", "submission.zip"),
                 ("checkpoint", "model.pth"),
-                ("calibration", "calibration.npy"),
+                ("static_audit", "static.json"),
             ):
                 path = root / filename
                 path.write_bytes((label + "-verified").encode())
@@ -86,7 +87,11 @@ class GuardrailPackageTests(unittest.TestCase):
             output = root / "guardrail"
             manifest = FREEZE.freeze_guardrail(output, artifacts)
             self.assertEqual(manifest["profile"]["depth_blocks"], [2, 6, 6, 2])
-            self.assertEqual(manifest["platform_score"]["total"], 89.6297)
+            self.assertEqual(manifest["platform_score"]["total"], 90.7763)
+            self.assertEqual(
+                manifest["platform_score"]["metric_mapping"]["U"],
+                "lightweight",
+            )
             on_disk = json.loads((output / "guardrail_manifest.json").read_text())
             self.assertEqual(len(on_disk["artifacts"]), 3)
             with self.assertRaises(FileExistsError):
@@ -265,6 +270,29 @@ class GuardrailPackageTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertIn("缺少打包必需文件", result.stdout)
             self.assertFalse((root / "submit_package").exists())
+
+    def test_build_submission_rejects_unsafe_alternate_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "pangu_weather"
+            self._prepare_build_tree(root)
+            victim = Path(directory) / "do_not_delete"
+            victim.mkdir()
+            marker = victim / "marker.txt"
+            marker.write_text("preserve", encoding="utf-8")
+            environment = os.environ.copy()
+            environment["PANGU_SUBMIT_DIR"] = str(victim)
+            result = subprocess.run(
+                ["bash", str(root / "scripts/build_submission.sh")],
+                cwd=directory,
+                env=environment,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("Refusing unsafe PANGU_SUBMIT_DIR", result.stdout)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve")
 
 
 if __name__ == "__main__":
