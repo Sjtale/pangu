@@ -11,6 +11,8 @@ from pathlib import Path
 
 REQUIRED_PATHS = {
     "pangu_weather/README.md",
+    "pangu_weather/蒸馏与推理说明.md",
+    "pangu_weather/侍奉部*说明文档.pdf",
     "pangu_weather/compliant_inference_wrapper.py",
     "pangu_weather/conf/config.yaml",
     "pangu_weather/data/download_model_url.txt",

@@ -18,6 +18,8 @@ SUBMIT_DIR="$PROJECT_DIR/submit_package"
 PANGU_DIR="$SUBMIT_DIR/pangu_weather"
 MODEL_URL_FILE="$PROJECT_DIR/data/download_model_url.txt"
 ZIP_FILE="$SUBMIT_DIR/pangu_weather.zip"
+DISTILL_DOC="蒸馏与推理说明.md"
+TEAM_PDF="侍奉部*说明文档.pdf"
 
 ROOT_FILES=(
     compliant_inference_wrapper.py
@@ -45,6 +47,8 @@ REPRO_SCRIPTS=(
 for relative_path in \
     conf/config.yaml \
     COMPLIANCE_README.md \
+    "$DISTILL_DOC" \
+    "$TEAM_PDF" \
     data/download_model_url.txt \
     hip_kernels/earth_attention_tiled_fwd.hip \
     scripts/audit_submission_package.py \
@@ -73,6 +77,8 @@ for filename in "${ROOT_FILES[@]}"; do
 done
 cp "$MODEL_URL_FILE" "$PANGU_DIR/data/"
 cp "$PROJECT_DIR/COMPLIANCE_README.md" "$PANGU_DIR/README.md"
+cp "$PROJECT_DIR/$DISTILL_DOC" "$PANGU_DIR/"
+cp "$PROJECT_DIR/$TEAM_PDF" "$PANGU_DIR/"
 for relative_path in "${REPRO_SCRIPTS[@]}"; do
     cp "$PROJECT_DIR/$relative_path" "$PANGU_DIR/$relative_path"
 done
@@ -94,16 +100,32 @@ rm -f "$CONFIG_FILE.bak"
 
 # 4. 打包并使用精确成员路径白名单审计
 echo "📦 正在压缩最终提交包..."
-(
-    cd "$SUBMIT_DIR"
-    zip -qr pangu_weather.zip pangu_weather/
-)
+python - "$SUBMIT_DIR" <<'PY'
+from pathlib import Path
+import sys
+import zipfile
+
+submit_dir = Path(sys.argv[1])
+source_dir = submit_dir / "pangu_weather"
+target = submit_dir / "pangu_weather.zip"
+with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    for path in sorted(item for item in source_dir.rglob("*") if item.is_file()):
+        archive.write(path, path.relative_to(submit_dir).as_posix())
+PY
 
 echo "🔍 正在执行精确包结构审计..."
 python "$SCRIPT_DIR/audit_submission_package.py" "$ZIP_FILE" >/dev/null
 echo "✅ 打包完成！提交包路径：$ZIP_FILE"
 echo "🔍 提交包内部结构预览："
-unzip -l "$ZIP_FILE" | grep -v "/$"
+python - "$ZIP_FILE" <<'PY'
+import sys
+import zipfile
+
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    for item in archive.infolist():
+        if not item.is_dir():
+            print(f"{item.file_size:10d}  {item.filename}")
+PY
 if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$ZIP_FILE" > "$ZIP_FILE.sha256"
 else
@@ -114,4 +136,4 @@ echo ""
 echo "🎉 [最终检查清单]"
 echo "1. 确保 SCNet 模型 ZIP 解压后直接得到 model_fp16.pth。"
 echo "2. 不要同时放入 model_fp16_alias_compact.pth 和 model_fp16.pth。"
-echo "3. 提交 pangu_weather.zip 给官方平台，外加一份你的优化文档 PDF！"
+echo "3. 提交 pangu_weather.zip 给官方平台；包内已含 Markdown 和侍奉部说明文档 PDF。"
