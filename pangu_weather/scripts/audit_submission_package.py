@@ -12,7 +12,7 @@ from pathlib import Path
 REQUIRED_PATHS = {
     "pangu_weather/README.md",
     "pangu_weather/蒸馏与推理说明.md",
-    "pangu_weather/侍奉部*说明文档.pdf",
+    "pangu_weather/侍奉部_说明文档.pdf",
     "pangu_weather/compliant_inference_wrapper.py",
     "pangu_weather/conf/config.yaml",
     "pangu_weather/data/download_model_url.txt",
@@ -34,6 +34,9 @@ REQUIRED_PATHS = {
     "pangu_weather/scripts/quantize_mixed_precision.py",
 }
 ALLOWED_PATHS = set(REQUIRED_PATHS)
+REQUIRED_DIRECTORIES = {
+    "pangu_weather/result/output/",
+}
 
 FORBIDDEN_SOURCE_MARKERS = {
     "PANGU_GLOBAL_MEAN_CORRECTION",
@@ -107,15 +110,24 @@ def audit_zip(path, model_path=None):
     path = Path(path)
     with zipfile.ZipFile(path) as archive:
         files = [item for item in archive.infolist() if not item.is_dir()]
+        directories = [item for item in archive.infolist() if item.is_dir()]
         path_list = [item.filename for item in files]
+        directory_list = [item.filename for item in directories]
         paths = set(path_list)
+        directory_paths = set(directory_list)
         missing = sorted(REQUIRED_PATHS - paths)
+        missing_directories = sorted(REQUIRED_DIRECTORIES - directory_paths)
         unexpected = sorted(paths - ALLOWED_PATHS)
         duplicates = sorted(name for name in paths if path_list.count(name) > 1)
-        if missing or unexpected or duplicates:
+        directory_duplicates = sorted(
+            name for name in directory_paths if directory_list.count(name) > 1
+        )
+        if missing or missing_directories or unexpected or duplicates or directory_duplicates:
             raise ValueError(
                 "Submission package mismatch: "
-                f"missing={missing}, unexpected={unexpected}, duplicates={duplicates}"
+                f"missing={missing}, missing_directories={missing_directories}, "
+                f"unexpected={unexpected}, duplicates={duplicates}, "
+                f"directory_duplicates={directory_duplicates}"
             )
 
         violations = {}
@@ -137,6 +149,7 @@ def audit_zip(path, model_path=None):
             "package_sha256": sha256_file(path),
             "uncompressed_code_bytes": sum(item.file_size for item in files),
             "files": sorted(item.filename for item in files),
+            "directories": sorted(item.filename for item in directories),
         }
     if model_path is not None:
         model_path = Path(model_path)

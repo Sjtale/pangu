@@ -25,8 +25,14 @@ AUDIT = load_script("audit_submission_package")
 
 class GuardrailPackageTests(unittest.TestCase):
     @staticmethod
+    def _write_required_directories(archive):
+        for member in sorted(AUDIT.REQUIRED_DIRECTORIES):
+            archive.writestr(member, b"")
+
+    @staticmethod
     def _write_valid_package(path):
         with zipfile.ZipFile(path, "w") as archive:
+            GuardrailPackageTests._write_required_directories(archive)
             for member in sorted(AUDIT.REQUIRED_PATHS):
                 archive.writestr(member, member)
 
@@ -93,6 +99,13 @@ class GuardrailPackageTests(unittest.TestCase):
             report = AUDIT.audit_zip(path)
             self.assertEqual(set(report["files"]), AUDIT.REQUIRED_PATHS)
 
+            missing_output = Path(directory) / "missing-output.zip"
+            with zipfile.ZipFile(missing_output, "w") as archive:
+                for member in sorted(AUDIT.REQUIRED_PATHS):
+                    archive.writestr(member, member)
+            with self.assertRaisesRegex(ValueError, "missing_directories"):
+                AUDIT.audit_zip(missing_output)
+
             invalid = Path(directory) / "invalid.zip"
             self._write_valid_package(invalid)
             with zipfile.ZipFile(invalid, "a") as archive:
@@ -104,6 +117,7 @@ class GuardrailPackageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "submission.zip"
             with zipfile.ZipFile(path, "w") as archive:
+                self._write_required_directories(archive)
                 for member in sorted(AUDIT.REQUIRED_PATHS):
                     content = member
                     if member == "pangu_weather/inference.py":
@@ -116,6 +130,7 @@ class GuardrailPackageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "submission.zip"
             with zipfile.ZipFile(path, "w") as archive:
+                self._write_required_directories(archive)
                 for member in sorted(AUDIT.REQUIRED_PATHS):
                     content = member
                     if member == "pangu_weather/distill_train.py":
@@ -209,6 +224,7 @@ class GuardrailPackageTests(unittest.TestCase):
 
             empty_url = root / "empty-url.zip"
             with zipfile.ZipFile(empty_url, "w") as archive:
+                self._write_required_directories(archive)
                 for member in sorted(AUDIT.REQUIRED_PATHS):
                     archive.writestr(member, "")
             report = AUDIT.audit_zip(empty_url)
@@ -230,6 +246,9 @@ class GuardrailPackageTests(unittest.TestCase):
             package = root / "submit_package/pangu_weather.zip"
             report = AUDIT.audit_zip(package)
             self.assertEqual(set(report["files"]), AUDIT.REQUIRED_PATHS)
+            self.assertTrue(
+                AUDIT.REQUIRED_DIRECTORIES.issubset(set(report["directories"]))
+            )
 
     def test_build_submission_rejects_missing_model_url(self):
         with tempfile.TemporaryDirectory() as directory:

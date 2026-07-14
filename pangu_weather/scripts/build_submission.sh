@@ -19,7 +19,7 @@ PANGU_DIR="$SUBMIT_DIR/pangu_weather"
 MODEL_URL_FILE="$PROJECT_DIR/data/download_model_url.txt"
 ZIP_FILE="$SUBMIT_DIR/pangu_weather.zip"
 DISTILL_DOC="蒸馏与推理说明.md"
-TEAM_PDF="侍奉部*说明文档.pdf"
+TEAM_PDF="侍奉部_说明文档.pdf"
 
 ROOT_FILES=(
     compliant_inference_wrapper.py
@@ -109,8 +109,12 @@ submit_dir = Path(sys.argv[1])
 source_dir = submit_dir / "pangu_weather"
 target = submit_dir / "pangu_weather.zip"
 with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-    for path in sorted(item for item in source_dir.rglob("*") if item.is_file()):
-        archive.write(path, path.relative_to(submit_dir).as_posix())
+    for path in sorted(source_dir.rglob("*")):
+        member = path.relative_to(submit_dir).as_posix()
+        if path.is_dir():
+            archive.writestr(member.rstrip("/") + "/", b"")
+        else:
+            archive.write(path, member)
 PY
 
 echo "🔍 正在执行精确包结构审计..."
