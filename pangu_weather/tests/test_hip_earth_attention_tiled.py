@@ -31,11 +31,34 @@ class TiledHipSourceTests(unittest.TestCase):
         self.assertIn("PANGU_P2_TILED_ATTENTION", inference_source)
         self.assertIn('if _is_enabled("PANGU_P2_TILED_ATTENTION"):', inference_source)
         self.assertIn(
+            'os.environ.setdefault("PANGU_P2_TILED_ATTENTION", "1")',
+            inference_source,
+        )
+        self.assertIn(
+            'os.environ.setdefault("PANGU_P2_TILED_MODE", "full-row-fast")',
+            inference_source,
+        )
+        self.assertIn(
+            'os.environ.setdefault("PANGU_P2_FULL_WIDTH", "1")',
+            inference_source,
+        )
+        self.assertIn(
+            'os.environ.setdefault("PANGU_TILED_HIP_ARCH", '
+            '"gfx936:sramecc+:xnack-")',
+            inference_source,
+        )
+        self.assertIn(
+            'os.environ.setdefault("PANGU_TILED_HIP_BUILD_DIR", '
+            '"/tmp/pangu_tiled_hip_p2_full")',
+            inference_source,
+        )
+        self.assertIn(
             'model_profile.get("name") != "pgw_lite_pruned_96"',
             inference_source,
         )
         self.assertIn('"PANGU_P2_TILED_MODE"', inference_source)
         self.assertIn("kernel_mode=p2_kernel_mode", inference_source)
+        self.assertIn("force_full_width=p2_full_width", inference_source)
         profile_source = (PANGU_ROOT / "pangu_profile_model.py").read_text(encoding="utf-8")
         self.assertNotIn("PANGU_P2_TILED_ATTENTION", profile_source)
 
@@ -154,6 +177,8 @@ class TiledHipSourceTests(unittest.TestCase):
             '"post_projection"',
             '"[P2_AUDIT] "',
             "register_forward_pre_hook",
+            "force_full_width=False",
+            "_pangu_p2_full_width",
         ):
             with self.subTest(adapter_token=token):
                 self.assertIn(token, adapter_source)
@@ -433,6 +458,27 @@ class TiledHipCpuHelperTests(unittest.TestCase):
 
         module.qkv.widths.clear()
         module.proj.widths.clear()
+        module._pangu_p2_full_width = True
+        offsets.clear()
+        result, captured = self.adapter._run_p2_tiled_chunks(
+            module,
+            x,
+            packed_bias=object(),
+            position_index=object(),
+            region_ids=object(),
+            mask_width=3,
+            tiled_forward=tiled_forward,
+            capture_attention_output=True,
+        )
+        self.assertEqual(module.qkv.widths, [5])
+        self.assertEqual(module.proj.widths, [5])
+        self.assertEqual(offsets, [0])
+        self.assertTrue(torch.equal(captured, x))
+        self.assertTrue(torch.equal(result, x + 1))
+
+        module.qkv.widths.clear()
+        module.proj.widths.clear()
+        module._pangu_p2_full_width = False
         module._pangu_chunked_qkv = False
         module._pangu_chunked_proj = False
         offsets.clear()

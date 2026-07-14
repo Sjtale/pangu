@@ -148,6 +148,7 @@ BASE_ENV = {
     # production-safe even if the caller's shell exports the flag.
     "PANGU_P2_TILED_ATTENTION": "0",
     "PANGU_P2_TILED_MODE": "online",
+    "PANGU_P2_FULL_WIDTH": "1",
     # Buffer interning is the platform-verified 90.1048 guardrail default.
     "PANGU_INTERN_IMMUTABLE_BUFFERS": "1",
 }
@@ -518,6 +519,12 @@ def main():
     parser.add_argument("--log-file", default=None)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument(
+        "--buffer-intern",
+        choices=("0", "1"),
+        default=None,
+        help="Force immutable-buffer interning off/on for every emitted candidate.",
+    )
+    parser.add_argument(
         "--preset",
         choices=[
             "baseline", "compact-mask", "direct-mask", "cuda-graph", "cpu-recovery",
@@ -552,6 +559,11 @@ def main():
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     candidates = list(iter_candidates(args.preset))
+    if args.buffer_intern is not None:
+        for candidate in candidates:
+            candidate["env"] = dict(candidate["env"])
+            candidate["env"]["PANGU_INTERN_IMMUTABLE_BUFFERS"] = args.buffer_intern
+            candidate["label"] = candidate_label(candidate["env"])
     if args.preset == "pangu-lite-2d":
         for candidate in candidates:
             candidate["env"] = dict(candidate["env"])

@@ -29,6 +29,12 @@ from calibration_utils import (
     load_affine_calibration,
     load_global_mean_correction,
 )
+from compliant_inference_wrapper import CompliantInferenceWrapper
+from selective_mlp96 import (
+    PROFILE_NAME as SELECTIVE_MLP96_PROFILE,
+    validate_initialization_metadata as validate_selective_mlp96_initialization,
+    validate_inference_state_load as validate_selective_mlp96_state_load,
+)
 
 # Submission defaults: the platform only executes inference.py and does not
 # pass environment variables. Keep these overrideable for server A/B tests.
@@ -61,6 +67,12 @@ os.environ.setdefault("PANGU_HIP_SCHEDULE_SPIN", "0")
 os.environ.setdefault("PANGU_HIP_PREFER_L1", "0")
 os.environ.setdefault("PANGU_HIP_STREAM_SPIN", "0")
 os.environ.setdefault("PANGU_INTERN_IMMUTABLE_BUFFERS", "1")
+os.environ.setdefault("PANGU_COMPLIANT_FULL69_BOUNDARY", "0")
+os.environ.setdefault("PANGU_P2_TILED_ATTENTION", "1")
+os.environ.setdefault("PANGU_P2_TILED_MODE", "full-row-fast")
+os.environ.setdefault("PANGU_P2_FULL_WIDTH", "1")
+os.environ.setdefault("PANGU_TILED_HIP_ARCH", "gfx936:sramecc+:xnack-")
+os.environ.setdefault("PANGU_TILED_HIP_BUILD_DIR", "/tmp/pangu_tiled_hip_p2_full")
 
 
 
@@ -326,6 +338,10 @@ def _cfg_list(value):
     return [int(v) for v in value]
 
 
+def _cfg_nested_int_list(value):
+    return [[int(item) for item in row] for row in value]
+
+
 def _is_enabled(name, default=False):
     default_value = "1" if default else "0"
     return os.environ.get(name, default_value).lower() not in {"0", "false", "no"}
@@ -398,6 +414,10 @@ def _profile_from_config(cfg, profile_name):
         res["architecture"] = str(profile.architecture)
     if hasattr(profile, "window_size"):
         res["window_size"] = _cfg_list(profile.window_size)
+    if hasattr(profile, "mlp_ratio_blocks"):
+        res["mlp_ratio_blocks"] = _cfg_nested_int_list(
+            profile.mlp_ratio_blocks
+        )
     return res
 
 
@@ -431,6 +451,10 @@ def _profile_from_metadata(cfg, metadata):
         profile["window_size"] = _cfg_list(metadata["window_size"])
     if "depth_blocks" in metadata:
         profile["depth_blocks"] = _cfg_list(metadata["depth_blocks"])
+    if "mlp_ratio_blocks" in metadata:
+        profile["mlp_ratio_blocks"] = _cfg_nested_int_list(
+            metadata["mlp_ratio_blocks"]
+        )
     if "architecture" in metadata:
         profile["architecture"] = str(metadata["architecture"])
     if metadata.get("share_deep_blocks"):
@@ -439,6 +463,15 @@ def _profile_from_metadata(cfg, metadata):
 
 
 def _infer_profile_from_state(cfg, ckpt, state_dict):
+    metadata = ckpt.get("model_profile")
+    if (
+        isinstance(metadata, dict)
+        and metadata.get("name") == SELECTIVE_MLP96_PROFILE
+        and "mlp_ratio_blocks" not in metadata
+    ):
+        raise ValueError(
+            "SelectiveMLP-96 checkpoint requires mlp_ratio_blocks metadata"
+        )
     profile = _profile_from_metadata(cfg, ckpt.get("model_profile"))
     if profile is not None:
         return profile
@@ -822,6 +855,14 @@ def _load_dequantized_state_dict_incremental(model, state_dict):
     return missing_keys, unexpected_keys, loaded_count
 
 
+def _validate_selective_mlp96_state_load(
+    model, state_dict, missing_keys, unexpected_keys
+):
+    return validate_selective_mlp96_state_load(
+        model, state_dict, missing_keys, unexpected_keys
+    )
+
+
 def _dequantize_state_dict(state_dict, target_dtype):
     dequantized_state_dict = {}
     for key, value in state_dict.items():
@@ -879,15 +920,20 @@ if __name__ == "__main__":
     ## DataLoader init
     cfg_data = YParams(config_file_path, "datapipe")
 
-    means, stds = get_stats(cfg_data.dataset.data_dir, cfg_data.dataset.stats_dir, cfg_data.dataset.channels)
+    means, input_stds = get_stats(
+        cfg_data.dataset.data_dir,
+        cfg_data.dataset.stats_dir,
+        cfg_data.dataset.channels,
+    )
+    input_means = np.array(means, copy=True)
+    input_stds = np.array(input_stds, copy=True)
 
-    stds, affine_calibration = _load_output_calibration(cfg.checkpoint_dir, means, stds)
+    stds, affine_calibration = _load_output_calibration(
+        cfg.checkpoint_dir, means, input_stds
+    )
     global_mean_correction = _load_global_mean_correction(
         cfg.checkpoint_dir, int(means.shape[1])
     )
-
-    datapipe = ERA5Datapipe(params=cfg_data, distributed=False)
-    test_dataloader = datapipe.test_dataloader()
 
     land_mask = torch.from_numpy(np.load(os.path.join(cfg_data.dataset.static_dir, "land_mask.npy")).astype(np.float32))
     soil_type = torch.from_numpy(np.load(os.path.join(cfg_data.dataset.static_dir, "soil_type.npy")).astype(np.float32))
@@ -902,6 +948,8 @@ if __name__ == "__main__":
     onnx_sim_path = f"{cfg.checkpoint_dir}/model_fp16_sim.onnx"
     onnx_raw_path = f"{cfg.checkpoint_dir}/model_fp16.onnx"
     use_onnx = False
+    is_selective_mlp96 = False
+    compliant_boundary = _is_enabled("PANGU_COMPLIANT_FULL69_BOUNDARY")
     pruned_ckpt_path = f"{cfg.checkpoint_dir}/{cfg.pruned_checkpoint}"
     distilled_ckpt_path = f"{cfg.checkpoint_dir}/{cfg.distilled_checkpoint}"
     
@@ -1035,6 +1083,22 @@ if __name__ == "__main__":
                 f"ℹ️  模型结构 profile={model_profile['name']} "
                 f"patch={model_profile['patch_size']} embed={model_profile['embed_dim']}"
             )
+            is_selective_mlp96 = model_profile["name"] == SELECTIVE_MLP96_PROFILE
+            if is_selective_mlp96:
+                compliant_boundary = True
+                if _is_enabled("PANGU_GLOBAL_MEAN_CORRECTION"):
+                    raise ValueError(
+                        "SelectiveMLP-96 requires global mean correction to remain off"
+                    )
+                validate_selective_mlp96_initialization(ckpt.get("initialization"))
+                if any(
+                    isinstance(value, torch.Tensor)
+                    and value.dtype in {torch.int8, torch.uint8}
+                    for value in state_dict.values()
+                ):
+                    raise ValueError(
+                        "SelectiveMLP-96 inference forbids quantized checkpoints"
+                    )
             share_deep_blocks = model_profile.get("share_deep_blocks")
             if share_deep_blocks:
                 print(f"ℹ️  深层共享 share_deep_blocks={share_deep_blocks}")
@@ -1079,23 +1143,24 @@ if __name__ == "__main__":
                 )
             else:
                 model = build_pangu_model(
-                img_size=cfg_data.dataset.img_size,
-                patch_size=model_profile["patch_size"],
-                embed_dim=model_profile["embed_dim"],
-                num_heads=model_profile["num_heads"],
-                window_size=model_profile["window_size"],
-                depth_blocks=model_profile.get("depth_blocks", None),
-                recompute_skip=recompute_skip,
-                layerwise_inference=layerwise_inference,
-                layerwise_empty_cache=layerwise_empty_cache,
-                use_swiglu=use_swiglu,
-                use_rmsnorm=use_rmsnorm,
-                use_gqa=use_gqa,
-                kv_group_size=gqa_group_size,
-                share_deep_blocks=share_deep_blocks,
-                chunked_attention=chunked_attention,
-                attention_chunk_size=attention_chunk_size,
-            )
+                    img_size=cfg_data.dataset.img_size,
+                    patch_size=model_profile["patch_size"],
+                    embed_dim=model_profile["embed_dim"],
+                    num_heads=model_profile["num_heads"],
+                    window_size=model_profile["window_size"],
+                    depth_blocks=model_profile.get("depth_blocks", None),
+                    recompute_skip=recompute_skip,
+                    layerwise_inference=layerwise_inference,
+                    layerwise_empty_cache=layerwise_empty_cache,
+                    use_swiglu=use_swiglu,
+                    use_rmsnorm=use_rmsnorm,
+                    use_gqa=use_gqa,
+                    kv_group_size=gqa_group_size,
+                    share_deep_blocks=share_deep_blocks,
+                    chunked_attention=chunked_attention,
+                    attention_chunk_size=attention_chunk_size,
+                    mlp_ratio_blocks=model_profile.get("mlp_ratio_blocks"),
+                )
             runtime_quant_linear = (
                 _is_enabled("PANGU_RUNTIME_QUANT_LINEAR")
                 and not use_gqa
@@ -1174,6 +1239,10 @@ if __name__ == "__main__":
             incremental_state_load = _is_enabled(
                 "PANGU_INCREMENTAL_STATE_LOAD", default=True
             )
+            if is_selective_mlp96 and not incremental_state_load:
+                raise ValueError(
+                    "SelectiveMLP-96 requires fail-closed incremental state loading"
+                )
             if runtime_quant_linear:
                 print("ℹ️  使用 runtime QuantLinear 常驻 INT8 权重加载")
                 missing_keys, unexpected_keys, loaded_count = (
@@ -1207,6 +1276,10 @@ if __name__ == "__main__":
                 from pangu_profile_model import adapt_qkv_for_gqa
                 ckpt["model_state_dict"] = adapt_qkv_for_gqa(ckpt["model_state_dict"], model)
                 model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            if is_selective_mlp96:
+                _validate_selective_mlp96_state_load(
+                    model, state_dict, missing_keys, unexpected_keys
+                )
             model.eval()
             if _is_enabled("PANGU_INTERN_IMMUTABLE_BUFFERS"):
                 intern_report = intern_immutable_buffers(model)
@@ -1232,14 +1305,17 @@ if __name__ == "__main__":
                     "PANGU_P2_TILED_MODE",
                     "online",
                 )
+                p2_full_width = _is_enabled("PANGU_P2_FULL_WIDTH")
                 patched_tiled_attention = enable_p2_tiled_attention(
                     model,
                     strict=True,
                     kernel_mode=p2_kernel_mode,
+                    force_full_width=p2_full_width,
                 )
                 print(
                     "⚡ PANGU_P2_TILED_ATTENTION=1，启用 isolated gfx936 tiled "
                     f"EarthAttention，mode={p2_kernel_mode}，"
+                    f"full_width={int(p2_full_width)}，"
                     f"patched={patched_tiled_attention}"
                 )
             _profile_cuda_memory("after load_state_dict/model eval")
@@ -1277,9 +1353,40 @@ if __name__ == "__main__":
             raise e
 
         target_dtype = torch.float16 if use_fp16 else torch.float32
+        if compliant_boundary:
+            if stream_weights or _is_enabled("PANGU_CPU_RECOVERY_OUTPUT"):
+                raise ValueError(
+                    "Compliant full-69 inference forbids CPU/weight offload paths"
+                )
+            affine_scale = (
+                None if affine_calibration is None else affine_calibration.scale
+            )
+            affine_bias = (
+                None if affine_calibration is None else affine_calibration.bias
+            )
+            model = CompliantInferenceWrapper(
+                model,
+                surface_mask[:1],
+                input_means,
+                input_stds,
+                output_means=means,
+                output_stds=stds,
+                affine_scale=affine_scale,
+                affine_bias=affine_bias,
+                compute_dtype=target_dtype,
+                global_mean_correction=global_mean_correction,
+            ).to("cuda:0")
+            model.eval()
+            del surface_mask
+            print(
+                "✅ FAQ-compliant full-69 boundary enabled: "
+                "pre/postprocess timed, physical FP32 output"
+            )
         # ---- 方向4.5: CUDA Graph 捕获（可选，DCU 上可能不支持）----
         _example = None
-        if _is_enabled("PANGU_DISABLE_CUDA_GRAPH"):
+        if compliant_boundary:
+            print("ℹ️  Compliant full-69 boundary skips CUDA Graph")
+        elif _is_enabled("PANGU_DISABLE_CUDA_GRAPH"):
             print("ℹ️  PANGU_DISABLE_CUDA_GRAPH=1，跳过 CUDA Graph 捕获，使用标准 PyTorch 推理")
         elif stream_weights:
             print("ℹ️  PANGU_STREAM_WEIGHTS 启用时跳过 CUDA Graph 捕获")
@@ -1315,6 +1422,18 @@ if __name__ == "__main__":
                 torch.cuda.empty_cache()
                 _profile_cuda_memory("after CUDA Graph fallback cleanup")
 
+    if compliant_boundary and use_onnx:
+        raise ValueError("Compliant full-69 boundary requires the PyTorch model")
+
+    # In the compliant path the loader returns raw physical fields.  Input
+    # normalization is performed by the timed wrapper after the exempt H2D.
+    datapipe = ERA5Datapipe(
+        params=cfg_data,
+        distributed=False,
+        normalize=not compliant_boundary,
+    )
+    test_dataloader = datapipe.test_dataloader()
+
     graph_direct_input = (
         isinstance(model, CUDAGraphWrapper)
         and _is_enabled("PANGU_GRAPH_DIRECT_INPUT", default=True)
@@ -1347,10 +1466,21 @@ if __name__ == "__main__":
                 print(f"  outvar shape: {list(outvar.shape)}  ← [batch, channels, H, W]")
                 print(f"  the first filename: {filename}")
 
-            upper_air_shape = tuple(invar[:, 4:].shape)
-            if graph_direct_input:
+            upper_air_shape = None
+            if compliant_boundary:
+                # The FAQ exempts only the raw 69-channel H2D transfer.  Finish
+                # that transfer before the protected timer starts; every
+                # required transformation remains inside model.forward.
+                # Preserve the loader dtype during the exempt transfer.  The
+                # FP16/FP32 compute cast is preprocessing and therefore occurs
+                # inside CompliantInferenceWrapper.forward under the timer.
+                invar = invar.to("cuda:0", non_blocking=True)
+                torch.cuda.synchronize()
+            elif graph_direct_input:
+                upper_air_shape = tuple(invar[:, 4:].shape)
                 invar = model.prepare_input(invar)
             else:
+                upper_air_shape = tuple(invar[:, 4:].shape)
                 # FP16: 输入数据直接转为半精度
                 # 方向4.3: non_blocking 异步数据传输，重叠 CPU/GPU 工作
                 invar_surface = invar[:, :4, :, :].to("cuda:0", dtype=target_dtype, non_blocking=True)
@@ -1368,7 +1498,11 @@ if __name__ == "__main__":
 
             #----------------------AI4S(时间度量不可更改)---------------------------
             start_time = time.perf_counter()      # AI4S(时间度量，位置不可更改)
-            out_surface, out_upper_air = model(invar)
+            if compliant_boundary:
+                model_output = model(invar)
+            else:
+                out_surface, out_upper_air = model(invar)
+                model_output = (out_surface, out_upper_air)
             torch.cuda.synchronize()              # AI4S(时间度量，位置不可更改，新增)
             end_time = time.perf_counter()        # AI4S(时间度量，位置不可更改)
             time_list.append(end_time-start_time) # AI4S(时间度量，位置不可更改)
@@ -1376,32 +1510,48 @@ if __name__ == "__main__":
             if _is_enabled("PANGU_PROFILE_MEMORY") and len(time_list) == 1:
                 _profile_cuda_memory("after first timed forward")
 
-            out_upper_air = out_upper_air.reshape(upper_air_shape)
-            # FP16: 输出转回 float32 再做反归一化，避免半精度下乘法精度损失
-            if _is_enabled("PANGU_CPU_OUTPUT_POSTPROCESS", default=True):
-                pred_tensor = torch.concat(
-                    [out_surface.detach().cpu(), out_upper_air.detach().cpu()],
-                    dim=1,
-                ).float()
-                pred_var = pred_tensor.numpy()
+            if compliant_boundary:
+                pred_tensor = model_output
+                # Full physical 69-channel D2H is explicitly outside timing.
+                pred_var = pred_tensor.detach().cpu().numpy()
             else:
-                pred_var = torch.concat([out_surface, out_upper_air], dim=1).float().cpu().numpy()
-            pred_var = pred_var * stds + means
-            pred_var = apply_affine_calibration(pred_var, means, affine_calibration)
-            pred_var = apply_global_mean_correction(pred_var, global_mean_correction)
+                out_surface, out_upper_air = model_output
+                out_upper_air = out_upper_air.reshape(upper_air_shape)
+                # Legacy boundary retained only for guardrail reproduction.
+                if _is_enabled("PANGU_CPU_OUTPUT_POSTPROCESS", default=True):
+                    pred_tensor = torch.concat(
+                        [out_surface.detach().cpu(), out_upper_air.detach().cpu()],
+                        dim=1,
+                    ).float()
+                    pred_var = pred_tensor.numpy()
+                else:
+                    pred_var = torch.concat(
+                        [out_surface, out_upper_air], dim=1
+                    ).float().cpu().numpy()
+                pred_var = pred_var * stds + means
+                pred_var = apply_affine_calibration(
+                    pred_var, means, affine_calibration
+                )
+                pred_var = apply_global_mean_correction(
+                    pred_var, global_mean_correction
+                )
             np.save(f"result/output/{filename}.npy", pred_var)
             if _is_enabled("PANGU_PROFILE_MEMORY") and len(time_list) == 1:
                 _profile_cuda_memory("after first output postprocess")
 
             # Explicitly clear loop-local GPU tensor references to prevent caching allocator double-buffering peak VRAM
             if (
-                not graph_direct_input
+                not compliant_boundary
+                and not graph_direct_input
                 and not _is_enabled("PANGU_CLEAR_INPUT_REFS", default=True)
             ):
                 del invar_surface, invar_upper_air, invar_surface_with_mask, invar_upper_air_reshaped
-            del invar, upper_air_shape
-            del out_surface, out_upper_air
-            if _is_enabled("PANGU_CPU_OUTPUT_POSTPROCESS", default=True):
+            del invar, upper_air_shape, model_output
+            if not compliant_boundary:
+                del out_surface, out_upper_air
+            if compliant_boundary or _is_enabled(
+                "PANGU_CPU_OUTPUT_POSTPROCESS", default=True
+            ):
                 del pred_tensor
 
 

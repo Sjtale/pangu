@@ -134,12 +134,53 @@ python scripts/probe_fast_attention_capability.py \
 # 不允许回退到 math/memory-efficient SDPA
 python scripts/probe_fast_attention_compatibility.py \
   --output logs/fast_attention_compatibility.json
+
+# 标准 Flash 接口失败后，按独立进程依次验证：
+# 原生 PyTorch-Triton -> Flex -> OneScience Triton -> TE forced fused
+bash scripts/run_bias_aware_attention_probes.sh
+
+# 只运行不依赖 torch.compile/JAX 的自定义 Triton 前向内核
+python scripts/probe_bias_aware_attention_backends.py \
+  --backend pytorch-triton \
+  --output logs/pytorch_triton_l144.json
+
+# 仅用于复现/定位：当前 Triton 3.0 在 dot 后行归约处已确认 SIGSEGV
+python scripts/probe_triton_runtime_stages.py \
+  --output logs/triton_runtime_stages.json
+
+# 最后剩余路线：仅用已安装 hipcc 编译项目自有 HIP kernel，不安装任何包
+python scripts/probe_hip_earth_attention.py \
+  --force-rebuild \
+  --output logs/hip_earth_attention_l32_l144.json
 ```
 
 兼容性报告只有在 `adapter_candidate=true` 且
 `decision=PROFILE_FOR_FUSED_KERNEL` 时才进入 `hipprof` 和完整模型 A/B。
 `STOP_PYTORCH_FLASH_AND_TEST_HIP_STAGEWISE` 表示组合 mask 无法使用强制
 Flash 路径，应停止该路线，不得把无 mask 的基础通过误认为 Pangu 兼容。
+新的 bias-aware 报告也只是微基准门禁：必须数值通过，且用
+`hipprof` 确认没有回退到 matmul/softmax 链，才能进入整模型 A/B。
+FlexAttention 会启动新的 `torch.compile` 隔离探针；这不改变项目中
+既有“当前 DCU 栈不对整模型启用 compile”的默认决策。
+首次 DCU 运行已在 Flex compile 中复现段错误，后续 launcher 默认跳过
+Flex。若 JAX 存在于另一厂商环境，可以指定该解释器而不改动
+当前 PyTorch 环境：
+
+```bash
+PANGU_JAX_PYTHON=/absolute/path/to/python \
+  bash scripts/run_bias_aware_attention_probes.sh
+```
+
+Transformer Engine 会自动启用 `NVTE_DEBUG=1`/级别 2，详细原因写入
+`transformer_engine_debug.log`。
+自定义 Triton 3.0 路径已关闭：QK 与任意 bias/mask 能执行，
+但 dot 之后的 FP32/FP16 行 max 归约均会 SIGSEGV。不得用 pip、venv、
+conda 或 apt 安装/覆盖 Triton、JAX 或 Transformer Engine。自有 HIP 路径
+在 DCU 上 L32 通过且比 eager 快 `1.91x`，但代表性 L144 产生非有限误差，
+并且 `4.0826 ms` 对 eager `0.6245 ms`，延迟为 `6.54x`。当前标量
+one-query-per-block HIP 实现已拒绝，不得进入 `hipprof`、正式模型
+或平台 A/B。只有全新的矩阵分块/MFMA 实现或厂商 dense-bias fused API
+可以重新打开这条路线。
 
 `PANGU_ATTN_CHUNK_SIZE_LAYER{1..4}` 和
 `PANGU_MLP_CHUNK_SIZE_LAYER{1..4}` 的值 `0` 表示整 stage；对应的
@@ -320,6 +361,57 @@ epoch/step 计划、warmup、学习率和 loss 权重；修复前无此元数据
 年份分块采样仅保留为显式 I/O 诊断开关，正式架构筛选入口不强制启用。
 日志中 `rolling20` 是最近 20 步真实耗时，
 `data_wait` 是其中等待 DataLoader 的时间，`cumulative` 仅供长程参考。
+
+### SelectiveMLP-96
+
+`SelectiveMLP-96` 保留 `[2,6,6,2]` 全部注意力/残差块，只将 layer2 的
+block 1–5 和 layer3 的 block 0–5 从 MLP ratio 4 压到 2。结构固定为
+`14,768,265` 参数；初始化器要求完整、未量化的 pruned-96 权重和官方
+full-192 教师，使用 32 个等间隔训练输入、每输入每目标 MLP 4096 token、
+seed `20260713` 选择成对的 384 个神经元。
+
+```bash
+export PANGU_SELECTIVE_MLP96_SOURCE=data/checkpoints/model_pgw_lite_pruned_96_fp16.pth
+export PANGU_SELECTIVE_MLP96_TEACHER=pangu_backups/model_bak.pth
+
+# 零随机、可追溯初始化；随后执行 512-step 恢复和 3072-step full-teacher KD
+bash scripts/run_selective_mlp96.sh prepare
+bash scripts/run_selective_mlp96.sh recover
+bash scripts/run_selective_mlp96.sh distill
+
+# 审计候选；参数、键、dtype、来源、采样契约和 29.1 MiB 门槛均 fail closed
+bash scripts/run_selective_mlp96.sh audit \
+  data/checkpoints/selective_mlp96_fullteacher_step2048_fp16.pth
+
+# 合规 pruned-96 A/B：5 个独立进程，每进程 1 次 warmup + 4 个稳态点；
+# 自动执行 mean、P90、峰值显存和 checkpoint 大小门槛
+bash scripts/run_selective_mlp96.sh runtime \
+  data/checkpoints/model_fp16_alias_compact.pth \
+  data/checkpoints/selective_mlp96_fullteacher_step2048_fp16.pth
+
+# 五个小 NPZ 的 rmse/acc 均为 [4,15]；无候选过 W 门槛时命令返回非零
+bash scripts/run_selective_mlp96.sh validate-metrics --metric-inputs \
+  --full192 logs/full192_metrics.npz \
+  --pruned96 logs/pruned96_metrics.npz \
+  --step1024 logs/selective_mlp96_step1024_metrics.npz \
+  --step2048 logs/selective_mlp96_step2048_metrics.npz \
+  --step3072 logs/selective_mlp96_step3072_metrics.npz \
+  --output logs/selective_mlp96_blocked_w.json
+```
+
+`prepare` 的激活采样仅将上述 11 个目标 MLP 切换为单次完整
+33120-token 调用，避免默认 `32768 + 352` 分块被误认为两个
+输入。这不改变 4096-token 采样、其他 block 或后续训练/推理分块。
+`source_recovery` 只解冻 11 个目标 MLP；训练时在已冻结的
+downsample/layer2 边界临时建立叶子梯度，以保留 OneScience 原有的
+layer2/3 reentrant activation checkpoint，且不对冻结前缀计算参数梯度。
+
+合规推理的 dataloader 返回未归一化的物理 69 通道；timer 外只做原始
+69 通道 H2D，`CompliantInferenceWrapper.forward` 内完成输入归一化、通道
+切分、静态 mask 拼接、模型推理、69 通道恢复和接受过的 affine。最终物理
+气压超过 FP16 有限范围，因此完整输出在 timer 内生成为连续 FP32，再执行
+唯一允许的完整 69 通道 D2H 和文件保存。global-mean correction、CPU/权重
+卸载、CUDA Graph、量化、GQA、SwiGLU、RMSNorm 均不进入该 profile。
 
 ## 集群训练，提前查看slurm作业提交方式和相关指令
 ```bash

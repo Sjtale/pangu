@@ -82,6 +82,25 @@ model:
         embed_dim: 80
         num_heads: [5, 10, 10, 5]
         depth_blocks: [1, 2, 2, 1]
+      # ARCHIVED/REJECTED 2026-07-13: weighted validation plateaued at 0.2003.
+      pangu_selective_1441_full192:
+        patch_size: [2, 8, 8]
+        embed_dim: 96
+        num_heads: [3, 6, 6, 3]
+        depth_blocks: [1, 4, 4, 1]
+        window_size: [2, 6, 12]
+        mlp_ratio: 4
+      selective_mlp96:
+        patch_size: [2, 8, 8]
+        embed_dim: 96
+        num_heads: [3, 6, 6, 3]
+        depth_blocks: [2, 6, 6, 2]
+        window_size: [2, 6, 12]
+        mlp_ratio_blocks:
+          - [4, 4]
+          - [4, 2, 2, 2, 2, 2]
+          - [2, 2, 2, 2, 2, 2]
+          - [4, 4]
     pruned_embed_dim: 160
     pruned_num_heads: [5, 10, 10, 5]
     pruned_checkpoint: "model_pruned_fp16.pth"

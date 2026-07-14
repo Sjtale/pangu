@@ -181,6 +181,10 @@ class UVRuntimeSwitchTests(unittest.TestCase):
             [candidate["env"]["PANGU_P2_TILED_MODE"] for candidate in candidates],
             ["online", "full-row-fast"],
         )
+        self.assertEqual(
+            [candidate["env"]["PANGU_P2_FULL_WIDTH"] for candidate in candidates],
+            ["1", "1"],
+        )
         self.assertEqual(len({candidate["label"] for candidate in candidates}), 2)
         for candidate in candidates:
             env = candidate["env"]

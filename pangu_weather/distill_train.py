@@ -1,4 +1,4 @@
-"""Distill the official Pangu model into a lightweight student profile.
+"""Train lightweight Pangu student profiles from audited initializations.
 
 Run from ``pangu_weather`` after generating the structured-pruning checkpoint,
 or set ``PANGU_STUDENT_PROFILE=pgw_lite_patch8`` to train the PGW-Lite
@@ -7,16 +7,17 @@ patch-size student:
     python scripts/prune_structured.py
     python distill_train.py
 
-The teacher is used only during training. The exported FP16 student can be
-selected in inference with ``PANGU_USE_DISTILLED=1``.
+Standard profiles use a teacher during distillation. The selective full_192
+recovery profile explicitly disables teacher construction and teacher losses.
 """
 
 import logging
 import math
 import os
+import re
 import sys
 import time
-from collections import deque
+from collections import OrderedDict, deque
 
 import numpy as np
 import torch
@@ -44,6 +45,27 @@ from score_training_utils import (
     warmup_cosine_factor,
     YearBlockSampler,
 )
+from selective_mlp96 import (
+    PROFILE_NAME as SELECTIVE_MLP96_PROFILE,
+    SOURCE_PROFILE as SELECTIVE_MLP96_SOURCE_PROFILE,
+    configure_trainable_parameters as configure_selective_mlp96_trainable,
+    source_recovery_gradient_boundary,
+    teacher_only_loss as selective_mlp96_teacher_loss,
+    validate_initialization_metadata as validate_selective_mlp96_initialization,
+    validate_profile as validate_selective_mlp96_profile,
+    validate_stage_protocol as validate_selective_mlp96_stage_protocol,
+)
+
+
+SELECTIVE_1441_PROFILE = "pangu_selective_1441_full192"
+SELECTIVE_1441_SPEC = {
+    "patch_size": [2, 8, 8],
+    "embed_dim": 96,
+    "num_heads": [3, 6, 6, 3],
+    "depth_blocks": [1, 4, 4, 1],
+    "window_size": [2, 6, 12],
+    "mlp_ratio": 4,
+}
 
 
 def forecast_loss(surface, upper_air, target_surface, target_upper_air):
@@ -52,6 +74,92 @@ def forecast_loss(surface, upper_air, target_surface, target_upper_air):
     return F.l1_loss(upper_air, target_upper_air) + 0.25 * F.l1_loss(
         surface, target_surface
     )
+
+
+def weighted_recovery_loss(
+    surface,
+    upper_air,
+    target_surface,
+    target_upper_air,
+    surface_weights,
+    upper_air_weights,
+):
+    """Organizer-weighted all-69-channel L1 for recovery-only training."""
+
+    surface_loss = (
+        F.l1_loss(surface, target_surface, reduction="none") * surface_weights
+    ).mean()
+    upper_air_loss = (
+        F.l1_loss(upper_air, target_upper_air, reduction="none")
+        * upper_air_weights
+    ).mean()
+    return upper_air_loss + 0.25 * surface_loss
+
+
+def validate_recovery_only_profile(profile):
+    if profile.get("name") != SELECTIVE_1441_PROFILE:
+        raise ValueError(
+            f"PANGU_RECOVERY_ONLY supports only {SELECTIVE_1441_PROFILE}"
+        )
+    actual = {key: profile.get(key) for key in SELECTIVE_1441_SPEC}
+    if actual != SELECTIVE_1441_SPEC:
+        raise ValueError(
+            f"Recovery-only profile mismatch: actual={actual}, expected={SELECTIVE_1441_SPEC}"
+        )
+
+
+def validate_recovery_only_schedule(
+    *,
+    ground_truth_weight,
+    teacher_weight,
+    hint_weight,
+    hint_layers,
+    score_aligned,
+    score_project_quantized,
+    total_epochs,
+    steps_per_epoch,
+    warmup_steps,
+    base_lr,
+    min_lr_ratio,
+    gradient_accumulation,
+    checkpoint_interval,
+):
+    actual = {
+        "ground_truth_weight": float(ground_truth_weight),
+        "teacher_weight": float(teacher_weight),
+        "hint_weight": float(hint_weight),
+        "hint_layers": list(hint_layers),
+        "score_aligned": bool(score_aligned),
+        "score_project_quantized": bool(score_project_quantized),
+        "total_epochs": int(total_epochs),
+        "steps_per_epoch": int(steps_per_epoch),
+        "warmup_steps": int(warmup_steps),
+        "base_lr": float(base_lr),
+        "min_lr_ratio": float(min_lr_ratio),
+        "gradient_accumulation": int(gradient_accumulation),
+        "checkpoint_interval": int(checkpoint_interval),
+    }
+    expected = {
+        "ground_truth_weight": 1.0,
+        "teacher_weight": 0.0,
+        "hint_weight": 0.0,
+        "hint_layers": [],
+        "score_aligned": False,
+        "score_project_quantized": False,
+        "total_epochs": 4,
+        "steps_per_epoch": 2048,
+        "warmup_steps": 256,
+        "base_lr": 1.0e-5,
+        "min_lr_ratio": 0.1,
+        "gradient_accumulation": 1,
+        "checkpoint_interval": 256,
+    }
+    if actual != expected:
+        raise ValueError(
+            f"Recovery-only protocol mismatch: actual={actual}, expected={expected}"
+        )
+    if env_enabled("PANGU_SCORED_ONLY_RECOVERY"):
+        raise ValueError("Recovery-only training forbids scored-only recovery")
 
 
 def distillation_loss(
@@ -80,6 +188,10 @@ def checkpoint_path(cfg, name):
 
 def cfg_list(value):
     return [int(v) for v in value]
+
+
+def cfg_nested_int_list(value):
+    return [[int(item) for item in row] for row in value]
 
 
 def cfg_str_list(value):
@@ -152,6 +264,10 @@ def get_model_profile(cfg, profile_name):
         res["architecture"] = str(profile.architecture)
     if hasattr(profile, "window_size"):
         res["window_size"] = cfg_list(profile.window_size)
+    if hasattr(profile, "mlp_ratio"):
+        res["mlp_ratio"] = int(profile.mlp_ratio)
+    if hasattr(profile, "mlp_ratio_blocks"):
+        res["mlp_ratio_blocks"] = cfg_nested_int_list(profile.mlp_ratio_blocks)
     return res
 
 
@@ -400,8 +516,16 @@ def save_student(
     inference_checkpoint_name=None,
     epoch_step=None,
     training_protocol=None,
+    initialization=None,
 ):
     model_to_save = model.module if hasattr(model, "module") else model
+    recovery_only = bool(
+        training_protocol and training_protocol.get("recovery_only", False)
+    )
+    selective_mlp96 = bool(
+        training_protocol
+        and training_protocol.get("student_profile") == SELECTIVE_MLP96_PROFILE
+    )
     train_state = {
         "model_state_dict": model_to_save.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -413,6 +537,8 @@ def save_student(
     }
     if training_protocol is not None:
         train_state["training_protocol"] = dict(training_protocol)
+    if initialization is not None:
+        train_state["initialization"] = initialization
     if epoch_step is not None:
         train_state["epoch_step"] = int(epoch_step)
     train_path = checkpoint_path(cfg, train_checkpoint_name)
@@ -423,14 +549,50 @@ def save_student(
     if inference_checkpoint_name is None:
         return
 
+    inference_source = model_to_save.state_dict()
+    if recovery_only or selective_mlp96:
+        # OneScience registers the same implementation under aliases such as
+        # ``fuser``/``Fuser``.  ``state_dict`` contains both paths, but the
+        # default named-parameter traversal emits each shared Parameter once.
+        # Keeping only that unique traversal is lossless and is required for
+        # the SelectiveMLP-96 parameter count/file-size contract.
+        parameter_keys = list(dict(model_to_save.named_parameters()))
+        inference_source = OrderedDict(
+            (key, inference_source[key]) for key in parameter_keys
+        )
     inference_state = {
-        "model_state_dict": {
-            key: value.detach().half().cpu()
-            if torch.is_floating_point(value)
-            else value.detach().cpu()
-            for key, value in model_to_save.state_dict().items()
-        },
-        "distillation": {
+        "model_state_dict": OrderedDict(
+            (
+                key,
+                value.detach().half().cpu()
+                if torch.is_floating_point(value)
+                else value.detach().cpu(),
+            )
+            for key, value in inference_source.items()
+        ),
+        "model_profile": student_profile,
+    }
+    if recovery_only:
+        inference_state["recovery"] = {
+            "mode": "all_69_weighted_l1",
+            "teacher_forward": False,
+            "teacher_loss": False,
+            "hint_loss": False,
+            "score_aligned": False,
+            "scored_only": False,
+        }
+    elif selective_mlp96:
+        inference_state["distillation"] = {
+            "teacher_source": training_protocol["teacher_source"],
+            "student_profile": SELECTIVE_MLP96_PROFILE,
+            "ground_truth_weight": 0.0,
+            "teacher_weight": 1.0,
+            "scored_teacher_weight": 0.70,
+            "unscored_teacher_weight": 0.30,
+            "all_69_channels": True,
+        }
+    else:
+        inference_state["distillation"] = {
             "teacher_embed_dim": int(cfg.embed_dim),
             "student_profile": student_profile["name"],
             "student_embed_dim": int(student_profile["embed_dim"]),
@@ -449,9 +611,9 @@ def save_student(
             "score_project_quantized": env_enabled(
                 "PANGU_SCORE_PROJECT_QUANTIZED"
             ),
-        },
-        "model_profile": student_profile,
-    }
+        }
+    if initialization is not None:
+        inference_state["initialization"] = initialization
     if training_protocol is not None:
         inference_state["training_protocol"] = dict(training_protocol)
     inference_path = checkpoint_path(cfg, inference_checkpoint_name)
@@ -460,11 +622,18 @@ def save_student(
     os.replace(temporary_inference_path, inference_path)
 
 
-def prepare_batch(data, surface_mask, device):
-    invar, outvar = data[:2]
+def prepare_model_input(data, surface_mask, device):
+    """Move only organizer inputs; teacher-only training never reads labels."""
+
+    invar = data[0]
     invar_surface = invar[:, :4].to(device, dtype=torch.float32)
     invar_upper_air = invar[:, 4:].to(device, dtype=torch.float32)
-    model_input = torch.cat([invar_surface, surface_mask, invar_upper_air], dim=1)
+    return torch.cat([invar_surface, surface_mask, invar_upper_air], dim=1)
+
+
+def prepare_batch(data, surface_mask, device):
+    model_input = prepare_model_input(data, surface_mask, device)
+    outvar = data[1]
     target_surface = outvar[:, :4].to(device, dtype=torch.float32)
     target_upper_air = outvar[:, 4:].to(device, dtype=torch.float32)
     return model_input, target_surface, target_upper_air
@@ -581,6 +750,7 @@ def make_model(cfg_data, profile, use_upgrades=True):
             patch_size=tuple(profile["patch_size"]),
             dim=profile["embed_dim"],
         )
+    force_native = profile.get("name") == SELECTIVE_MLP96_PROFILE
     return build_pangu_model(
         img_size=cfg_data.dataset.img_size,
         patch_size=profile["patch_size"],
@@ -589,9 +759,10 @@ def make_model(cfg_data, profile, use_upgrades=True):
         window_size=profile["window_size"],
         depth_blocks=profile.get("depth_blocks", None),
         share_deep_blocks=profile.get("share_deep_blocks", False),
-        use_swiglu=False if not use_upgrades else None,
-        use_rmsnorm=False if not use_upgrades else None,
-        use_gqa=False if not use_upgrades else None,
+        mlp_ratio_blocks=profile.get("mlp_ratio_blocks"),
+        use_swiglu=False if force_native or not use_upgrades else None,
+        use_rmsnorm=False if force_native or not use_upgrades else None,
+        use_gqa=False if force_native or not use_upgrades else None,
     )
 
 
@@ -692,6 +863,39 @@ def main():
     student_profile = get_student_profile(cfg)
     if "window_size" not in student_profile:
         student_profile["window_size"] = cfg_list(cfg.window_size)
+    recovery_only = env_enabled("PANGU_RECOVERY_ONLY")
+    is_selective_mlp96 = student_profile["name"] == SELECTIVE_MLP96_PROFILE
+    selective_mlp96_stage = os.environ.get(
+        "PANGU_SELECTIVE_MLP96_STAGE", ""
+    ).strip()
+    if is_selective_mlp96:
+        validate_selective_mlp96_profile(student_profile)
+        if selective_mlp96_stage not in {
+            "source_recovery",
+            "full_teacher",
+        }:
+            raise ValueError(
+                "SelectiveMLP-96 requires PANGU_SELECTIVE_MLP96_STAGE="
+                "source_recovery or full_teacher"
+            )
+    elif selective_mlp96_stage:
+        raise ValueError(
+            "PANGU_SELECTIVE_MLP96_STAGE is valid only for selective_mlp96"
+        )
+    if (
+        student_profile["name"] == SELECTIVE_1441_PROFILE
+        and not env_enabled("PANGU_ALLOW_REJECTED_SELECTIVE_1441")
+    ):
+        raise ValueError(
+            f"{SELECTIVE_1441_PROFILE} is archived/rejected; set "
+            "PANGU_ALLOW_REJECTED_SELECTIVE_1441=1 only for reproduction"
+        )
+    if recovery_only:
+        validate_recovery_only_profile(student_profile)
+    elif student_profile["name"] == SELECTIVE_1441_PROFILE:
+        raise ValueError(
+            f"{SELECTIVE_1441_PROFILE} may be trained only with PANGU_RECOVERY_ONLY=1"
+        )
     checkpoint_names = get_profile_checkpoint_names(cfg, student_profile)
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -743,13 +947,45 @@ def main():
         cfg_data.dataloader.batch_size, 1, 1, 1
     )
 
-    teacher = make_model(cfg_data, teacher_profile, use_upgrades=False).half()
+    channel_weights = np.asarray(
+        getattr(cfg_data.dataset, "weights"), dtype=np.float32
+    )
+    if channel_weights.size != 69:
+        raise ValueError(
+            f"Recovery/training expects 69 channel weights, got {channel_weights.size}"
+        )
+    recovery_surface_weights = torch.as_tensor(
+        channel_weights[:4], device=device
+    ).view(1, 4, 1, 1)
+    recovery_upper_weights = torch.as_tensor(
+        channel_weights[4:], device=device
+    ).view(1, 65, 1, 1)
+
     local_teacher = checkpoint_path(cfg, "model_bak.pth")
     backup_teacher = os.path.join(cfg.official_checkpoint_dir, "model_bak.pth")
     teacher_path = local_teacher if os.path.exists(local_teacher) else backup_teacher
-    load_state(teacher, teacher_path)
-    teacher.to(device).eval()
-    teacher.requires_grad_(False)
+    if is_selective_mlp96 and selective_mlp96_stage == "source_recovery":
+        source_name = os.environ.get(
+            "PANGU_SELECTIVE_MLP96_SOURCE_CHECKPOINT", ""
+        ).strip()
+        teacher_path = resolve_checkpoint_arg(cfg, source_name)
+        if not teacher_path:
+            raise FileNotFoundError(
+                "source_recovery requires "
+                "PANGU_SELECTIVE_MLP96_SOURCE_CHECKPOINT"
+            )
+        teacher_profile = dict(SELECTIVE_MLP96_SOURCE_PROFILE)
+
+    teacher = None
+    if recovery_only:
+        logger.info(
+            "Recovery-only mode: full_192 teacher construction and forward are disabled"
+        )
+    else:
+        teacher = make_model(cfg_data, teacher_profile, use_upgrades=False).half()
+        load_state(teacher, teacher_path, strict=True)
+        teacher.to(device).eval()
+        teacher.requires_grad_(False)
 
     student = make_model(cfg_data, student_profile, use_upgrades=True)
     latest_train_checkpoint = checkpoint_names["latest"]
@@ -760,16 +996,17 @@ def main():
     is_a80 = name == "uv_a_patch8_w80_shallow"
     is_kd_2d = name == "pangu_lite_2d_pos288"
     fresh_official = env_enabled("PANGU_DISTILL_FRESH_OFFICIAL")
-    if is_s96 and not os.path.exists(latest_train_path) and os.path.exists(
+    protocol_locked = is_s96 or recovery_only or is_selective_mlp96
+    if protocol_locked and not os.path.exists(latest_train_path) and os.path.exists(
         distilled_train_path
     ):
         raise FileExistsError(
-            "S96 found a best/train checkpoint without a matching latest checkpoint; "
+            "Protocol-locked training found a best/train checkpoint without a matching latest checkpoint; "
             "use a new PANGU_DISTILL_CHECKPOINT_PREFIX"
         )
     resume = not fresh_official and (
         os.path.exists(latest_train_path)
-        or (not is_s96 and os.path.exists(distilled_train_path))
+        or (not protocol_locked and os.path.exists(distilled_train_path))
     )
 
     pruned_start_path = checkpoint_path(cfg, f"model_{name}.pth")
@@ -777,8 +1014,8 @@ def main():
     resume_from = os.environ.get("PANGU_DISTILL_RESUME_FROM", "latest").strip().lower()
     if resume_from not in {"latest", "best"}:
         raise ValueError("PANGU_DISTILL_RESUME_FROM must be 'latest' or 'best'")
-    if is_s96 and resume_from != "latest":
-        raise ValueError("S96 protocol-locked training may resume only from latest")
+    if protocol_locked and resume_from != "latest":
+        raise ValueError("Protocol-locked training may resume only from latest")
 
     init_override = resolve_checkpoint_arg(cfg, os.environ.get("PANGU_DISTILL_INIT_CHECKPOINT", ""))
     if fresh_official and init_override:
@@ -787,6 +1024,19 @@ def main():
         )
     if init_override and not os.path.exists(init_override):
         raise FileNotFoundError(f"PANGU_DISTILL_INIT_CHECKPOINT not found: {init_override}")
+    if recovery_only and fresh_official:
+        raise ValueError("Recovery-only training forbids PANGU_DISTILL_FRESH_OFFICIAL")
+    if recovery_only and not resume and not init_override:
+        raise FileNotFoundError(
+            "Fresh recovery-only training requires PANGU_DISTILL_INIT_CHECKPOINT"
+        )
+    if is_selective_mlp96 and fresh_official:
+        raise ValueError("SelectiveMLP-96 forbids PANGU_DISTILL_FRESH_OFFICIAL")
+    if is_selective_mlp96 and not resume and not init_override:
+        raise FileNotFoundError(
+            "Fresh SelectiveMLP-96 stage requires "
+            "PANGU_DISTILL_INIT_CHECKPOINT"
+        )
 
     if fresh_official:
         initial_student_path = teacher_path
@@ -814,7 +1064,56 @@ def main():
         legacy_pruned = checkpoint_path(cfg, cfg.pruned_checkpoint)
         initial_student_path = legacy_pruned if name == "student_160" else teacher_path
 
-    if is_kd_2d:
+    initialization_metadata = None
+    if recovery_only:
+        student_checkpoint = load_state(student, initial_student_path, strict=True)
+        initialization_metadata = student_checkpoint.get("initialization")
+        expected_initialization = {
+            "method": "full192_selective_1441_deterministic",
+            "source": "official_full_192",
+            "source_file": "model_bak.pth",
+            "block_map": [[0], [0, 1, 4, 5], [0, 1, 4, 5], [0]],
+            "random_initialized_parameters": 0,
+        }
+        actual_initialization = {
+            key: (initialization_metadata or {}).get(key)
+            for key in expected_initialization
+        }
+        if actual_initialization != expected_initialization:
+            raise ValueError(
+                "Recovery-only training requires audited deterministic full_192 "
+                f"initialization: actual={actual_initialization}"
+            )
+        source_sha256 = initialization_metadata.get("source_sha256", "")
+        if not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+            raise ValueError("Recovery-only initialization has no valid source SHA256")
+        if (
+            initialization_metadata.get("covered_parameter_state_keys")
+            != initialization_metadata.get("parameter_state_keys")
+        ):
+            raise ValueError("Recovery-only initialization coverage is incomplete")
+        logger.info(
+            "Strict-loaded deterministic full_192 selective initialization from %s",
+            initial_student_path,
+        )
+    elif is_selective_mlp96:
+        student_checkpoint = load_state(student, initial_student_path, strict=True)
+        initialization_metadata = student_checkpoint.get("initialization")
+        validate_selective_mlp96_initialization(initialization_metadata)
+        if resume:
+            previous_stage = student_checkpoint.get("training_protocol", {}).get(
+                "selective_mlp96_stage"
+            )
+            if previous_stage != selective_mlp96_stage:
+                raise ValueError(
+                    "SelectiveMLP-96 stage changes require a new checkpoint prefix "
+                    "and PANGU_DISTILL_INIT_CHECKPOINT"
+                )
+        logger.info(
+            "Strict-loaded audited SelectiveMLP-96 initialization from %s",
+            initial_student_path,
+        )
+    elif is_kd_2d:
         if initial_student_path == teacher_path:
             raise FileNotFoundError(
                 "2D KD requires the audited hybrid checkpoint; run "
@@ -857,7 +1156,23 @@ def main():
         student_checkpoint = load_compatible_state(student, teacher_path, logger)
     student.to(device)
 
+    if is_selective_mlp96:
+        selective_trainable_names = configure_selective_mlp96_trainable(
+            student, selective_mlp96_stage
+        )
+        logger.info(
+            "SelectiveMLP-96 stage=%s trainable_tensors=%d",
+            selective_mlp96_stage,
+            len(selective_trainable_names),
+        )
+
     score_aligned = env_enabled("PANGU_SCORE_ALIGNED") or is_kd_2d
+    if recovery_only and score_aligned:
+        raise ValueError("Recovery-only training forbids score-aligned loss")
+    if is_selective_mlp96 and score_aligned:
+        raise ValueError("SelectiveMLP-96 forbids ground-truth score-aligned loss")
+    if recovery_only and env_enabled("PANGU_SCORE_PROJECT_QUANTIZED"):
+        raise ValueError("Recovery-only training forbids quantized projection")
     if is_s96 and score_aligned:
         raise ValueError("S96 requires standard global L1; PANGU_SCORE_ALIGNED must be 0")
     score_stage = os.environ.get("PANGU_SCORE_STAGE", "all").strip().lower()
@@ -931,6 +1246,24 @@ def main():
         raise ValueError(
             "S96 requires hard=0.5, teacher=0.5, hint=0 and no hint layers"
         )
+    if recovery_only and (
+        ground_truth_weight != 1.0
+        or teacher_weight != 0.0
+        or hint_weight != 0.0
+        or hint_layers
+    ):
+        raise ValueError(
+            "Recovery-only training requires hard=1, teacher=0, hint=0 and no hint layers"
+        )
+    if is_selective_mlp96 and (
+        ground_truth_weight != 0.0
+        or teacher_weight != 1.0
+        or hint_weight != 0.0
+        or hint_layers
+    ):
+        raise ValueError(
+            "SelectiveMLP-96 requires hard=0, teacher=1, hint=0 and no hint layers"
+        )
 
     # One optimizer parameter group: every trainable layer uses the same LR.
     base_lr = cfg_float(cfg, "distill_learning_rate", 5.0e-5)
@@ -956,10 +1289,46 @@ def main():
     total_steps = total_epochs * optimizer_steps_per_epoch
     warmup_steps = cfg_int(cfg, "distill_warmup_steps", 256)
     min_lr_ratio = cfg_float(cfg, "distill_min_lr_ratio", 0.01)
+    checkpoint_interval = int(os.environ.get("PANGU_DISTILL_CHECKPOINT_INTERVAL", "0"))
+    if checkpoint_interval < 0:
+        raise ValueError("PANGU_DISTILL_CHECKPOINT_INTERVAL must be non-negative")
     if total_epochs <= 0:
         raise ValueError("distill_max_epoch must be positive")
     if warmup_steps < 0 or warmup_steps > total_steps:
         raise ValueError("distill_warmup_steps must be between zero and total steps")
+    if recovery_only:
+        validate_recovery_only_schedule(
+            ground_truth_weight=ground_truth_weight,
+            teacher_weight=teacher_weight,
+            hint_weight=hint_weight,
+            hint_layers=hint_layers,
+            score_aligned=score_aligned,
+            score_project_quantized=score_project_quantized,
+            total_epochs=total_epochs,
+            steps_per_epoch=steps_per_epoch,
+            warmup_steps=warmup_steps,
+            base_lr=base_lr,
+            min_lr_ratio=min_lr_ratio,
+            gradient_accumulation=gradient_accumulation,
+            checkpoint_interval=checkpoint_interval,
+        )
+    if is_selective_mlp96:
+        validate_selective_mlp96_stage_protocol(
+            selective_mlp96_stage,
+            total_epochs=total_epochs,
+            steps_per_epoch=steps_per_epoch,
+            warmup_steps=warmup_steps,
+            base_lr=base_lr,
+            min_lr_ratio=min_lr_ratio,
+            checkpoint_interval=checkpoint_interval,
+            gradient_accumulation=gradient_accumulation,
+            ground_truth_weight=ground_truth_weight,
+            teacher_weight=teacher_weight,
+            hint_weight=hint_weight,
+            hint_layers=hint_layers,
+            score_aligned=score_aligned,
+            score_project_quantized=score_project_quantized,
+        )
 
     scheduler = WarmupCosineSchedule(
         optimizer=optimizer,
@@ -976,20 +1345,67 @@ def main():
         score_aligned,
         score_loss_weights,
         min_lr_ratio,
-        loss_mode="score_aligned" if score_aligned else "global_l1",
+        loss_mode=(
+            "all_69_weighted_l1_recovery"
+            if recovery_only
+            else (
+                "teacher_only_scored70_unscored30"
+                if is_selective_mlp96
+                else ("score_aligned" if score_aligned else "global_l1")
+            )
+        ),
         ground_truth_weight=ground_truth_weight,
         teacher_weight=teacher_weight,
         surface_loss_weight=0.25,
         upper_air_loss_weight=1.0,
         optimizer_param_groups=1,
         initialization_strategy=(
-            "hybrid_3d_to_2d_audited"
-            if is_kd_2d
-            else ("pgw_lite_width96_exact_depth_selection" if is_s96 else "compatible_state")
+            "full192_selective_1441_deterministic"
+            if recovery_only
+            else (
+                "pruned96_activation_aware_mlp_pair_selection"
+                if is_selective_mlp96
+                else (
+                    "hybrid_3d_to_2d_audited"
+                    if is_kd_2d
+                    else (
+                        "pgw_lite_width96_exact_depth_selection"
+                        if is_s96
+                        else "compatible_state"
+                    )
+                )
+            )
         ),
     )
     training_protocol["gradient_accumulation"] = gradient_accumulation
     training_protocol["attention_only_warmup_epochs"] = 1 if is_kd_2d else 0
+    training_protocol["recovery_only"] = recovery_only
+    training_protocol["teacher_forward"] = not recovery_only
+    training_protocol["all_channel_weights"] = recovery_only
+    training_protocol["channel_weights"] = (
+        [float(value) for value in channel_weights.tolist()]
+        if recovery_only
+        else None
+    )
+    training_protocol["optimizer"] = "FusedAdam"
+    training_protocol["optimizer_betas"] = [0.9, 0.999]
+    training_protocol["weight_decay"] = 3.0e-6
+    training_protocol["checkpoint_interval"] = checkpoint_interval
+    training_protocol["minimum_lr"] = base_lr * min_lr_ratio
+    if is_selective_mlp96:
+        training_protocol["selective_mlp96_stage"] = selective_mlp96_stage
+        training_protocol["teacher_source"] = (
+            "pruned_96" if selective_mlp96_stage == "source_recovery" else "full_192"
+        )
+        training_protocol["scored_teacher_weight"] = 0.70
+        training_protocol["unscored_teacher_weight"] = 0.30
+        training_protocol["ground_truth_backprop"] = False
+        training_protocol["all_69_channels"] = True
+        training_protocol["activation_checkpointing"] = (
+            "layer2_layer3_reentrant_frozen_prefix_boundary"
+            if selective_mlp96_stage == "source_recovery"
+            else "layer2_layer3_reentrant"
+        )
 
     # Detect architecture change to prevent loading mismatched optimizer state
     checkpoint_state = student_checkpoint.get("model_state_dict", student_checkpoint)
@@ -1071,6 +1487,10 @@ def main():
             scheduler._update_lr()
 
     extra_epochs = cfg_int(cfg, "distill_extra_epochs", 0)
+    if (recovery_only or is_selective_mlp96) and extra_epochs != 0:
+        raise ValueError(
+            "Protocol-locked training forbids distill_extra_epochs"
+        )
     if extra_epochs > 0:
         requested_total_epochs = start_epoch + extra_epochs
         if requested_total_epochs > total_epochs:
@@ -1130,10 +1550,11 @@ def main():
         )
 
     logger.info(
-        "Distillation starts: teacher=%s, student_profile=%s, init=%s, "
+        "%s starts: teacher=%s, student_profile=%s, init=%s, "
         "data=%s, years=%s, "
         "loss_weights=(hard=%.2f, teacher=%.2f, hint=%.2f), hint_layers=%s",
-        teacher_path,
+        "Recovery-only training" if recovery_only else "Distillation",
+        "disabled" if recovery_only else teacher_path,
         student_profile["name"],
         initial_student_path,
         cfg_data.dataset.data_dir,
@@ -1162,9 +1583,6 @@ def main():
         scheduler.current_step,
         ",".join(f"{weight:.4f}" for weight in score_loss_weights),
     )
-    checkpoint_interval = int(os.environ.get("PANGU_DISTILL_CHECKPOINT_INTERVAL", "0"))
-    if checkpoint_interval < 0:
-        raise ValueError("PANGU_DISTILL_CHECKPOINT_INTERVAL must be non-negative")
     if io_sampler is not None:
         logger.info(
             "I/O sampler enabled: year-block=%d seed=%d workers=%d prefetch=%d persistent=1",
@@ -1220,23 +1638,49 @@ def main():
                 break
             step_start = time.perf_counter()
             data_wait = step_start - previous_step_end
-            model_input, target_surface, target_upper_air = prepare_batch(
-                data, surface_mask, device
-            )
+            if is_selective_mlp96:
+                model_input = prepare_model_input(data, surface_mask, device)
+                batch, _, height, width = model_input.shape
+                target_surface = target_upper_air = None
+                upper_air_shape = (batch, 65, height, width)
+            else:
+                model_input, target_surface, target_upper_air = prepare_batch(
+                    data, surface_mask, device
+                )
+                upper_air_shape = target_upper_air.shape
             if teacher_capture is not None:
                 teacher_capture.clear()
                 student_capture.clear()
+            teacher_surface = teacher_upper_air = None
             with torch.no_grad():
-                teacher_surface, teacher_upper_air = teacher(model_input.half())
-                teacher_surface = teacher_surface.float()
-                teacher_upper_air = teacher_upper_air.float().reshape(target_upper_air.shape)
+                teacher_surface, teacher_upper_air = (
+                    teacher(model_input.half())
+                    if not recovery_only
+                    else (None, None)
+                )
+                if not recovery_only:
+                    teacher_surface = teacher_surface.float()
+                    teacher_upper_air = teacher_upper_air.float().reshape(
+                        upper_air_shape
+                    )
 
             if is_kd_2d:
                 student_surface, student_upper_air = student(model_input)
+            elif (
+                is_selective_mlp96
+                and selective_mlp96_stage == "source_recovery"
+            ):
+                with source_recovery_gradient_boundary(student):
+                    with replace_function(
+                        student,
+                        ["layer2", "layer3"],
+                        dist.is_initialized(),
+                    ):
+                        student_surface, student_upper_air = student(model_input)
             else:
                 with replace_function(student, ["layer2", "layer3"], dist.is_initialized()):
                     student_surface, student_upper_air = student(model_input)
-            student_upper_air = student_upper_air.reshape(target_upper_air.shape)
+            student_upper_air = student_upper_air.reshape(upper_air_shape)
             hint_loss = None
             if hint_weight > 0.0:
                 hint_loss = feature_hint_loss(
@@ -1246,7 +1690,27 @@ def main():
                     teacher_grids,
                     hint_layers,
                 )
-            if is_kd_2d:
+            if recovery_only:
+                loss = weighted_recovery_loss(
+                    student_surface,
+                    student_upper_air,
+                    target_surface,
+                    target_upper_air,
+                    recovery_surface_weights,
+                    recovery_upper_weights,
+                )
+                hard_loss = loss
+                teacher_loss = loss.new_zeros(())
+            elif is_selective_mlp96:
+                loss, scored_teacher_loss, unscored_teacher_loss = (
+                    selective_mlp96_teacher_loss(
+                        (student_surface, student_upper_air),
+                        (teacher_surface, teacher_upper_air),
+                    )
+                )
+                hard_loss = loss.new_zeros(())
+                teacher_loss = loss
+            elif is_kd_2d:
                 loss, score_parts = kd_2d_score_loss(
                     (student_surface, student_upper_air),
                     (target_surface, target_upper_air),
@@ -1334,6 +1798,7 @@ def main():
                         latest_train_checkpoint,
                         epoch_step=step,
                         training_protocol=training_protocol,
+                        initialization=initialization_metadata,
                     )
                     logger.info(
                         "Saved resumable checkpoint at epoch %d step %d/%d",
@@ -1360,7 +1825,16 @@ def main():
                 )
                 output_surface, output_upper_air = student(model_input)
                 output_upper_air = output_upper_air.reshape(target_upper_air.shape)
-                if score_aligned:
+                if recovery_only:
+                    loss = weighted_recovery_loss(
+                        output_surface,
+                        output_upper_air,
+                        target_surface,
+                        target_upper_air,
+                        recovery_surface_weights,
+                        recovery_upper_weights,
+                    )
+                elif score_aligned:
                     loss = score_validation_loss(
                         (output_surface, output_upper_air),
                         (target_surface, target_upper_air),
@@ -1410,6 +1884,7 @@ def main():
                 latest_train_checkpoint,
                 epoch_step=steps_per_epoch,
                 training_protocol=training_protocol,
+                initialization=initialization_metadata,
             )
         if is_best:
             if world_rank == 0:
@@ -1426,6 +1901,38 @@ def main():
                     checkpoint_names["inference"],
                     epoch_step=steps_per_epoch,
                     training_protocol=training_protocol,
+                    initialization=initialization_metadata,
+                )
+        if (
+            world_rank == 0
+            and is_selective_mlp96
+            and selective_mlp96_stage == "full_teacher"
+        ):
+            completed_steps = (epoch + 1) * steps_per_epoch
+            if completed_steps in {1024, 2048, 3072}:
+                snapshot_prefix = os.path.splitext(
+                    checkpoint_names["inference"]
+                )[0]
+                if snapshot_prefix.endswith("_fp16"):
+                    snapshot_prefix = snapshot_prefix[: -len("_fp16")]
+                save_student(
+                    student,
+                    optimizer,
+                    scheduler,
+                    epoch,
+                    best_valid_loss,
+                    best_loss_epoch,
+                    cfg,
+                    student_profile,
+                    f"{snapshot_prefix}_step{completed_steps}_train.pth",
+                    f"{snapshot_prefix}_step{completed_steps}_fp16.pth",
+                    epoch_step=steps_per_epoch,
+                    training_protocol=training_protocol,
+                    initialization=initialization_metadata,
+                )
+                logger.info(
+                    "Saved SelectiveMLP-96 W-selection snapshot at step %d",
+                    completed_steps,
                 )
         if world_rank == 0:
             logger.info(

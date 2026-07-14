@@ -151,6 +151,9 @@ def _run_p2_tiled_chunks(
     )
     chunked_qkv = bool(getattr(self, "_pangu_chunked_qkv", False))
     chunked_proj = bool(getattr(self, "_pangu_chunked_proj", False))
+    if bool(getattr(self, "_pangu_p2_full_width", False)):
+        chunked_qkv = False
+        chunked_proj = False
     if configured_chunk_size <= 0 or not (chunked_qkv or chunked_proj):
         chunk_size = batch_windows
     else:
@@ -312,7 +315,12 @@ def _forward_p2_tiled(self, x, mask=None):
     return result
 
 
-def enable_p2_tiled_attention(model, strict=True, kernel_mode="online"):
+def enable_p2_tiled_attention(
+    model,
+    strict=True,
+    kernel_mode="online",
+    force_full_width=False,
+):
     """Patch exact-profile EarthAttention modules for an explicit A/B run.
 
     The function does not alter production defaults.  It returns the number
@@ -339,12 +347,14 @@ def enable_p2_tiled_attention(model, strict=True, kernel_mode="online"):
         module._pangu_p2_module_name = module_name
         module._pangu_p2_tiled_strict = bool(strict)
         module._pangu_p2_tiled_kernel_mode = kernel_mode
+        module._pangu_p2_full_width = bool(force_full_width)
         module.forward = types.MethodType(_forward_p2_tiled, module)
         patched += 1
     if patched == 0:
         raise RuntimeError("no exact-profile EarthAttention3D module was patched")
     model._pangu_p2_tiled_attention_count = patched
     model._pangu_p2_tiled_kernel_mode = kernel_mode
+    model._pangu_p2_full_width = bool(force_full_width)
     return patched
 
 

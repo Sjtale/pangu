@@ -207,10 +207,15 @@ class DistillTrainStaticTests(unittest.TestCase):
 
     def test_global_l1_and_single_lr_are_wired(self):
         source = SCRIPT_PATH.read_text(encoding="utf-8")
-        forecast = source[source.index("def forecast_loss") : source.index("def distillation_loss")]
+        forecast = source[
+            source.index("def forecast_loss") : source.index(
+                "def weighted_recovery_loss"
+            )
+        ]
         self.assertIn("F.l1_loss(upper_air, target_upper_air)", forecast)
         self.assertIn("0.25 * F.l1_loss", forecast)
-        self.assertNotIn("dataset.weights", source)
+        self.assertNotIn("dataset.weights", forecast)
+        self.assertIn('getattr(cfg_data.dataset, "weights")', source)
         self.assertNotIn("get_llrd_param_groups", source)
         self.assertIn("trainable_parameters", source)
         self.assertIn("optimizer_param_groups=1", source)

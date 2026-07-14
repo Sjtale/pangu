@@ -7,6 +7,9 @@ by profile checkpoints here instead of relying on local OneScience edits.
 
 import types
 import os
+import math
+from numbers import Real
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,6 +17,31 @@ import torch.nn.functional as F
 from onescience.models.pangu import Pangu
 from onescience.modules import OneRecovery, OneFuser
 from onescience.modules.attention.earthattention3d import EarthAttention3D
+
+
+SELECTIVE_MLP_96_PARAMETER_COUNT = 14_768_265
+SELECTIVE_MLP_96_MLP_RATIO_BLOCKS = (
+    (4, 4),
+    (4, 2, 2, 2, 2, 2),
+    (2, 2, 2, 2, 2, 2),
+    (4, 4),
+)
+
+
+def selective_mlp_96_profile():
+    """Return an independent copy of the exact SelectiveMLP-96 profile."""
+
+    return {
+        "name": "selective_mlp96",
+        "patch_size": [2, 8, 8],
+        "embed_dim": 96,
+        "num_heads": [3, 6, 6, 3],
+        "window_size": [2, 6, 12],
+        "depth_blocks": [2, 6, 6, 2],
+        "mlp_ratio_blocks": [
+            list(stage) for stage in SELECTIVE_MLP_96_MLP_RATIO_BLOCKS
+        ],
+    }
 
 
 def _is_enabled(name, default=False):
@@ -1007,6 +1035,166 @@ def _set_fuser_blocks(fuser, blocks):
     raise AttributeError("Pangu fuser does not expose a blocks ModuleList")
 
 
+def validate_mlp_ratio_blocks(mlp_ratio_blocks, depth_blocks, embed_dim):
+    """Validate and normalize a four-stage, block-level MLP-ratio schedule."""
+
+    if isinstance(mlp_ratio_blocks, (str, bytes)):
+        raise TypeError("mlp_ratio_blocks must be a four-stage nested sequence")
+    try:
+        stages = list(mlp_ratio_blocks)
+    except TypeError as exc:
+        raise TypeError(
+            "mlp_ratio_blocks must be a four-stage nested sequence"
+        ) from exc
+    if len(stages) != 4:
+        raise ValueError(
+            f"mlp_ratio_blocks must contain 4 stages, got {len(stages)}"
+        )
+
+    if isinstance(depth_blocks, (str, bytes)):
+        raise TypeError("depth_blocks must be a four-element sequence")
+    try:
+        raw_depths = list(depth_blocks)
+    except TypeError as exc:
+        raise TypeError("depth_blocks must be a four-element sequence") from exc
+    if len(raw_depths) != 4:
+        raise ValueError(f"depth_blocks must contain 4 values, got {len(raw_depths)}")
+
+    depths = []
+    for stage_idx, depth in enumerate(raw_depths):
+        if (
+            isinstance(depth, bool)
+            or not isinstance(depth, Real)
+            or not math.isfinite(float(depth))
+            or int(depth) != float(depth)
+            or int(depth) <= 0
+        ):
+            raise ValueError(
+                f"depth_blocks[{stage_idx}] must be a positive integer, got {depth!r}"
+            )
+        depths.append(int(depth))
+
+    embed_dim = int(embed_dim)
+    if embed_dim <= 0:
+        raise ValueError(f"embed_dim must be positive, got {embed_dim}")
+    stage_dims = (embed_dim, embed_dim * 2, embed_dim * 2, embed_dim)
+    normalized = []
+    for stage_idx, (stage, depth, dim) in enumerate(
+        zip(stages, depths, stage_dims)
+    ):
+        if isinstance(stage, (str, bytes)):
+            raise TypeError(
+                f"mlp_ratio_blocks[{stage_idx}] must be a sequence of ratios"
+            )
+        try:
+            ratios = list(stage)
+        except TypeError as exc:
+            raise TypeError(
+                f"mlp_ratio_blocks[{stage_idx}] must be a sequence of ratios"
+            ) from exc
+        if len(ratios) != depth:
+            raise ValueError(
+                f"mlp_ratio_blocks[{stage_idx}] must contain {depth} ratios, "
+                f"got {len(ratios)}"
+            )
+
+        normalized_stage = []
+        for block_idx, ratio in enumerate(ratios):
+            if (
+                isinstance(ratio, bool)
+                or not isinstance(ratio, Real)
+                or not math.isfinite(float(ratio))
+                or float(ratio) <= 0
+            ):
+                raise ValueError(
+                    f"mlp_ratio_blocks[{stage_idx}][{block_idx}] must be a "
+                    f"positive finite number, got {ratio!r}"
+                )
+            ratio = float(ratio)
+            hidden_features = dim * ratio
+            if not hidden_features.is_integer():
+                raise ValueError(
+                    f"mlp_ratio_blocks[{stage_idx}][{block_idx}]={ratio} does "
+                    f"not produce an integer hidden size for dim={dim}"
+                )
+            normalized_stage.append(int(ratio) if ratio.is_integer() else ratio)
+        normalized.append(normalized_stage)
+    return normalized
+
+
+def apply_mlp_ratio_blocks(model, mlp_ratio_blocks, embed_dim):
+    """Replace selected native Pangu MLPs according to a block-level schedule."""
+
+    stage_names = ("layer1", "layer2", "layer3", "layer4")
+    stage_dims = (
+        int(embed_dim),
+        int(embed_dim) * 2,
+        int(embed_dim) * 2,
+        int(embed_dim),
+    )
+    stage_blocks = []
+    for stage_name in stage_names:
+        blocks = _get_fuser_blocks(getattr(model, stage_name, None))
+        if blocks is None:
+            raise ValueError(f"{stage_name} does not expose Pangu fuser blocks")
+        stage_blocks.append(blocks)
+
+    schedule = validate_mlp_ratio_blocks(
+        mlp_ratio_blocks,
+        [len(blocks) for blocks in stage_blocks],
+        embed_dim,
+    )
+
+    from onescience.modules.func_utils.pangu_utils import Mlp
+
+    replacements = []
+    for stage_name, blocks, dim, ratios in zip(
+        stage_names, stage_blocks, stage_dims, schedule
+    ):
+        for block_idx, (block, ratio) in enumerate(zip(blocks, ratios)):
+            transformer = getattr(block, "transformer", None)
+            old_mlp = getattr(transformer, "mlp", None)
+            if not isinstance(old_mlp, Mlp):
+                raise TypeError(
+                    f"{stage_name}.blocks.{block_idx} must contain a native Mlp"
+                )
+            if (
+                old_mlp.fc1.in_features != dim
+                or old_mlp.fc2.out_features != dim
+                or old_mlp.fc2.in_features != old_mlp.fc1.out_features
+            ):
+                raise ValueError(
+                    f"{stage_name}.blocks.{block_idx} has incompatible MLP shapes"
+                )
+            target_hidden = int(dim * ratio)
+            replacements.append((transformer, old_mlp, target_hidden, ratio))
+
+    replaced = 0
+    for transformer, old_mlp, target_hidden, ratio in replacements:
+        if old_mlp.fc1.out_features != target_hidden:
+            new_mlp = Mlp(
+                in_features=old_mlp.fc1.in_features,
+                hidden_features=target_hidden,
+                out_features=old_mlp.fc2.out_features,
+                act_layer=type(old_mlp.act),
+                drop=float(old_mlp.drop.p),
+            )
+            new_mlp.to(
+                device=old_mlp.fc1.weight.device,
+                dtype=old_mlp.fc1.weight.dtype,
+            )
+            new_mlp.train(old_mlp.training)
+            transformer.mlp = new_mlp
+            replaced += 1
+        transformer.mlp_ratio = ratio
+
+    model._pangu_mlp_ratio_blocks = tuple(
+        tuple(stage) for stage in schedule
+    )
+    model._pangu_mlp_ratio_replaced = replaced
+    return replaced
+
+
 def enable_deep_block_sharing(model, mode="layer2_to_layer3"):
     """Share same-resolution deep blocks to reduce resident parameters.
 
@@ -1471,6 +1659,7 @@ def build_pangu_model(
     share_deep_blocks=None,
     chunked_attention=None,
     attention_chunk_size=None,
+    mlp_ratio_blocks=None,
 ):
     """Create a Pangu model and patch submission-local profile differences.
 
@@ -1591,6 +1780,19 @@ def build_pangu_model(
         use_gqa = _is_enabled("PANGU_USE_GQA")
     if kv_group_size is None:
         kv_group_size = _env_int("PANGU_GQA_GROUP_SIZE", 2)
+    if share_deep_blocks is None:
+        share_deep_blocks = _env_share_deep_blocks()
+
+    if mlp_ratio_blocks is not None:
+        if use_swiglu:
+            raise ValueError(
+                "mlp_ratio_blocks requires native Mlp modules; use_swiglu must be False"
+            )
+        if share_deep_blocks:
+            raise ValueError(
+                "mlp_ratio_blocks is incompatible with shared deep blocks"
+            )
+        apply_mlp_ratio_blocks(model, mlp_ratio_blocks, embed_dim)
 
     apply_architectural_upgrades(
         model,
@@ -1600,8 +1802,6 @@ def build_pangu_model(
         kv_group_size=kv_group_size
     )
 
-    if share_deep_blocks is None:
-        share_deep_blocks = _env_share_deep_blocks()
     if share_deep_blocks:
         enable_deep_block_sharing(model, mode=share_deep_blocks)
 
