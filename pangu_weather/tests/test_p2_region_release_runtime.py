@@ -468,10 +468,10 @@ class HipPreparationTests(unittest.TestCase):
 
 
 class InferenceWiringTests(unittest.TestCase):
-    def test_stage1_switches_are_default_off_and_run_before_timer(self):
+    def test_promoted_region_and_experimental_prebuild_defaults_before_timer(self):
         source = (ROOT / "inference.py").read_text(encoding="utf-8")
         self.assertIn(
-            'os.environ.setdefault("PANGU_P2_REGION_RELEASE", "0")',
+            'os.environ.setdefault("PANGU_P2_REGION_RELEASE", "1")',
             source,
         )
         self.assertIn(
