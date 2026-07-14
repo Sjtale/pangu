@@ -166,6 +166,27 @@ class UVRuntimeSwitchTests(unittest.TestCase):
         self.assertEqual(env["PANGU_HIP_STREAM_SPIN"], "0")
         self.assertEqual(env["PANGU_INTERN_IMMUTABLE_BUFFERS"], "1")
 
+    def test_p2_tiled_preset_is_explicit_off_on_ab(self):
+        candidates = list(probe_uv_runtime_sweep.iter_candidates("p2-tiled"))
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(
+            [candidate["kind"] for candidate in candidates],
+            ["baseline", "p2-tiled"],
+        )
+        self.assertEqual(
+            [candidate["env"]["PANGU_P2_TILED_ATTENTION"] for candidate in candidates],
+            ["0", "1"],
+        )
+        self.assertEqual(
+            [candidate["env"]["PANGU_P2_TILED_MODE"] for candidate in candidates],
+            ["online", "full-row-fast"],
+        )
+        self.assertEqual(len({candidate["label"] for candidate in candidates}), 2)
+        for candidate in candidates:
+            env = candidate["env"]
+            self.assertEqual(env["PANGU_CHUNKED_ATTENTION"], "1")
+            self.assertEqual(env["PANGU_INTERN_IMMUTABLE_BUFFERS"], "1")
+
     def test_hip_probe_isolates_each_control_and_combination(self):
         candidates = list(probe_uv_runtime_sweep.iter_candidates("hip"))
         self.assertEqual(len(candidates), 5)

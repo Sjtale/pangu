@@ -144,6 +144,10 @@ BASE_ENV = {
     "PANGU_HIP_SCHEDULE_SPIN": "0",
     "PANGU_HIP_PREFER_L1": "0",
     "PANGU_HIP_STREAM_SPIN": "0",
+    # P2 is an explicit full-model A/B candidate; keep every other preset
+    # production-safe even if the caller's shell exports the flag.
+    "PANGU_P2_TILED_ATTENTION": "0",
+    "PANGU_P2_TILED_MODE": "online",
     # Buffer interning is the platform-verified 90.1048 guardrail default.
     "PANGU_INTERN_IMMUTABLE_BUFFERS": "1",
 }
@@ -184,6 +188,7 @@ def candidate_label(env):
         f"_hip{env['PANGU_HIP_SCHEDULE_SPIN']}"
         f"{env['PANGU_HIP_PREFER_L1']}"
         f"{env['PANGU_HIP_STREAM_SPIN']}"
+        f"_p2{env.get('PANGU_P2_TILED_ATTENTION', '0')}"
         f"_l23a{env['PANGU_ATTN_CHUNK_SIZE_LAYER2']}"
         f"q{env['PANGU_CHUNKED_QKV_LAYER2']}"
         f"p{env['PANGU_CHUNKED_PROJ_LAYER2']}"
@@ -212,6 +217,20 @@ def iter_candidates(preset="baseline"):
             "kind": "architecture",
             "env": merged,
         }
+        return
+
+    if preset == "p2-tiled":
+        for value, kind in (("0", "baseline"), ("1", "p2-tiled")):
+            env = dict(BASE_ENV)
+            env["PANGU_P2_TILED_ATTENTION"] = value
+            if value == "1":
+                env["PANGU_P2_TILED_MODE"] = "full-row-fast"
+            validate_env(env)
+            yield {
+                "label": candidate_label(env),
+                "kind": kind,
+                "env": env,
+            }
         return
 
     if preset in {"hip", "buffer-intern", "stagewise"}:
@@ -504,6 +523,7 @@ def main():
             "baseline", "compact-mask", "direct-mask", "cuda-graph", "cpu-recovery",
             "full-recovery", "focused", "full", "pangu-lite-2d", "hip",
             "buffer-intern", "stagewise",
+            "p2-tiled",
         ],
         default="baseline",
         help=(
@@ -513,8 +533,9 @@ def main():
             "width; pangu-lite-2d measures the 2D positional-embedding student; "
             "hip isolates the three HIP runtime controls; buffer-intern shares "
             "identical FP16 masks/indexes; stagewise screens three layer2/3 "
-            "chunk schedules; focused sweeps attention chunk size; full is the broad "
-            "diagnostic grid."
+            "chunk schedules; p2-tiled runs an explicit off/on full-model A/B "
+            "for pgw_lite_pruned_96; focused sweeps attention chunk size; full "
+            "is the broad diagnostic grid."
         ),
     )
     parser.add_argument("--dry-run", action="store_true")

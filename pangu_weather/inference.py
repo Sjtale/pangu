@@ -1216,6 +1216,32 @@ if __name__ == "__main__":
                     f"groups={intern_report['shared_groups']} "
                     f"saved={intern_report['saved_bytes'] / 1024**2:.1f} MiB"
                 )
+            if _is_enabled("PANGU_P2_TILED_ATTENTION"):
+                if model_profile.get("name") != "pgw_lite_pruned_96":
+                    raise ValueError(
+                        "PANGU_P2_TILED_ATTENTION requires the exact "
+                        "pgw_lite_pruned_96 profile"
+                    )
+                if use_gqa:
+                    raise ValueError(
+                        "PANGU_P2_TILED_ATTENTION is incompatible with GQA"
+                    )
+                from p2_tiled_attention import enable_p2_tiled_attention
+
+                p2_kernel_mode = os.environ.get(
+                    "PANGU_P2_TILED_MODE",
+                    "online",
+                )
+                patched_tiled_attention = enable_p2_tiled_attention(
+                    model,
+                    strict=True,
+                    kernel_mode=p2_kernel_mode,
+                )
+                print(
+                    "⚡ PANGU_P2_TILED_ATTENTION=1，启用 isolated gfx936 tiled "
+                    f"EarthAttention，mode={p2_kernel_mode}，"
+                    f"patched={patched_tiled_attention}"
+                )
             _profile_cuda_memory("after load_state_dict/model eval")
             if stream_weights:
                 offloaded_count, offloaded_bytes = enable_streamed_weight_residency(
