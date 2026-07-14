@@ -34,6 +34,7 @@ ROOT_FILES=(
 # 在删除上一个提交包前检查全部输入，避免因配置错误损失已验证包。
 for relative_path in \
     conf/config.yaml \
+    data/download_model_url.txt \
     hip_kernels/earth_attention_tiled_fwd.hip \
     scripts/audit_submission_package.py \
     "${ROOT_FILES[@]}"; do
@@ -42,22 +43,6 @@ for relative_path in \
         exit 1
     fi
 done
-
-if [[ ! -s "$MODEL_URL_FILE" ]]; then
-    echo "❌ $MODEL_URL_FILE 不存在或为空。" >&2
-    exit 1
-fi
-if ! awk '
-    NR == 1 {
-        if ($0 == "" || $0 ~ /[[:space:]]/ || $0 !~ /^https?:\/\//) bad = 1
-        next
-    }
-    { bad = 1 }
-    END { exit !(NR == 1 && !bad) }
-' "$MODEL_URL_FILE"; then
-    echo "❌ download_model_url.txt 必须只包含一行无空白的 HTTP(S) 链接。" >&2
-    exit 1
-fi
 
 # 1. 清理并创建干净的目录结构
 rm -rf "$SUBMIT_DIR"

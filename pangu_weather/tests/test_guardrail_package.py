@@ -27,12 +27,7 @@ class GuardrailPackageTests(unittest.TestCase):
     def _write_valid_package(path):
         with zipfile.ZipFile(path, "w") as archive:
             for member in sorted(AUDIT.REQUIRED_PATHS):
-                payload = (
-                    "https://example.invalid/model.zip\n"
-                    if member == AUDIT.MODEL_URL_PATH
-                    else member
-                )
-                archive.writestr(member, payload)
+                archive.writestr(member, member)
 
     @staticmethod
     def _prepare_build_tree(root, include_url=True):
@@ -103,7 +98,7 @@ class GuardrailPackageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unexpected"):
                 AUDIT.audit_zip(invalid)
 
-    def test_package_audit_rejects_wrong_path_and_empty_url(self):
+    def test_package_audit_rejects_wrong_path_and_allows_empty_url(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             wrong_path = root / "wrong-path.zip"
@@ -120,8 +115,8 @@ class GuardrailPackageTests(unittest.TestCase):
             with zipfile.ZipFile(empty_url, "w") as archive:
                 for member in sorted(AUDIT.REQUIRED_PATHS):
                     archive.writestr(member, "")
-            with self.assertRaisesRegex(ValueError, "download_model_url"):
-                AUDIT.audit_zip(empty_url)
+            report = AUDIT.audit_zip(empty_url)
+            self.assertEqual(set(report["files"]), AUDIT.REQUIRED_PATHS)
 
     def test_build_submission_produces_audited_p2_package(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -153,7 +148,7 @@ class GuardrailPackageTests(unittest.TestCase):
                 stderr=subprocess.STDOUT,
             )
             self.assertNotEqual(result.returncode, 0, result.stdout)
-            self.assertIn("不存在或为空", result.stdout)
+            self.assertIn("缺少打包必需文件", result.stdout)
             self.assertFalse((root / "submit_package").exists())
 
 

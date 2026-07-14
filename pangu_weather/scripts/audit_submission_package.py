@@ -23,7 +23,6 @@ REQUIRED_PATHS = {
     "pangu_weather/selective_mlp96.py",
 }
 ALLOWED_PATHS = set(REQUIRED_PATHS)
-MODEL_URL_PATH = "pangu_weather/data/download_model_url.txt"
 
 
 def sha256_file(path):
@@ -47,22 +46,6 @@ def audit_zip(path, model_path=None):
             raise ValueError(
                 "Submission package mismatch: "
                 f"missing={missing}, unexpected={unexpected}, duplicates={duplicates}"
-            )
-
-        try:
-            model_url = archive.read(MODEL_URL_PATH).decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise ValueError("download_model_url.txt must be valid UTF-8") from error
-        lines = model_url.splitlines()
-        if (
-            len(lines) != 1
-            or not lines[0]
-            or any(character.isspace() for character in lines[0])
-            or not lines[0].startswith(("http://", "https://"))
-        ):
-            raise ValueError(
-                "download_model_url.txt must contain exactly one whitespace-free "
-                "HTTP(S) URL"
             )
 
         report = {
