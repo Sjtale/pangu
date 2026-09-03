@@ -30,18 +30,23 @@ AUDIT = load_script("audit_submission_package")
 
 
 def compliant_checkpoint():
+    import torch
+
     return {
-        "model_state_dict": {},
+        "model_state_dict": {
+            **{f"linear{index}.weight": torch.ones(1, 1, dtype=torch.int8) for index in range(62)},
+            **{f"linear{index}.weight_scale": torch.ones(1, 1, dtype=torch.float16) for index in range(62)},
+        },
         "model_profile": {"name": "pgw_lite_pruned_96"},
         "distillation": {
             "teacher_source": "organizer_pangu_full_model",
-            "ground_truth_weight": 0.3,
+            "ground_truth_weight": 0.5,
             "teacher_weight": 0.5,
-            "hint_weight": 0.2,
             "all_69_channels": True,
             "predict_residual": False,
         },
-        "quantization": {"quantized_keys_count": 62},
+        "quantization": {"fp16_keep_count": 5, "quantized_keys_count": 62},
+        "alias_compaction": {"alias_pair_count": 224},
     }
 
 
@@ -169,7 +174,7 @@ class CheckpointGzipAuditTests(unittest.TestCase):
             report["model_member_decoded_sha256"],
             hashlib.sha256(decoded).hexdigest(),
         )
-        self.assertFalse(
+        self.assertTrue(
             report["model_tensor_audit"]["quantization_metadata_matches_actual"]
         )
 

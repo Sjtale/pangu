@@ -37,10 +37,8 @@ STUDENT_PROFILE = {
     "depth_blocks": [2, 6, 6, 2],
     "window_size": [2, 6, 12],
 }
-GROUND_TRUTH_WEIGHT = 0.3
+GROUND_TRUTH_WEIGHT = 0.5
 TEACHER_WEIGHT = 0.5
-HINT_WEIGHT = 0.2
-HINT_LAYERS = ("layer1", "layer2")
 
 LATEST_CHECKPOINT = "model_pgw_lite_pruned_96_latest.pth"
 TRAIN_CHECKPOINT = "model_pgw_lite_pruned_96_train.pth"
@@ -56,14 +54,10 @@ def forecast_loss(surface, upper_air, target_surface, target_upper_air):
     )
 
 
-def distillation_loss(student, target, teacher, hint_loss):
+def distillation_loss(student, target, teacher):
     hard_loss = forecast_loss(*student, *target)
     teacher_loss = forecast_loss(*student, *teacher)
-    total = (
-        GROUND_TRUTH_WEIGHT * hard_loss
-        + TEACHER_WEIGHT * teacher_loss
-        + HINT_WEIGHT * hint_loss
-    )
+    total = GROUND_TRUTH_WEIGHT * hard_loss + TEACHER_WEIGHT * teacher_loss
     return total, hard_loss, teacher_loss
 
 
@@ -166,86 +160,6 @@ def prepare_batch(data, surface_mask, device):
     target_surface = outvar[:, :4].to(device, dtype=torch.float32)
     target_upper_air = outvar[:, 4:].to(device, dtype=torch.float32)
     return model_input, target_surface, target_upper_air
-
-
-def ceil_div(value, divisor):
-    return (int(value) + int(divisor) - 1) // int(divisor)
-
-
-def feature_grids(img_size, patch_size):
-    pressure = 1 + ceil_div(13, patch_size[0])
-    layer1 = (
-        pressure,
-        ceil_div(img_size[0], patch_size[1]),
-        ceil_div(img_size[1], patch_size[2]),
-    )
-    return {
-        "layer1": layer1,
-        "layer2": (pressure, ceil_div(layer1[1], 2), ceil_div(layer1[2], 2)),
-    }
-
-
-class FeatureCapture:
-    def __init__(self, model, layers):
-        self.features = {}
-        self.handles = [
-            getattr(model, layer).register_forward_hook(self._hook(layer))
-            for layer in layers
-        ]
-
-    def _hook(self, name):
-        def capture(_module, _inputs, output):
-            self.features[name] = output
-
-        return capture
-
-    def clear(self):
-        self.features.clear()
-
-    def close(self):
-        for handle in self.handles:
-            handle.remove()
-
-
-def tokens_to_grid(tokens, grid):
-    if tokens.dim() != 3:
-        raise ValueError(f"Expected [B, N, C] feature tensor, got {tuple(tokens.shape)}")
-    batch, token_count, channels = tokens.shape
-    expected = math.prod(grid)
-    if token_count != expected:
-        raise ValueError(
-            f"Feature token count mismatch: got {token_count}, expected {expected}"
-        )
-    return tokens.transpose(1, 2).reshape(batch, channels, *grid)
-
-
-def resize_channels(feature, channels):
-    if feature.shape[1] == channels:
-        return feature
-    batch, source_channels, pressure, height, width = feature.shape
-    series = feature.permute(0, 2, 3, 4, 1).reshape(-1, 1, source_channels)
-    resized = F.interpolate(series.float(), size=channels, mode="linear", align_corners=False)
-    return resized.reshape(batch, pressure, height, width, channels).permute(0, 4, 1, 2, 3)
-
-
-def normalize_feature(feature):
-    dims = tuple(range(2, feature.dim()))
-    mean = feature.mean(dim=dims, keepdim=True)
-    std = feature.std(dim=dims, keepdim=True, unbiased=False)
-    return (feature - mean) / (std + 1.0e-4)
-
-
-def feature_hint_loss(student_capture, teacher_capture, student_grids, teacher_grids):
-    losses = []
-    for layer in HINT_LAYERS:
-        student = tokens_to_grid(student_capture.features[layer].float(), student_grids[layer])
-        teacher = tokens_to_grid(teacher_capture.features[layer].float(), teacher_grids[layer])
-        teacher = F.adaptive_avg_pool3d(teacher, student.shape[2:])
-        teacher = resize_channels(teacher, student.shape[1])
-        losses.append(
-            F.l1_loss(normalize_feature(student), normalize_feature(teacher.detach()))
-        )
-    return torch.stack(losses).mean()
 
 
 class WarmupCosineSchedule:
@@ -360,8 +274,6 @@ def save_student(
             "student_embed_dim": STUDENT_PROFILE["embed_dim"],
             "ground_truth_weight": GROUND_TRUTH_WEIGHT,
             "teacher_weight": TEACHER_WEIGHT,
-            "hint_weight": HINT_WEIGHT,
-            "hint_layers": list(HINT_LAYERS),
             "all_69_channels": True,
             "predict_residual": False,
         },
@@ -478,92 +390,89 @@ def main():
         start_epoch = int(student_checkpoint["epoch"]) + 1
     del student_checkpoint
 
-    teacher_capture = FeatureCapture(teacher, HINT_LAYERS)
-    student_capture = FeatureCapture(student, HINT_LAYERS)
-    teacher_grids = feature_grids(cfg_data.dataset.img_size, teacher_profile["patch_size"])
-    student_grids = feature_grids(cfg_data.dataset.img_size, STUDENT_PROFILE["patch_size"])
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
 
     logger.info(
-        "pruned_96 distillation: teacher=%s init=%s weights=(%.1f, %.1f, %.1f)",
+        "pruned_96 distillation: teacher=%s init=%s weights=(%.1f, %.1f)",
         teacher_path,
         initial_path,
         GROUND_TRUTH_WEIGHT,
         TEACHER_WEIGHT,
-        HINT_WEIGHT,
     )
 
-    try:
-        for epoch in range(start_epoch, total_epochs):
-            student.train()
-            totals = {"loss": 0.0, "hard": 0.0, "teacher": 0.0, "hint": 0.0}
-            started = time.time()
-            for step, data in enumerate(train_loader, start=1):
-                if step > steps_per_epoch:
-                    break
+    for epoch in range(start_epoch, total_epochs):
+        student.train()
+        totals = {"loss": 0.0, "hard": 0.0, "teacher": 0.0}
+        started = time.time()
+        for step, data in enumerate(train_loader, start=1):
+            if step > steps_per_epoch:
+                break
+            model_input, target_surface, target_upper_air = prepare_batch(
+                data, surface_mask, device
+            )
+            with torch.no_grad():
+                teacher_surface, teacher_upper_air = teacher(model_input.half())
+                teacher_surface = teacher_surface.float()
+                teacher_upper_air = teacher_upper_air.float().reshape(target_upper_air.shape)
+            with replace_function(student, ["layer2", "layer3"], False):
+                student_surface, student_upper_air = student(model_input)
+            student_upper_air = student_upper_air.reshape(target_upper_air.shape)
+            loss, hard_loss, teacher_loss = distillation_loss(
+                (student_surface, student_upper_air),
+                (target_surface, target_upper_air),
+                (teacher_surface, teacher_upper_air),
+            )
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            totals["loss"] += loss.item()
+            totals["hard"] += hard_loss.item()
+            totals["teacher"] += teacher_loss.item()
+            logger.info(
+                "Train %d-%d/%d %.2fs/step total=%.4f hard=%.4f teacher=%.4f",
+                epoch,
+                step,
+                steps_per_epoch,
+                (time.time() - started) / step,
+                totals["loss"] / step,
+                totals["hard"] / step,
+                totals["teacher"] / step,
+            )
+
+        student.eval()
+        valid_loss = 0.0
+        valid_steps = 0
+        with torch.no_grad():
+            for data in valid_loader:
                 model_input, target_surface, target_upper_air = prepare_batch(
                     data, surface_mask, device
                 )
-                teacher_capture.clear()
-                student_capture.clear()
-                with torch.no_grad():
-                    teacher_surface, teacher_upper_air = teacher(model_input.half())
-                    teacher_surface = teacher_surface.float()
-                    teacher_upper_air = teacher_upper_air.float().reshape(target_upper_air.shape)
-                with replace_function(student, ["layer2", "layer3"], False):
-                    student_surface, student_upper_air = student(model_input)
-                student_upper_air = student_upper_air.reshape(target_upper_air.shape)
-                hint_loss = feature_hint_loss(
-                    student_capture, teacher_capture, student_grids, teacher_grids
-                )
-                loss, hard_loss, teacher_loss = distillation_loss(
-                    (student_surface, student_upper_air),
-                    (target_surface, target_upper_air),
-                    (teacher_surface, teacher_upper_air),
-                    hint_loss,
-                )
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                scheduler.step()
-                totals["loss"] += loss.item()
-                totals["hard"] += hard_loss.item()
-                totals["teacher"] += teacher_loss.item()
-                totals["hint"] += hint_loss.item()
-                logger.info(
-                    "Train %d-%d/%d %.2fs/step total=%.4f hard=%.4f teacher=%.4f hint=%.4f",
-                    epoch,
-                    step,
-                    steps_per_epoch,
-                    (time.time() - started) / step,
-                    totals["loss"] / step,
-                    totals["hard"] / step,
-                    totals["teacher"] / step,
-                    totals["hint"] / step,
-                )
-
-            student.eval()
-            valid_loss = 0.0
-            valid_steps = 0
-            with torch.no_grad():
-                for data in valid_loader:
-                    model_input, target_surface, target_upper_air = prepare_batch(
-                        data, surface_mask, device
-                    )
-                    output_surface, output_upper_air = student(model_input)
-                    output_upper_air = output_upper_air.reshape(target_upper_air.shape)
-                    valid_loss += forecast_loss(
-                        output_surface,
-                        output_upper_air,
-                        target_surface,
-                        target_upper_air,
-                    ).item()
-                    valid_steps += 1
-            valid_loss /= max(1, valid_steps)
-            improved = valid_loss < best_valid_loss
-            if improved:
-                best_valid_loss = valid_loss
-                best_loss_epoch = epoch
+                output_surface, output_upper_air = student(model_input)
+                output_upper_air = output_upper_air.reshape(target_upper_air.shape)
+                valid_loss += forecast_loss(
+                    output_surface,
+                    output_upper_air,
+                    target_surface,
+                    target_upper_air,
+                ).item()
+                valid_steps += 1
+        valid_loss /= max(1, valid_steps)
+        improved = valid_loss < best_valid_loss
+        if improved:
+            best_valid_loss = valid_loss
+            best_loss_epoch = epoch
+        save_student(
+            student,
+            optimizer,
+            scheduler,
+            epoch,
+            best_valid_loss,
+            best_loss_epoch,
+            cfg,
+            LATEST_CHECKPOINT,
+        )
+        if improved:
             save_student(
                 student,
                 optimizer,
@@ -572,32 +481,18 @@ def main():
                 best_valid_loss,
                 best_loss_epoch,
                 cfg,
-                LATEST_CHECKPOINT,
+                TRAIN_CHECKPOINT,
+                export_fp16=True,
             )
-            if improved:
-                save_student(
-                    student,
-                    optimizer,
-                    scheduler,
-                    epoch,
-                    best_valid_loss,
-                    best_loss_epoch,
-                    cfg,
-                    TRAIN_CHECKPOINT,
-                    export_fp16=True,
-                )
-            logger.info(
-                "Epoch %d validation=%.4f best=%.4f at epoch %d",
-                epoch,
-                valid_loss,
-                best_valid_loss,
-                best_loss_epoch,
-            )
-            if epoch - best_loss_epoch > int(cfg.patience):
-                break
-    finally:
-        teacher_capture.close()
-        student_capture.close()
+        logger.info(
+            "Epoch %d validation=%.4f best=%.4f at epoch %d",
+            epoch,
+            valid_loss,
+            best_valid_loss,
+            best_loss_epoch,
+        )
+        if epoch - best_loss_epoch > int(cfg.patience):
+            break
 
 
 if __name__ == "__main__":

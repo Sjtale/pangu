@@ -75,6 +75,8 @@ class ConvertFp16TorchTests(unittest.TestCase):
                     "model_state_dict": state,
                     "optimizer_state_dict": {"x": 1},
                     "model_profile": {"name": "pgw_lite_pruned_96"},
+                    "distillation": {"teacher_weight": 0.5},
+                    "pruning": {"method": "structured"},
                 },
                 source,
             )
@@ -84,6 +86,8 @@ class ConvertFp16TorchTests(unittest.TestCase):
             self.assertEqual(
                 checkpoint["model_profile"], {"name": "pgw_lite_pruned_96"}
             )
+            self.assertEqual(checkpoint["distillation"], {"teacher_weight": 0.5})
+            self.assertEqual(checkpoint["pruning"], {"method": "structured"})
             self.module.verify_checkpoint(state, str(output))
 
 

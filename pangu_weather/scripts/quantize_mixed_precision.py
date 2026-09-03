@@ -40,6 +40,51 @@ def quantize_per_output_channel(value):
     q_weight = torch.clamp(torch.round(value / scale), -128, 127).to(torch.int8)
     return q_weight, scale.to(torch.float16)
 
+
+def canonical_fuser_key(key):
+    return key.replace(".Fuser.", ".fuser.", 1)
+
+
+def quantize_state_dict(state_dict, linear_keys, keep_names, share_deep_blocks=None):
+    """Quantize each logical Linear once while preserving fuser/Fuser aliases."""
+
+    mixed_state_dict = {}
+    quantized_cache = {}
+    fp16_cache = {}
+    quantized_names = set()
+    fp16_names = set()
+
+    for key, value in state_dict.items():
+        clean_key = key.replace("module.", "")
+        canonical_key = canonical_fuser_key(clean_key)
+
+        if share_deep_blocks == "layer2_to_layer3" and canonical_key.startswith("layer3."):
+            continue
+        if canonical_key.endswith("attn_mask") or canonical_key.endswith("relative_position_index"):
+            continue
+
+        if canonical_key in linear_keys:
+            module_name = canonical_key[:-len(".weight")]
+            if module_name in keep_names:
+                if canonical_key not in fp16_cache:
+                    fp16_cache[canonical_key] = value.to(torch.float16)
+                    fp16_names.add(module_name)
+                mixed_state_dict[clean_key] = fp16_cache[canonical_key]
+            else:
+                if canonical_key not in quantized_cache:
+                    quantized_cache[canonical_key] = quantize_per_output_channel(value)
+                    quantized_names.add(module_name)
+                q_weight, scale = quantized_cache[canonical_key]
+                mixed_state_dict[clean_key] = q_weight
+                mixed_state_dict[clean_key + "_scale"] = scale
+            continue
+
+        mixed_state_dict[clean_key] = (
+            value.to(torch.float16) if torch.is_floating_point(value) else value
+        )
+
+    return mixed_state_dict, len(quantized_names), len(fp16_names)
+
 def main():
     parser = argparse.ArgumentParser(description="Sensitivity-Guided Mixed Precision PTQ")
     parser.add_argument("--keep-count", type=int, default=5, help="Number of top sensitive layers to keep in FP16")
@@ -128,44 +173,12 @@ def main():
         if isinstance(module, torch.nn.Linear):
             linear_keys.add(name + ".weight")
 
-    # Perform mixed quantization
-    mixed_state_dict = {}
-    quantized_count = 0
-    fp16_count = 0
-    total_keys = len(state_dict)
-
-    for key, value in state_dict.items():
-        clean_key = key.replace("module.", "")
-
-        # Handle block sharing
-        if share_deep_blocks == "layer2_to_layer3" and clean_key.startswith("layer3."):
-            continue
-
-        # Drop static buffers
-        if clean_key.endswith("attn_mask") or clean_key.endswith("relative_position_index"):
-            continue
-
-        if clean_key in linear_keys:
-            module_name = clean_key[:-len(".weight")]
-            if module_name in keep_names:
-                # Keep in FP16
-                mixed_state_dict[clean_key] = value.to(torch.float16)
-                fp16_count += 1
-                continue
-            else:
-                # Quantize to INT8
-                if torch.is_floating_point(value):
-                    q_weight, scale = quantize_per_output_channel(value)
-                    mixed_state_dict[clean_key] = q_weight
-                    mixed_state_dict[clean_key + "_scale"] = scale
-                    quantized_count += 1
-                    continue
-
-        # Force all remaining weights (LN, Conv, bias) to FP16
-        if torch.is_floating_point(value):
-            mixed_state_dict[clean_key] = value.to(torch.float16)
-        else:
-            mixed_state_dict[clean_key] = value
+    mixed_state_dict, quantized_count, fp16_count = quantize_state_dict(
+        state_dict,
+        linear_keys,
+        keep_names,
+        share_deep_blocks,
+    )
 
     print(f"\nMixed Quantization finished:")
     print(f"  - FP16 Linear layers: {fp16_count}")
@@ -193,6 +206,9 @@ def main():
         },
         "model_profile": ckpt.get("model_profile", profile),
     }
+    for metadata_key in ("distillation", "pruning", "initialization"):
+        if metadata_key in ckpt:
+            mixed_ckpt[metadata_key] = ckpt[metadata_key]
 
     # Backup the original quantized pth if overwriting model_fp16.pth
     if args.output is None and out_name == "model_fp16.pth":

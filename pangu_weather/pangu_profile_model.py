@@ -1452,10 +1452,13 @@ def _forward_chunked_mlp_block(self, x: torch.Tensor):
             shifts=(-ShiftPressureLevels, -ShiftHeight, -ShiftWidth),
             dims=(1, 2, 3),
         )
+        del x
         x_windows = window_partition(shifted_x, self.window_size)
     else:
         shifted_x = x
         x_windows = window_partition(shifted_x, self.window_size)
+        del x
+    del shifted_x
 
     WindowPressureLevels, WindowHeight, WindowWidth = self.window_size
     x_windows = x_windows.view(
@@ -1466,6 +1469,7 @@ def _forward_chunked_mlp_block(self, x: torch.Tensor):
     )
 
     attn_windows = self.attn(x_windows, mask=self.attn_mask)
+    del x_windows
 
     attn_windows = attn_windows.view(
         attn_windows.shape[0],
@@ -1484,6 +1488,7 @@ def _forward_chunked_mlp_block(self, x: torch.Tensor):
             Lat=PaddedHeight,
             Lon=PaddedWidth,
         )
+        del attn_windows
         x = torch.roll(
             shifted_x,
             shifts=(ShiftPressureLevels, ShiftHeight, ShiftWidth),
@@ -1497,7 +1502,9 @@ def _forward_chunked_mlp_block(self, x: torch.Tensor):
             Lat=PaddedHeight,
             Lon=PaddedWidth,
         )
+        del attn_windows
         x = shifted_x
+    del shifted_x
 
     x = crop3d(x.permute(0, 4, 1, 2, 3), self.input_resolution).permute(
         0, 2, 3, 4, 1
@@ -1517,9 +1524,25 @@ def _forward_chunked_mlp_block(self, x: torch.Tensor):
     # Chunked MLP computation to reduce peak dynamic activations VRAM
     configured_chunk_size = int(getattr(self, "_pangu_mlp_chunk_size", 32768))
     chunk_size = NumTokens if configured_chunk_size <= 0 else configured_chunk_size
+    direct_residual = bool(
+        getattr(self, "_pangu_mlp_direct_residual", False)
+    )
 
     if chunk_size >= NumTokens:
         x_mlp = self.mlp(self.norm2(x))
+    elif direct_residual:
+        if self.training:
+            raise RuntimeError(
+                "PANGU_MLP_DIRECT_RESIDUAL is inference-only"
+            )
+        for start in range(0, NumTokens, chunk_size):
+            end = min(start + chunk_size, NumTokens)
+            x_chunk = x[:, start:end]
+            mlp_chunk = self.mlp(self.norm2(x_chunk))
+            x_chunk.add_(self.drop_path(mlp_chunk))
+            del mlp_chunk
+            del x_chunk
+        return x
     else:
         x_mlp = x.new_empty(Batch, NumTokens, Channels)
         for start in range(0, NumTokens, chunk_size):
@@ -1538,6 +1561,7 @@ def enable_chunked_mlp(
     chunk_size=32768,
     inplace_block=False,
     stage_chunk_sizes=None,
+    direct_residual_accumulation=False,
 ):
     """Patch model-local EarthTransformer3DBlock instances to save memory on MLP forward pass."""
     patched = 0
@@ -1550,6 +1574,9 @@ def enable_chunked_mlp(
                 stage_chunk_sizes.get(stage, chunk_size)
             )
             module._pangu_inplace_block = bool(inplace_block)
+            module._pangu_mlp_direct_residual = bool(
+                direct_residual_accumulation
+            )
             module.forward = types.MethodType(_forward_chunked_mlp_block, module)
             patched += 1
     return patched
@@ -1768,6 +1795,7 @@ def build_pangu_model(
         )
 
     inplace_block = _is_enabled("PANGU_INPLACE_BLOCK")
+    direct_mlp_residual = _is_enabled("PANGU_MLP_DIRECT_RESIDUAL")
     if _is_enabled("PANGU_CHUNKED_MLP", default=True):
         mlp_chunk_size = _env_int("PANGU_MLP_CHUNK_SIZE", 32768)
         mlp_stage_chunk_sizes = {
@@ -1779,10 +1807,13 @@ def build_pangu_model(
             chunk_size=mlp_chunk_size,
             inplace_block=inplace_block,
             stage_chunk_sizes=mlp_stage_chunk_sizes,
+            direct_residual_accumulation=direct_mlp_residual,
         )
         print(f"🧠  PANGU_CHUNKED_MLP=1，chunk_size={mlp_chunk_size}，patched={model._pangu_chunked_mlp_count}")
         if inplace_block:
             print("🔧  PANGU_INPLACE_BLOCK=1，启用 in-place 残差更新")
+        if direct_mlp_residual:
+            print("🔧  PANGU_MLP_DIRECT_RESIDUAL=1，启用分块 MLP 直接残差累加")
 
     split_recovery = _is_enabled("PANGU_SPLIT_RECOVERY")
     if layerwise_inference:

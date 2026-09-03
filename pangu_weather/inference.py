@@ -9,7 +9,6 @@ import time
 import json
 import gc
 import gzip
-import hashlib
 import io
 from onescience.utils.YParams import YParams
 from onescience.datapipes.climate import ERA5Datapipe
@@ -56,6 +55,7 @@ os.environ.setdefault("PANGU_SPLIT_RECOVERY", "0")
 os.environ.setdefault("PANGU_CACHE_EARTH_BIAS", "0")
 os.environ.setdefault("PANGU_INPLACE_BLOCK", "1")
 os.environ.setdefault("PANGU_CLEAR_INPUT_REFS", "1")
+os.environ.setdefault("PANGU_BLOCKING_INPUT_TRANSFER", "1")
 os.environ.setdefault("PANGU_COMPACT_ATTN_MASK", "0")
 os.environ.setdefault("PANGU_DIRECT_MASK_SLICE", "0")
 os.environ.setdefault("PANGU_GRAPH_DIRECT_INPUT", "1")
@@ -74,7 +74,7 @@ os.environ.setdefault("PANGU_P2_FULL_WIDTH", "1")
 os.environ.setdefault("PANGU_P2_RELEASE_ORIGINAL_BIAS", "1")
 os.environ.setdefault("PANGU_P2_RETAIN_CPU_BIAS_BACKUP", "0")
 os.environ.setdefault("PANGU_P2_REGION_RELEASE", "1")
-os.environ.setdefault("PANGU_P2_PREBUILD_HIP", "0")
+os.environ.setdefault("PANGU_P2_PREBUILD_HIP", "1")
 os.environ.setdefault("PANGU_P2_FULL_ROW_SCORE_STRIDE", "144")
 os.environ.setdefault("PANGU_P2_FULL_ROW_QK_TILE", "16")
 os.environ.setdefault(
@@ -822,302 +822,6 @@ def _load_dequantized_state_dict_incremental(model, state_dict):
     return missing_keys, unexpected_keys, loaded_count
 
 
-def _tensor_sha256(tensor):
-    value = tensor.detach().to(device="cpu").contiguous()
-    return hashlib.sha256(value.numpy().tobytes(order="C")).hexdigest()
-
-
-_PRUNED96_GENERATED_MASK_LAYOUT = (
-    (
-        "layer1",
-        (1,),
-        (15, 64, 144, 144),
-        "39ee00633b54a104ae928d7724a72afd84490b9067d05f878b0664baa5de1b07",
-    ),
-    (
-        "layer2",
-        (1, 3, 5),
-        (8, 32, 144, 144),
-        "7064b0fd983ea8966be281f089673fe86ee57bdee4ae9e8587f064887ae2f36c",
-    ),
-    (
-        "layer3",
-        (1, 3, 5),
-        (8, 32, 144, 144),
-        "7064b0fd983ea8966be281f089673fe86ee57bdee4ae9e8587f064887ae2f36c",
-    ),
-    (
-        "layer4",
-        (1,),
-        (15, 64, 144, 144),
-        "39ee00633b54a104ae928d7724a72afd84490b9067d05f878b0664baa5de1b07",
-    ),
-)
-
-
-def _verified_pruned96_generated_mask_keys(model_state, source_state):
-    """Verify the exact constructor masks omitted by the scored checkpoint."""
-
-    expected = set()
-    owners = []
-    for stage, block_indices, shape, digest in _PRUNED96_GENERATED_MASK_LAYOUT:
-        for block_index in block_indices:
-            prefix = f"{stage}.{{alias}}.blocks.{block_index}.transformer.attn_mask"
-            upper_key = prefix.format(alias="Fuser")
-            lower_key = prefix.format(alias="fuser")
-            expected.update((upper_key, lower_key))
-            owners.append((upper_key, lower_key, tuple(shape), digest))
-
-    runtime_keys = {key for key in model_state if key.endswith("attn_mask")}
-    if runtime_keys != expected:
-        raise ValueError(
-            "pruned96 constructor-mask topology mismatch: "
-            f"missing={sorted(expected - runtime_keys)}, "
-            f"extra={sorted(runtime_keys - expected)}"
-        )
-    source_keys = {key for key in source_state if key.endswith("attn_mask")}
-    if source_keys:
-        raise ValueError(
-            "The exact scored pruned96 checkpoint must omit constructor masks: "
-            f"{sorted(source_keys)}"
-        )
-
-    canonical_by_digest = {}
-    owner_storages = set()
-    owner_bytes = 0
-    devices = set()
-    for upper_key, lower_key, expected_shape, expected_digest in owners:
-        upper = model_state[upper_key]
-        lower = model_state[lower_key]
-        for key, value in ((upper_key, upper), (lower_key, lower)):
-            if not isinstance(value, torch.Tensor):
-                raise ValueError(f"pruned96 constructor mask is not a tensor: {key}")
-            if tuple(value.shape) != expected_shape:
-                raise ValueError(
-                    f"pruned96 constructor-mask shape mismatch: {key} "
-                    f"expected={expected_shape}, actual={tuple(value.shape)}"
-                )
-            if value.dtype != torch.float16:
-                raise ValueError(
-                    f"pruned96 constructor-mask dtype mismatch: {key} "
-                    f"expected=torch.float16, actual={value.dtype}"
-                )
-            if not value.is_contiguous() or value.storage_offset() != 0:
-                raise ValueError(f"pruned96 constructor mask must be base-contiguous: {key}")
-            expected_bytes = value.numel() * value.element_size()
-            if value.untyped_storage().nbytes() != expected_bytes:
-                raise ValueError(f"pruned96 constructor-mask storage mismatch: {key}")
-            if value.requires_grad:
-                raise ValueError(f"pruned96 constructor mask requires gradients: {key}")
-            devices.add(value.device)
-
-        upper_storage = upper.untyped_storage()._cdata
-        if upper_storage != lower.untyped_storage()._cdata:
-            raise ValueError(
-                "pruned96 constructor-mask Fuser alias does not share storage: "
-                f"{upper_key}"
-            )
-        if upper_storage in owner_storages:
-            raise ValueError(
-                "pruned96 constructor masks share storage before interning: "
-                f"{upper_key}"
-            )
-        owner_storages.add(upper_storage)
-        owner_bytes += upper.numel() * upper.element_size()
-
-        canonical = canonical_by_digest.get(expected_digest)
-        if canonical is None:
-            actual_digest = _tensor_sha256(upper)
-            if actual_digest != expected_digest:
-                raise ValueError(
-                    f"pruned96 constructor-mask SHA256 mismatch: {upper_key} "
-                    f"expected={expected_digest}, actual={actual_digest}"
-                )
-            canonical_by_digest[expected_digest] = upper
-        elif not torch.equal(upper, canonical):
-            raise ValueError(
-                f"pruned96 constructor-mask value mismatch: {upper_key}"
-            )
-
-    if len(devices) != 1:
-        raise ValueError(f"pruned96 constructor masks span devices: {sorted(map(str, devices))}")
-    if len(owner_storages) != 8:
-        raise ValueError(
-            f"pruned96 constructor-mask owner count mismatch: {len(owner_storages)}"
-        )
-    unique_value_bytes = sum(
-        tensor.numel() * tensor.element_size()
-        for tensor in canonical_by_digest.values()
-    )
-    return expected, {
-        "constructor_mask_missing_keys": sorted(expected),
-        "constructor_mask_missing_key_count": len(expected),
-        "constructor_mask_owner_count": len(owner_storages),
-        "constructor_mask_physical_bytes": owner_bytes,
-        "constructor_mask_unique_value_count": len(canonical_by_digest),
-        "constructor_mask_unique_value_bytes": unique_value_bytes,
-    }
-
-
-def _runtime_alias_keys(model_state, source_state):
-    allowed = set()
-    for lower_key, lower_tensor in model_state.items():
-        if lower_key in source_state or ".fuser." not in lower_key:
-            continue
-        upper_key = lower_key.replace(".fuser.", ".Fuser.", 1)
-        upper_tensor = model_state.get(upper_key)
-        if upper_key not in source_state or upper_tensor is None:
-            continue
-        if lower_tensor.shape != upper_tensor.shape or lower_tensor.dtype != upper_tensor.dtype:
-            raise RuntimeError(f"Runtime alias metadata differs: {lower_key}")
-        if (
-            lower_tensor.untyped_storage()._cdata
-            != upper_tensor.untyped_storage()._cdata
-        ):
-            raise RuntimeError(f"Runtime aliases do not share storage: {lower_key}")
-        allowed.add(lower_key)
-    return allowed
-
-
-def _resolve_pruned96_state_load_contract(model, checkpoint, state_dict):
-    """Resolve the exact missing-key allowlist for the scored pruned96 model."""
-
-    quantized_state_keys = sorted(
-        key
-        for key, value in state_dict.items()
-        if key.endswith(
-            ("_scale", ".int4_scale", ".int4_shape", ".int4_group_size")
-        )
-        or (
-            isinstance(value, torch.Tensor)
-            and value.dtype in {torch.int8, torch.uint8}
-        )
-    )
-    if quantized_state_keys:
-        raise ValueError(
-            "Stage-1 pgw_lite_pruned_96 forbids undeclared quantized state: "
-            f"{quantized_state_keys}"
-        )
-
-    model_state = model.state_dict()
-    generated_masks, mask_report = _verified_pruned96_generated_mask_keys(
-        model_state,
-        state_dict,
-    )
-    allowed_aliases = _runtime_alias_keys(model_state, state_dict)
-    baseline_allowed = allowed_aliases | generated_masks
-    baseline_report = {
-        "alias_missing_keys": sorted(allowed_aliases),
-        "elided_index_keys": [],
-        **mask_report,
-    }
-    storage = checkpoint.get("storage_optimization")
-    if storage is None:
-        return baseline_allowed, baseline_report
-    if not isinstance(storage, dict):
-        raise ValueError("storage_optimization metadata must be a mapping")
-    if "deterministic_index_elision" in storage:
-        raise ValueError("Legacy deterministic_index_elision metadata is forbidden")
-    elision = storage.get("deterministic_buffer_elision")
-    if elision is None:
-        return baseline_allowed, baseline_report
-    if storage.get("schema_version") != 1 or not isinstance(elision, dict):
-        raise ValueError("Unsupported deterministic_buffer_elision metadata")
-    if elision.get("method") != "constructor-earth-position-index-v1":
-        raise ValueError("Unsupported deterministic buffer elision method")
-
-    removed_keys = elision.get("removed_checkpoint_keys")
-    expected_missing = elision.get("expected_runtime_missing_keys")
-    generated = elision.get("generated_indices")
-    if not isinstance(removed_keys, list) or not removed_keys:
-        raise ValueError("removed_checkpoint_keys must be a non-empty list")
-    if not isinstance(expected_missing, list) or not expected_missing:
-        raise ValueError("expected_runtime_missing_keys must be a non-empty list")
-    if not isinstance(generated, dict):
-        raise ValueError("generated_indices must be a mapping")
-    if len(removed_keys) != len(set(removed_keys)):
-        raise ValueError("removed_checkpoint_keys contains duplicates")
-    if len(expected_missing) != len(set(expected_missing)):
-        raise ValueError("expected_runtime_missing_keys contains duplicates")
-
-    removed_keys = set(removed_keys)
-    expected_missing = set(expected_missing)
-    runtime_index_keys = {
-        key for key in model_state if key.endswith("earth_position_index")
-    }
-    source_index_keys = {
-        key for key in state_dict if key.endswith("earth_position_index")
-    }
-    if source_index_keys:
-        raise ValueError(
-            "Index-elided checkpoint still contains earth_position_index buffers"
-        )
-    if expected_missing != runtime_index_keys:
-        raise ValueError(
-            "expected_runtime_missing_keys must equal every runtime "
-            "earth_position_index key"
-        )
-    if not removed_keys.issubset(expected_missing):
-        raise ValueError("Removed checkpoint keys are absent from the runtime allowlist")
-    if set(generated) != expected_missing:
-        raise ValueError("generated_indices keys must equal expected_runtime_missing_keys")
-    if any(not key.endswith("earth_position_index") for key in expected_missing):
-        raise ValueError("Only earth_position_index buffers may be elided")
-    if any(key in state_dict for key in expected_missing):
-        raise ValueError("Elided index key is still present in the checkpoint")
-
-    removed_bytes = 0
-    for key in sorted(expected_missing):
-        target = model_state.get(key)
-        metadata = generated.get(key)
-        if target is None:
-            raise ValueError(f"Runtime model is missing generated index: {key}")
-        if not isinstance(metadata, dict):
-            raise ValueError(f"Invalid generated index metadata: {key}")
-        if list(target.shape) != metadata.get("shape"):
-            raise ValueError(f"Generated index shape mismatch: {key}")
-        if str(target.dtype) != metadata.get("dtype"):
-            raise ValueError(f"Generated index dtype mismatch: {key}")
-        if _tensor_sha256(target) != metadata.get("sha256"):
-            raise ValueError(f"Generated index SHA256 mismatch: {key}")
-        if key in removed_keys:
-            removed_bytes += target.numel() * target.element_size()
-
-    declared_bytes = elision.get("removed_logical_bytes")
-    if isinstance(declared_bytes, bool) or not isinstance(declared_bytes, int):
-        raise ValueError("removed_logical_bytes must be an integer")
-    if declared_bytes != removed_bytes:
-        raise ValueError("removed_logical_bytes differs from generated indices")
-
-    return baseline_allowed | expected_missing, {
-        "alias_missing_keys": sorted(allowed_aliases),
-        "elided_index_keys": sorted(expected_missing),
-        "removed_logical_bytes": removed_bytes,
-        **mask_report,
-    }
-
-
-def _validate_pruned96_state_load(
-    missing_keys,
-    unexpected_keys,
-    allowed_missing_keys,
-):
-    actual_missing = set(missing_keys)
-    allowed_missing = set(allowed_missing_keys)
-    if actual_missing != allowed_missing:
-        missing = sorted(allowed_missing - actual_missing)
-        extra = sorted(actual_missing - allowed_missing)
-        raise RuntimeError(
-            "pruned96 missing-key contract failed: "
-            f"not_missing={missing}, unexpected_missing={extra}"
-        )
-    if unexpected_keys:
-        raise RuntimeError(
-            "pruned96 checkpoint contains unexpected keys: "
-            f"{sorted(set(unexpected_keys))}"
-        )
-
-
 def _validate_selective_mlp96_state_load(
     model, state_dict, missing_keys, unexpected_keys
 ):
@@ -1358,7 +1062,6 @@ if __name__ == "__main__":
                 f"ℹ️  模型结构 profile={model_profile['name']} "
                 f"patch={model_profile['patch_size']} embed={model_profile['embed_dim']}"
             )
-            is_pruned96 = model_profile["name"] == "pgw_lite_pruned_96"
             is_selective_mlp96 = model_profile["name"] == SELECTIVE_MLP96_PROFILE
             if is_selective_mlp96:
                 validate_selective_mlp96_initialization(ckpt.get("initialization"))
@@ -1431,6 +1134,28 @@ if __name__ == "__main__":
                     chunked_attention=chunked_attention,
                     attention_chunk_size=attention_chunk_size,
                     mlp_ratio_blocks=model_profile.get("mlp_ratio_blocks"),
+                )
+            if (
+                _is_enabled("PANGU_P2_TILED_ATTENTION")
+                and _is_enabled("PANGU_P2_REGION_RELEASE")
+            ):
+                if model_profile.get("name") != "pgw_lite_pruned_96" or use_gqa:
+                    raise ValueError(
+                        "PANGU_P2_REGION_RELEASE requires the exact non-GQA "
+                        "pgw_lite_pruned_96 profile"
+                    )
+                cpu_mask_intern_report = intern_immutable_buffers(
+                    model,
+                    buffer_names=("attn_mask",),
+                )
+                from p2_tiled_attention import prepare_p2_region_masks_cpu
+
+                cpu_region_report = prepare_p2_region_masks_cpu(model)
+                print(
+                    "🧩 P2 Region IDs prepared on CPU before model.to(cuda): "
+                    f"interned={cpu_mask_intern_report['replaced']} "
+                    f"dense_bytes={cpu_region_report['dense_mask_unique_bytes_before']} "
+                    f"region_bytes={cpu_region_report['region_ids_unique_bytes']}"
                 )
             runtime_quant_linear = (
                 _is_enabled("PANGU_RUNTIME_QUANT_LINEAR")
@@ -1544,29 +1269,6 @@ if __name__ == "__main__":
             incremental_state_load = _is_enabled(
                 "PANGU_INCREMENTAL_STATE_LOAD", default=True
             )
-            pruned96_allowed_missing = None
-            if is_pruned96:
-                if runtime_quant_linear or use_gqa or not incremental_state_load:
-                    raise ValueError(
-                        "pgw_lite_pruned_96 requires the fail-closed incremental "
-                        "state loader"
-                    )
-                pruned96_allowed_missing, pruned96_contract = (
-                    _resolve_pruned96_state_load_contract(
-                        model,
-                        ckpt,
-                        state_dict,
-                    )
-                )
-                print(
-                    "🔒 pruned96 state-load contract: "
-                    f"allowed_missing={len(pruned96_allowed_missing)} "
-                    f"aliases={len(pruned96_contract['alias_missing_keys'])} "
-                    "constructor_masks="
-                    f"{len(pruned96_contract['constructor_mask_missing_keys'])} "
-                    f"elided_indices={len(pruned96_contract['elided_index_keys'])} "
-                    f"elided_bytes={pruned96_contract.get('removed_logical_bytes', 0)}"
-                )
             if is_selective_mlp96 and not incremental_state_load:
                 raise ValueError(
                     "SelectiveMLP-96 requires fail-closed incremental state loading"
@@ -1604,12 +1306,6 @@ if __name__ == "__main__":
                 from pangu_profile_model import adapt_qkv_for_gqa
                 ckpt["model_state_dict"] = adapt_qkv_for_gqa(ckpt["model_state_dict"], model)
                 model.load_state_dict(ckpt["model_state_dict"], strict=False)
-            if is_pruned96:
-                _validate_pruned96_state_load(
-                    missing_keys,
-                    unexpected_keys,
-                    pruned96_allowed_missing,
-                )
             if is_selective_mlp96:
                 _validate_selective_mlp96_state_load(
                     model, state_dict, missing_keys, unexpected_keys
@@ -1668,12 +1364,13 @@ if __name__ == "__main__":
                     force_full_width=p2_full_width,
                     release_original_bias=p2_release_bias,
                     retain_cpu_backup=p2_retain_cpu_bias,
-                    precompute_region_ids=p2_region_release,
                     release_original_masks=p2_region_release,
-                    retain_cpu_mask_backup=False,
                 )
-                if p2_region_release or p2_prebuild_hip:
-                    torch.cuda.synchronize()
+                p2_region_report = getattr(
+                    model,
+                    "_pangu_p2_region_setup_report",
+                    {},
+                )
                 print(
                     "⚡ PANGU_P2_TILED_ATTENTION=1，启用 isolated gfx936 tiled "
                     f"EarthAttention，mode={p2_kernel_mode}，"
@@ -1681,6 +1378,7 @@ if __name__ == "__main__":
                     f"release_bias={int(p2_release_bias)}，"
                     f"cpu_backup={int(p2_retain_cpu_bias)}，"
                     f"region_release={int(p2_region_release)}，"
+                    f"region_moves={p2_region_report.get('region_ids_device_move_count', 0)}，"
                     f"prebuild_hip={int(p2_prebuild_hip)}，"
                     f"patched={patched_tiled_attention}"
                 )
@@ -1800,6 +1498,17 @@ if __name__ == "__main__":
         del surface_mask
         print("🧩 PANGU_GRAPH_DIRECT_INPUT=1，输入直接写入 Graph 静态缓冲区")
 
+    blocking_input_transfer = _is_enabled(
+        "PANGU_BLOCKING_INPUT_TRANSFER", default=True
+    )
+    if not compliant_boundary and not graph_direct_input:
+        print(
+            "🧩 PANGU_BLOCKING_INPUT_TRANSFER="
+            f"{int(blocking_input_transfer)}，"
+            "FP32→FP16 输入搬运"
+            f"{'阻塞完成' if blocking_input_transfer else '异步提交'}"
+        )
+
     os.makedirs('result/output/', exist_ok=True)                          # AI4S, 输出路径不可更改
     print(f"📂 samples will be generated to './result/output/'")
     _profile_cuda_memory("before inference loop")
@@ -1839,9 +1548,19 @@ if __name__ == "__main__":
             else:
                 upper_air_shape = tuple(invar[:, 4:].shape)
                 # FP16: 输入数据直接转为半精度
-                # 方向4.3: non_blocking 异步数据传输，重叠 CPU/GPU 工作
-                invar_surface = invar[:, :4, :, :].to("cuda:0", dtype=target_dtype, non_blocking=True)
-                invar_upper_air = invar[:, 4:, :, :].to("cuda:0", dtype=target_dtype, non_blocking=True)
+                # ROCm 的跨 dtype 异步 H2D 会在后续操作完成前保留
+                # FP32 staging。在官方计时起点前完成搬运，避免它定峰。
+                input_non_blocking = not blocking_input_transfer
+                invar_surface = invar[:, :4, :, :].to(
+                    "cuda:0",
+                    dtype=target_dtype,
+                    non_blocking=input_non_blocking,
+                )
+                invar_upper_air = invar[:, 4:, :, :].to(
+                    "cuda:0",
+                    dtype=target_dtype,
+                    non_blocking=input_non_blocking,
+                )
                 # Avoid GPU concatenation of invar (150 MB saving)
                 invar_surface_with_mask = torch.concat([invar_surface, surface_mask], dim=1)
                 invar_upper_air_reshaped = invar_upper_air.reshape(
@@ -1868,39 +1587,44 @@ if __name__ == "__main__":
                 _profile_cuda_memory("after first timed forward")
 
             if compliant_boundary:
-                pred_tensor = model_output
                 # Full physical 69-channel D2H is explicitly outside timing.
-                pred_var = pred_tensor.detach().cpu().numpy()
+                pred_var = model_output.detach().cpu().numpy()
+                del model_output
             else:
                 out_surface, out_upper_air = model_output
+                del model_output
                 out_upper_air = out_upper_air.reshape(upper_air_shape)
                 # Legacy boundary retained only for guardrail reproduction.
                 if _is_enabled("PANGU_CPU_OUTPUT_POSTPROCESS", default=True):
+                    out_surface_cpu = out_surface.detach().cpu()
+                    del out_surface
+                    out_upper_air_cpu = out_upper_air.detach().cpu()
+                    del out_upper_air
                     pred_tensor = torch.concat(
-                        [out_surface.detach().cpu(), out_upper_air.detach().cpu()],
+                        [out_surface_cpu, out_upper_air_cpu],
                         dim=1,
                     ).float()
+                    del out_surface_cpu, out_upper_air_cpu
                     pred_var = pred_tensor.numpy()
                 else:
                     pred_var = torch.concat(
                         [out_surface, out_upper_air], dim=1
                     ).float().cpu().numpy()
+                    del out_surface, out_upper_air
                 pred_var = pred_var * stds + means
             np.save(f"result/output/{filename}.npy", pred_var)
             if _is_enabled("PANGU_PROFILE_MEMORY") and len(time_list) == 1:
                 _profile_cuda_memory("after first output postprocess")
 
-            # Explicitly clear loop-local GPU tensor references to prevent caching allocator double-buffering peak VRAM
+            # Clear fallback input aliases when early input release is disabled.
             if (
                 not compliant_boundary
                 and not graph_direct_input
                 and not _is_enabled("PANGU_CLEAR_INPUT_REFS", default=True)
             ):
                 del invar_surface, invar_upper_air, invar_surface_with_mask, invar_upper_air_reshaped
-            del invar, upper_air_shape, model_output
-            if not compliant_boundary:
-                del out_surface, out_upper_air
-            if compliant_boundary or _is_enabled(
+            del invar, upper_air_shape
+            if not compliant_boundary and _is_enabled(
                 "PANGU_CPU_OUTPUT_POSTPROCESS", default=True
             ):
                 del pred_tensor

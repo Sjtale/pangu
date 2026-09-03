@@ -255,6 +255,89 @@ class T0OptimizationsTests(unittest.TestCase):
             # Check outputs
             self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
 
+    def test_direct_chunked_mlp_residual_matches_fallback_and_rejects_training(self):
+        class MockTransformerBlock(nn.Module):
+            def __init__(self, use_roll, shift_size):
+                super().__init__()
+                self.input_resolution = (2, 4, 4)
+                self.shift_size = shift_size
+                self.window_size = (2, 2, 2)
+                self.use_roll = use_roll
+                self.norm1 = nn.Identity()
+                self.norm2 = nn.Identity()
+                self.pad = nn.Identity()
+                self.drop_path = nn.Identity()
+                self.attn = lambda x_windows, mask: x_windows
+                self.attn_mask = None
+                self.mlp = nn.Linear(3, 3)
+
+        torch.manual_seed(321)
+        original = torch.randn(1, 32, 3)
+        for use_roll, shift_size in (
+            (False, (0, 0, 0)),
+            (True, (1, 2, 2)),
+        ):
+            for inplace in (False, True):
+                with self.subTest(use_roll=use_roll, inplace=inplace):
+                    block = MockTransformerBlock(use_roll, shift_size).eval()
+                    block.forward = types.MethodType(
+                        pangu_profile_model._forward_chunked_mlp_block,
+                        block,
+                    )
+                    block._pangu_inplace_block = inplace
+                    block._pangu_mlp_chunk_size = 7
+                    block._pangu_mlp_direct_residual = False
+                    expected = block(original.clone())
+
+                    block._pangu_mlp_direct_residual = True
+                    actual = block(original.clone())
+                    self.assertTrue(torch.allclose(actual, expected, atol=1e-6))
+
+        block = MockTransformerBlock(False, (0, 0, 0)).train()
+        block.forward = types.MethodType(
+            pangu_profile_model._forward_chunked_mlp_block,
+            block,
+        )
+        block._pangu_inplace_block = False
+        block._pangu_mlp_chunk_size = 7
+        block._pangu_mlp_direct_residual = True
+        with self.assertRaisesRegex(RuntimeError, "inference-only"):
+            block(original.clone())
+
+    def test_block_intermediate_release_preserves_exact_roll_and_chunk_tail(self):
+        class IdentityTransformerBlock(nn.Module):
+            def __init__(self, use_roll, shift_size):
+                super().__init__()
+                self.input_resolution = (2, 4, 4)
+                self.shift_size = shift_size
+                self.window_size = (2, 2, 2)
+                self.use_roll = use_roll
+                self.norm1 = nn.Identity()
+                self.norm2 = nn.Identity()
+                self.pad = nn.Identity()
+                self.drop_path = nn.Identity()
+                self.attn = lambda x_windows, mask: x_windows
+                self.attn_mask = None
+                self.mlp = nn.Identity()
+
+        original = torch.arange(1 * 32 * 3, dtype=torch.float32).reshape(1, 32, 3)
+        for use_roll, shift_size in (
+            (False, (0, 0, 0)),
+            (True, (1, 2, 2)),
+        ):
+            for inplace in (False, True):
+                with self.subTest(use_roll=use_roll, inplace=inplace):
+                    block = IdentityTransformerBlock(use_roll, shift_size)
+                    block.forward = types.MethodType(
+                        pangu_profile_model._forward_chunked_mlp_block,
+                        block,
+                    )
+                    block._pangu_inplace_block = inplace
+                    block._pangu_mlp_chunk_size = 7
+                    with torch.inference_mode():
+                        actual = block(original.clone())
+                    self.assertTrue(torch.equal(actual, original * 4))
+
 
 if __name__ == "__main__":
     unittest.main()

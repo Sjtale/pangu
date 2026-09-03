@@ -11,9 +11,10 @@ class DistillTrainStaticTests(unittest.TestCase):
     def test_fixed_profile_and_losses(self):
         self.assertIn('"name": "pgw_lite_pruned_96"', SOURCE)
         self.assertIn('"depth_blocks": [2, 6, 6, 2]', SOURCE)
-        self.assertIn("GROUND_TRUTH_WEIGHT = 0.3", SOURCE)
+        self.assertIn("GROUND_TRUTH_WEIGHT = 0.5", SOURCE)
         self.assertIn("TEACHER_WEIGHT = 0.5", SOURCE)
-        self.assertIn("HINT_WEIGHT = 0.2", SOURCE)
+        for marker in ("HINT_WEIGHT", "HINT_LAYERS", "feature_hint_loss", "FeatureCapture"):
+            self.assertNotIn(marker, SOURCE)
 
     def test_all_69_non_residual_metadata(self):
         self.assertIn('"teacher_source": "organizer_pangu_full_model"', SOURCE)

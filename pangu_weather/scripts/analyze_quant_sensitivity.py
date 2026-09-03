@@ -82,14 +82,18 @@ def main():
     ]
     for name, module in linear_modules:
         original = module.weight.detach().clone()
-        module.weight.copy_(simulated_int4(original))
-        with torch.inference_mode():
-            surface, upper = model(sample)
-        deviation = float(
-            (surface.float() - reference_surface.float()).square().mean()
-            + (upper.float() - reference_upper.float()).square().mean()
-        )
-        module.weight.copy_(original)
+        try:
+            with torch.no_grad():
+                module.weight.copy_(simulated_int4(original))
+            with torch.inference_mode():
+                surface, upper = model(sample)
+            deviation = float(
+                (surface.float() - reference_surface.float()).square().mean()
+                + (upper.float() - reference_upper.float()).square().mean()
+            )
+        finally:
+            with torch.no_grad():
+                module.weight.copy_(original)
         results.append(
             {"name": name, "mse_deviation": deviation, "param_count": original.numel()}
         )

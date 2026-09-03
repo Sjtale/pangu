@@ -117,10 +117,8 @@ model:
     quantized_checkpoint: "model_distilled_quantized.pth"
     distill_max_epoch: 20
     distill_learning_rate: 5.0e-5
-    distill_ground_truth_weight: 0.3
+    distill_ground_truth_weight: 0.5
     distill_teacher_weight: 0.5
-    distill_hint_weight: 0.2
-    distill_hint_layers: ["layer1", "layer2"]
     distill_steps_per_epoch: 2048
     official_checkpoint_dir: "./data/checkpoints"
     patience: 50

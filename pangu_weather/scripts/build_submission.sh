@@ -68,10 +68,10 @@ ROOT_FILES=(
 
 REPRO_SCRIPTS=(
     scripts/audit_submission_package.py
+    scripts/analyze_quant_sensitivity.py
     scripts/compact_fuser_alias_checkpoint.py
     scripts/compress_checkpoint_gzip.py
     scripts/convert_fp16.py
-    scripts/elide_deterministic_indices.py
     scripts/prune_structured.py
     scripts/quantize_mixed_precision.py
 )

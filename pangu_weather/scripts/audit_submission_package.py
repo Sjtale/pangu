@@ -30,10 +30,10 @@ REQUIRED_PATHS = {
     "pangu_weather/selective_mlp96.py",
     "pangu_weather/train.py",
     "pangu_weather/distill_train.py",
+    "pangu_weather/scripts/analyze_quant_sensitivity.py",
     "pangu_weather/scripts/compact_fuser_alias_checkpoint.py",
     "pangu_weather/scripts/convert_fp16.py",
     "pangu_weather/scripts/compress_checkpoint_gzip.py",
-    "pangu_weather/scripts/elide_deterministic_indices.py",
     "pangu_weather/scripts/audit_submission_package.py",
     "pangu_weather/scripts/prune_structured.py",
     "pangu_weather/scripts/quantize_mixed_precision.py",
@@ -90,16 +90,20 @@ def audit_checkpoint_metadata(checkpoint):
     if not isinstance(checkpoint, dict):
         raise ValueError("Checkpoint must be a metadata dictionary")
     profile = checkpoint.get("model_profile") or {}
-    distillation = checkpoint.get("distillation") or {}
     if not isinstance(profile, dict) or not profile.get("name"):
         raise ValueError("Checkpoint is missing model_profile.name")
+    distillation = checkpoint.get("distillation")
+    if distillation is None:
+        return {
+            "model_profile": profile["name"],
+            "distillation_metadata_present": False,
+        }
     if not isinstance(distillation, dict):
         raise ValueError("Checkpoint distillation metadata must be a dictionary")
     required = {
         "teacher_source",
         "ground_truth_weight",
         "teacher_weight",
-        "hint_weight",
         "all_69_channels",
         "predict_residual",
     }
@@ -114,19 +118,18 @@ def audit_checkpoint_metadata(checkpoint):
         raise ValueError("Residual-target student checkpoints are forbidden")
     hard = float(distillation["ground_truth_weight"])
     teacher = float(distillation["teacher_weight"])
-    hint = float(distillation["hint_weight"])
-    if min(hard, teacher, hint) < 0:
+    if min(hard, teacher) < 0:
         raise ValueError("Distillation weights must be non-negative")
-    if teacher + hint <= hard:
-        raise ValueError(
-            "Full-model teacher constraints must dominate ground-truth supervision"
-        )
+    if abs(hard - 0.5) > 1.0e-12 or abs(teacher - 0.5) > 1.0e-12:
+        raise ValueError("Fixed pruned_96 distillation weights must be 0.5/0.5")
+    if "hint_weight" in distillation or "hint_layers" in distillation:
+        raise ValueError("Fixed pruned_96 distillation must not use hint loss")
     return {
         "model_profile": profile["name"],
+        "distillation_metadata_present": True,
         "teacher_source": distillation["teacher_source"],
         "ground_truth_weight": hard,
         "teacher_weight": teacher,
-        "hint_weight": hint,
         "all_69_channels": True,
         "predict_residual": False,
     }
@@ -423,6 +426,23 @@ def audit_zip(path, model_path=None):
             )
         provenance = audit_checkpoint_metadata(checkpoint)
         tensor_audit = audit_checkpoint_tensors(checkpoint)
+        quantization = checkpoint.get("quantization")
+        if not isinstance(quantization, Mapping):
+            raise ValueError("Final checkpoint is missing quantization metadata")
+        if int(quantization.get("fp16_keep_count", -1)) != 67:
+            raise ValueError("Final checkpoint must retain all 67 FP16 Linear weights")
+        if int(quantization.get("quantized_keys_count", -1)) != 0:
+            raise ValueError("Final checkpoint must declare zero quantized weights")
+        if not tensor_audit["quantization_metadata_matches_actual"]:
+            raise ValueError(
+                "Final checkpoint quantization metadata differs from actual tensors: "
+                f"{tensor_audit['quantization_consistency_issues']}"
+            )
+        alias_compaction = checkpoint.get("alias_compaction")
+        if not isinstance(alias_compaction, Mapping):
+            raise ValueError("Final checkpoint is missing alias_compaction metadata")
+        if int(alias_compaction.get("alias_pair_count", -1)) != 224:
+            raise ValueError("Final checkpoint must compact exactly 224 alias pairs")
         report["model"] = str(model_path.resolve())
         report["model_bytes"] = model_path.stat().st_size
         report["model_sha256"] = sha256_file(model_path)

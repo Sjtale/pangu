@@ -588,6 +588,11 @@ class UVRuntimeSwitchTests(unittest.TestCase):
         self.assertIn('os.environ.setdefault("PANGU_DISABLE_CUDA_GRAPH", "1")', source)
         self.assertIn('os.environ.setdefault("PANGU_LAYERWISE_CUDA_GRAPH", "0")', source)
         self.assertIn('os.environ.setdefault("PANGU_GRAPH_DIRECT_INPUT", "1")', source)
+        self.assertIn(
+            'os.environ.setdefault("PANGU_BLOCKING_INPUT_TRANSFER", "1")',
+            source,
+        )
+        self.assertEqual(source.count("non_blocking=input_non_blocking"), 2)
         self.assertIn('os.environ.setdefault("PANGU_COMPACT_ATTN_MASK", "0")', source)
         self.assertIn('os.environ.setdefault("PANGU_DIRECT_MASK_SLICE", "0")', source)
         self.assertIn('os.environ.setdefault("PANGU_HIP_SCHEDULE_SPIN", "0")', source)

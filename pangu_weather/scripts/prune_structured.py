@@ -16,6 +16,7 @@ import os
 from collections import OrderedDict
 
 import torch
+import torch.nn.functional as F
 
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -239,6 +240,69 @@ def _migrate_tensor(
     raise ValueError(
         f"No pruning rule for {key}: {tuple(source.shape)} -> {tuple(target.shape)}"
     )
+
+
+def _resize_patch_weight(value, target_shape, preserve_embedding_scale):
+    """Resize only the horizontal patch kernel dimensions deterministically."""
+
+    if value.ndim != len(target_shape) or value.ndim < 4:
+        raise ValueError(
+            f"Patch weight rank mismatch: {tuple(value.shape)} -> {tuple(target_shape)}"
+        )
+    if tuple(value.shape[:-2]) != tuple(target_shape[:-2]):
+        raise ValueError(
+            "Patch weight non-spatial dimensions do not match after pruning: "
+            f"{tuple(value.shape)} -> {tuple(target_shape)}"
+        )
+    source_height, source_width = value.shape[-2:]
+    target_height, target_width = target_shape[-2:]
+    resized = F.interpolate(
+        value.float().reshape(-1, 1, source_height, source_width),
+        size=(target_height, target_width),
+        mode="bicubic",
+        align_corners=False,
+    ).reshape(target_shape)
+    if preserve_embedding_scale:
+        resized *= (source_height * source_width) / (target_height * target_width)
+    return resized.to(value.dtype)
+
+
+def _interpolate_earth_bias(value, target_shape):
+    """Resize the latitude-window axis while preserving longitude groups."""
+
+    if value.ndim != 3 or len(target_shape) != 3:
+        raise ValueError("Earth-position bias must be rank three")
+    if value.shape[0] != target_shape[0] or value.shape[2] != target_shape[2]:
+        raise ValueError(
+            f"Earth-position bias dimensions mismatch: "
+            f"{tuple(value.shape)} -> {tuple(target_shape)}"
+        )
+    source_windows = int(value.shape[1])
+    target_windows = int(target_shape[1])
+    heads = int(value.shape[2])
+    if source_windows % 4 == 0 and target_windows % 4 == 0:
+        source_latitude = source_windows // 4
+        target_latitude = target_windows // 4
+        series = value.float().view(value.shape[0], 4, source_latitude, heads)
+        series = series.permute(0, 3, 1, 2).reshape(-1, 1, source_latitude)
+        resized = F.interpolate(
+            series,
+            size=target_latitude,
+            mode="linear",
+            align_corners=False,
+        )
+        resized = resized.view(value.shape[0], heads, 4, target_latitude)
+        resized = resized.permute(0, 2, 3, 1).reshape(target_shape)
+    else:
+        series = value.float().permute(0, 2, 1).reshape(-1, 1, source_windows)
+        resized = F.interpolate(
+            series,
+            size=target_windows,
+            mode="linear",
+            align_corners=False,
+        )
+        resized = resized.view(value.shape[0], heads, target_windows).permute(0, 2, 1)
+    return resized.to(value.dtype)
 
 
 def get_depth_block_map(source_depths, target_depths):
@@ -476,10 +540,12 @@ def prune_checkpoint(args):
         if args.target_profile not in profiles:
             raise ValueError(f"Unknown target profile: {args.target_profile}")
         target_profile_cfg = profiles[args.target_profile]
+        target_patch_size = [int(v) for v in target_profile_cfg.patch_size]
         target_width = int(target_profile_cfg.embed_dim)
         target_heads = tuple(int(h) for h in target_profile_cfg.num_heads)
         target_depth_blocks = getattr(target_profile_cfg, "depth_blocks", None)
     else:
+        target_patch_size = list(patch_size)
         target_width = args.target_embed_dim
         target_heads = (
             target_width // head_dim,
@@ -512,7 +578,7 @@ def prune_checkpoint(args):
 
     target_model = build_pangu_model(
         img_size=img_size,
-        patch_size=patch_size,
+        patch_size=target_patch_size,
         embed_dim=target_width,
         num_heads=target_heads,
         window_size=cfg.window_size,
@@ -547,20 +613,46 @@ def prune_checkpoint(args):
         mlp_hidden = _mlp_indices(source_state, source_width, target_width)
 
         migrated = OrderedDict()
+        resized_patch_keys = []
+        interpolated_bias_keys = []
+        regenerated_buffer_keys = []
         for key, target_tensor in target_state.items():
             source_key = get_source_key_for_target(key, source_depths, target_depths)
             if source_key not in source_state:
                 raise KeyError(f"Source checkpoint is missing {source_key} for target {key}")
-            tensor = _migrate_tensor(
-                source_key,
-                source_state[source_key],
-                target_tensor,
-                residual,
-                attention_heads,
-                mlp_hidden,
-                source_width,
-                source_heads,
-            )
+            if key.endswith(("attn_mask", "earth_position_index")):
+                tensor = target_tensor
+                regenerated_buffer_keys.append(key)
+            else:
+                tensor = _migrate_tensor(
+                    source_key,
+                    source_state[source_key],
+                    target_tensor,
+                    residual,
+                    attention_heads,
+                    mlp_hidden,
+                    source_width,
+                    source_heads,
+                )
+                if key.endswith(".proj.weight") and key.startswith(
+                    (
+                        "patchembed2d.",
+                        "patchembed3d.",
+                        "patchrecovery2d.",
+                        "patchrecovery3d.",
+                    )
+                ) and tuple(tensor.shape) != tuple(target_tensor.shape):
+                    tensor = _resize_patch_weight(
+                        tensor,
+                        target_tensor.shape,
+                        preserve_embedding_scale=key.startswith("patchembed"),
+                    )
+                    resized_patch_keys.append(key)
+                elif key.endswith("earth_position_bias_table") and (
+                    tuple(tensor.shape) != tuple(target_tensor.shape)
+                ):
+                    tensor = _interpolate_earth_bias(tensor, target_tensor.shape)
+                    interpolated_bias_keys.append(key)
             if tuple(tensor.shape) != tuple(target_tensor.shape):
                 raise ValueError(
                     f"Shape mismatch for {key}: got {tuple(tensor.shape)}, "
@@ -582,11 +674,21 @@ def prune_checkpoint(args):
         "target_embed_dim": target_width,
         "source_num_heads": source_heads,
         "target_num_heads": target_heads,
+        "source_patch_size": list(patch_size),
+        "target_patch_size": target_patch_size,
         "shallow_channels": residual["shallow"].tolist(),
         "deep_channels": residual["deep"].tolist(),
     }
     if target_depth_blocks is not None:
         metadata["target_depth_blocks"] = target_depth_blocks
+    if not args.strict_exact_depth:
+        metadata.update(
+            {
+                "resized_patch_keys": resized_patch_keys,
+                "interpolated_bias_keys": interpolated_bias_keys,
+                "regenerated_buffer_keys": regenerated_buffer_keys,
+            }
+        )
     if args.strict_exact_depth:
         metadata.update(
             {
@@ -603,13 +705,13 @@ def prune_checkpoint(args):
         )
         
     model_profile = {
-        "name": args.target_profile if args.target_profile else (f"pgw_lite_pruned_{target_width}" if patch_size == [2, 8, 8] else f"student_{target_width}"),
-        "patch_size": patch_size,
+        "name": args.target_profile if args.target_profile else (f"pgw_lite_pruned_{target_width}" if target_patch_size == [2, 8, 8] else f"student_{target_width}"),
+        "patch_size": target_patch_size,
         "embed_dim": target_width,
         "num_heads": list(target_heads),
+        "depth_blocks": list(target_depths),
+        "window_size": [int(value) for value in cfg.window_size],
     }
-    if target_depth_blocks is not None:
-        model_profile["depth_blocks"] = target_depth_blocks
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     torch.save(
@@ -631,6 +733,7 @@ def prune_checkpoint(args):
     print(f"Pruned checkpoint size: {target_size / 1024**2:.1f} MiB")
     print(f"Checkpoint size reduction: {(1 - target_size / source_size) * 100:.2f}%")
     print(f"Saved pruned checkpoint: {args.output}")
+    print(f"Target patch_size: {target_patch_size}")
     print(f"Target embed_dim: {target_width}, num_heads: {target_heads}")
     if target_depth_blocks is not None:
         print(f"Target depth blocks: {target_depth_blocks}")

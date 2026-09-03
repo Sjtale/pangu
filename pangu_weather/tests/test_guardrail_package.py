@@ -163,19 +163,20 @@ class GuardrailPackageTests(unittest.TestCase):
             buffer = io.BytesIO()
             torch.save(
                 {
-                    "model_state_dict": {},
+                    "model_state_dict": {
+                        **{f"linear{index}.weight": torch.ones(1, 1, dtype=torch.float16) for index in range(67)},
+                    },
                     "model_profile": {"name": "pgw_lite_pruned_96"},
                     "distillation": {
                         "teacher_source": "organizer_pangu_full_model",
-                        "ground_truth_weight": 0.3,
+                        "ground_truth_weight": 0.5,
                         "teacher_weight": 0.5,
-                        "hint_weight": 0.2,
                         "all_69_channels": True,
                         "predict_residual": False,
                     },
                     "quantization": {
-                        "fp16_keep_count": 5,
-                        "quantized_keys_count": 62,
+                        "fp16_keep_count": 67,
+                        "quantized_keys_count": 0,
                     },
                     "alias_compaction": {"alias_pair_count": 224},
                 },
@@ -190,20 +191,19 @@ class GuardrailPackageTests(unittest.TestCase):
                 "organizer_pangu_full_model",
             )
 
-    def test_checkpoint_metadata_rejects_residual_or_truth_dominance(self):
+    def test_checkpoint_metadata_rejects_residual_or_wrong_fixed_weights(self):
         base = {
             "model_profile": {"name": "pgw_lite_pruned_96"},
             "distillation": {
                 "teacher_source": "organizer_pangu_full_model",
-                "ground_truth_weight": 0.3,
+                "ground_truth_weight": 0.5,
                 "teacher_weight": 0.5,
-                "hint_weight": 0.2,
                 "all_69_channels": True,
                 "predict_residual": True,
             },
             "quantization": {
-                "fp16_keep_count": 5,
-                "quantized_keys_count": 62,
+                "fp16_keep_count": 67,
+                "quantized_keys_count": 0,
             },
             "alias_compaction": {"alias_pair_count": 224},
         }
@@ -211,8 +211,19 @@ class GuardrailPackageTests(unittest.TestCase):
             AUDIT.audit_checkpoint_metadata(base)
         base["distillation"]["predict_residual"] = False
         base["distillation"]["ground_truth_weight"] = 0.8
-        with self.assertRaisesRegex(ValueError, "must dominate"):
+        with self.assertRaisesRegex(ValueError, "must be 0.5/0.5"):
             AUDIT.audit_checkpoint_metadata(base)
+
+        base["distillation"]["ground_truth_weight"] = 0.5
+        base["distillation"]["hint_weight"] = 0.0
+        with self.assertRaisesRegex(ValueError, "must not use hint"):
+            AUDIT.audit_checkpoint_metadata(base)
+
+    def test_checkpoint_metadata_allows_absent_optional_distillation(self):
+        report = AUDIT.audit_checkpoint_metadata(
+            {"model_profile": {"name": "pgw_lite_pruned_96"}}
+        )
+        self.assertFalse(report["distillation_metadata_present"])
 
     def test_package_audit_rejects_wrong_path_and_allows_empty_url(self):
         with tempfile.TemporaryDirectory() as directory:

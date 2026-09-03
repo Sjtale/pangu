@@ -93,6 +93,23 @@ class CompactFuserAliasTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Final alias writer"):
             MODULE.plan_alias_compaction(reversed_state)
 
+    def test_quantization_metadata_requires_actual_kept_int8_and_scale(self):
+        state = OrderedDict(
+            (
+                ("layer.Fuser.weight", torch.ones(2, 2, dtype=torch.int8)),
+                ("layer.Fuser.weight_scale", torch.ones(2, 1, dtype=torch.float16)),
+            )
+        )
+        MODULE.validate_quantized_state(
+            {"quantization": {"quantized_keys_count": 1}}, state
+        )
+
+        with self.assertRaisesRegex(ValueError, "declared representation"):
+            MODULE.validate_quantized_state(
+                {"quantization": {"quantized_keys_count": 1}},
+                OrderedDict((('layer.Fuser.weight', torch.ones(2, 2)),)),
+            )
+
     def test_sha256_file_is_stable(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "payload.bin"

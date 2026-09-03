@@ -21,6 +21,16 @@ from collections.abc import Mapping
 import torch
 
 
+PRESERVED_METADATA_KEYS = (
+    "model_profile",
+    "distillation",
+    "pruning",
+    "initialization",
+    "quantization",
+    "storage_optimization",
+)
+
+
 def _storage_key(tensor):
     storage = tensor.untyped_storage()
     return (storage._cdata, str(tensor.device), str(tensor.dtype))
@@ -174,6 +184,11 @@ def verify_checkpoint(source_state, candidate_path):
 def convert_to_fp16(source_path, destination_path, report_path=None):
     checkpoint = torch.load(source_path, map_location="cpu", weights_only=False)
     source_state = extract_state_dict(checkpoint)
+    preserved_metadata = {
+        key: checkpoint[key]
+        for key in PRESERVED_METADATA_KEYS
+        if key in checkpoint
+    }
     source_report = audit_checkpoint(source_path, checkpoint)
     print_report(source_report, "Source checkpoint")
     del checkpoint
@@ -183,7 +198,11 @@ def convert_to_fp16(source_path, destination_path, report_path=None):
     os.makedirs(os.path.dirname(destination_path), exist_ok=True)
     temporary_path = destination_path + ".tmp"
     try:
-        torch.save({"model_state_dict": fp16_state}, temporary_path)
+        output_checkpoint = {
+            "model_state_dict": fp16_state,
+            **preserved_metadata,
+        }
+        torch.save(output_checkpoint, temporary_path)
         verify_checkpoint(source_state, temporary_path)
         os.replace(temporary_path, destination_path)
     finally:

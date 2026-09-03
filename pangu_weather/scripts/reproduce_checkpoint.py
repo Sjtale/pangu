@@ -86,6 +86,8 @@ def main() -> None:
     run("scripts/analyze_quant_sensitivity.py", "--checkpoint", str(CONVERTED))
     run(
         "scripts/quantize_mixed_precision.py",
+        "--keep-count",
+        "67",
         "--checkpoint",
         str(CONVERTED),
         "--output",
@@ -104,10 +106,10 @@ def main() -> None:
     checkpoint = torch.load(FINAL, map_location="cpu", weights_only=False)
     quantization = checkpoint.get("quantization", {})
     compaction = checkpoint.get("alias_compaction", {})
-    if quantization.get("fp16_keep_count") != 5:
-        raise ValueError("Final checkpoint must retain exactly five FP16 Linear weights")
-    if quantization.get("quantized_keys_count") != 62:
-        raise ValueError("Final checkpoint must contain exactly 62 quantized weights")
+    if quantization.get("fp16_keep_count") != 67:
+        raise ValueError("Final checkpoint must retain all 67 FP16 Linear weights")
+    if quantization.get("quantized_keys_count") != 0:
+        raise ValueError("Final checkpoint must contain zero quantized weights")
     if compaction.get("alias_pair_count") != 224:
         raise ValueError("Final checkpoint must compact exactly 224 OneFuser aliases")
 
@@ -130,7 +132,7 @@ def main() -> None:
             "all_69_distillation",
             "fp16_conversion",
             "int4_sensitivity",
-            "top5_mixed_precision",
+            "all_linear_fp16",
             "onefuser_alias_compaction",
         ],
         "artifacts": [

@@ -4,9 +4,9 @@
 学生模型直接预测全部 69 个输出通道，不预测输入到真值的残差，不使用测试样本间相关性，
 不使用训练后外置斜率、仿射或全局均值系数修正预测。
 
-实际评分检查点 `model_fp16_alias_compact.pth` 包含 FP16 31.8988 MiB、
-INT64 2.5312 MiB，没有 INT8 tensor。旧 `quantization` 字段不代表最终保留的 tensor
-表示；尺寸审计以实际 dtype 和 storage 为准。
+最终检查点 `model_fp16_alias_compact.pth` 保留全部 67 个逻辑 Linear 权重为
+FP16，不包含 INT8 权重或 `_scale` tensor。OneFuser alias compaction 无损删除重复
+别名；审计以实际 dtype 和 storage 为准，不仅依赖 `quantization` 元数据。
 
 ## 计时边界
 
@@ -22,9 +22,9 @@ HIP 内核由随包源码在计时前或首次运行时编译，不携带共享�
 - `distill_train.py`：固定 `pruned_96` 的全 69 通道知识蒸馏入口。
 - `scripts/compact_fuser_alias_checkpoint.py`：无损去除重复别名权重。
 - `scripts/convert_fp16.py`：保留别名的 FP16 检查点转换。
-- `scripts/elide_deterministic_indices.py`：验证后省略可由固定结构重建的 position index。
+- `scripts/analyze_quant_sensitivity.py`：生成量化脚本当前接口所需的确定性敏感度清单。
+- `scripts/quantize_mixed_precision.py`：正式复现使用 `--keep-count 67`，保留全部 Linear 为 FP16。
 - `scripts/compress_checkpoint_gzip.py`：可选的确定性无损压缩，仅在组委会确认格式后使用。
-- `scripts/quantize_mixed_precision.py`：保留的后续实验工具，不是当前评分检查点的实际表示。
 - `蒸馏与推理说明.md`：从剪枝、蒸馏到最终推理的完整命令。
 
 模型压缩包必须仅在根目录包含 `model_fp16.pth`。代码包可用

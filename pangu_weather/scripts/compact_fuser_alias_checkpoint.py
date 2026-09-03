@@ -78,6 +78,20 @@ def compact_state_dict(state, drop_keys):
     return compacted
 
 
+def validate_quantized_state(checkpoint, state):
+    quantization = checkpoint.get("quantization")
+    if not isinstance(quantization, Mapping):
+        return
+    expected = int(quantization.get("quantized_keys_count", -1))
+    actual_int8 = sum(value.dtype == torch.int8 for value in state.values())
+    actual_scales = sum(key.endswith("_scale") for key in state)
+    if expected < 0 or actual_int8 != expected or actual_scales != expected:
+        raise ValueError(
+            "Quantized alias compaction changed the declared representation: "
+            f"expected={expected}, int8={actual_int8}, scales={actual_scales}"
+        )
+
+
 def tensor_bytes(tensor):
     return tensor.numel() * tensor.element_size()
 
@@ -165,6 +179,7 @@ def compact_checkpoint(source_path, output_path, audit_only=False):
         raise FileExistsError(f"Refusing to overwrite existing output: {output_path}")
 
     compacted_state = compact_state_dict(state, drop_keys)
+    validate_quantized_state(checkpoint, compacted_state)
     output_checkpoint = dict(checkpoint)
     output_checkpoint["model_state_dict"] = compacted_state
     output_checkpoint["alias_compaction"] = {
